@@ -7,3 +7,4 @@ data/intent_graphs/*.json
 data/intent_graphs/*.meta.json
 data/audits/*.json
 models/
+.DS_Store/

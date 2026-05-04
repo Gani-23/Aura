@@ -1,1 +1,316 @@
-# Aura
+# Living Systems Auditor
+
+Living Systems Auditor is a Python-first scaffold for an intent-aware runtime auditor. This repo starts with a minimal vertical slice:
+
+- ingest a Python codebase and build an intent graph snapshot
+- normalize observed runtime events
+- parse raw trace logs into normalized runtime events
+- detect drift when observed network calls fall outside declared or inferred intent
+- generate a structured remediation report
+- expose the flow through a CLI and FastAPI surface
+- persist snapshots and audit runs so the system can be inspected over time
+- persist job execution state in a SQLite-backed control plane
+
+## What works today
+
+- Python source ingestion using the standard library `ast` module
+- simple function and module extraction
+- external URL and hostname inference from common HTTP call patterns
+- drift detection for unexpected outbound network activity
+- markdown remediation reports written to disk
+- CLI commands for `ingest` and `audit`
+- local persistence for snapshots and audit history
+- SQLite-backed control-plane persistence for snapshots, audits, and queued jobs
+- API endpoints to list and fetch persisted snapshots and audits
+- API endpoints for live trace collection and collect-and-audit flows
+- API-key protection for service endpoints when `LSA_API_KEY` is configured
+- asynchronous audit job submission and polling over the API
+- startup recovery for persisted jobs that were left `running` during a restart
+- heartbeat-backed worker registry and job lease visibility in the control plane
+- active lease renewal and stale-worker takeover for long-running jobs
+- append-only worker heartbeat history and job lease event history for forensic review
+- time-based retention and explicit pruning for the growing history tables
+- daily rollup compaction for older heartbeat and lease-event history
+- trace-based audit flow for `logfmt`-style lines and raw `bpftrace` connect output
+- trace collection commands that can capture observer stdout straight into auditable trace files
+- structured connect-event enrichment with `pid`, `tid`, `fd`, `process`, `daddr`, `dport`, and service hints
+- optional destination alias resolution via trace hints or `data/destination_aliases.json`
+- correlation-aware function binding across `request_id`, `trace_id`, `span_id`, `conn_id`, and process/socket context
+- normalization of common tracing propagation formats like `traceparent`, `b3`, and `x-request-id` into canonical correlation fields
+- normalization of OpenTelemetry-style attribute names, Jaeger `uber-trace-id`, and `baggage` strings into canonical correlation fields
+- top-level audit explanations that summarize the primary drift storyline before the detailed session payloads and remediation reports
+- automatic trace sidecar manifests that preserve collection context such as collector session id, target PID, and observer command
+- derived `socket_id` and `flow_id` correlation keys when collector and observer metadata are rich enough to support them
+- explicit function-resolution hints through trace metadata like `qualname`, `module` + `function_name`, or `source_file` + `line`
+- stack-aware function-resolution hints through metadata like `stack`, `call_stack`, `frames`, or `callsite`
+- raw symbol normalization for collector outputs like `app:charge_customer`, `app::charge_customer`, or `app.py:4`
+- trace-local symbol map sidecars that resolve raw addresses into semantic function and stack hints
+- collection-time staging of symbol maps so `collect-trace` and `collect-audit` can publish trace-local `.symbols.json` artifacts automatically
+- inline symbol-definition extraction so collectors can emit `event=symbol ...` lines directly and let LSA materialize the symbol sidecar
+- trace-local context map sidecars that join request and trace metadata onto raw runtime events before correlation
+
+## Quick start
+
+```bash
+cd living-systems-auditor
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+export LSA_API_KEY=change-me-in-production
+# Optional for single-process dev mode only:
+export LSA_RUN_EMBEDDED_WORKER=1
+
+lsa ingest tests/fixtures/sample_service --out data/intent_graphs/sample.json
+lsa audit data/intent_graphs/sample.json tests/fixtures/sample_events.json --out-dir data/reports
+lsa parse-trace tests/fixtures/sample_trace.log --trace-format auto
+lsa audit-trace demo-snapshot tests/fixtures/sample_trace.log --snapshot-id --trace-format auto
+lsa collect-trace 1234 --program ebpf/network_observer.bt --duration 5 --out data/traces/live.log
+lsa collect-audit demo-snapshot 1234 --snapshot-id --program ebpf/network_observer.bt --trace-format bpftrace
+lsa worker --poll-interval 0.1
+lsa list-snapshots
+lsa list-audits
+lsa list-jobs
+lsa prune-history
+lsa list-worker-heartbeat-rollups <worker_id>
+lsa list-job-lease-event-rollups <job_id>
+lsa control-plane-analytics --days 30
+lsa emit-control-plane-alerts --force
+lsa process-control-plane-alert-followups --force
+lsa list-control-plane-alerts --limit 50
+lsa acknowledge-control-plane-alert <alert_id> --by operator --note "Investigating"
+lsa create-control-plane-alert-silence --by operator --reason "maintenance" --duration-minutes 30 --finding-code queue_without_active_workers
+lsa list-control-plane-alert-silences --active-only
+lsa cancel-control-plane-alert-silence <silence_id> --by operator
+lsa create-control-plane-oncall-schedule --by operator --team platform --timezone UTC --weekdays 0 1 2 3 4 5 6 --start-time 00:00 --end-time 23:59
+lsa list-control-plane-oncall-schedules --active-only
+lsa cancel-control-plane-oncall-schedule <schedule_id> --by operator
+```
+
+Example enriched trace line:
+
+```text
+event=network process=python comm=python pid=4242 tid=4242 fd=9 daddr=93.184.216.34 dport=443
+```
+
+This normalizes into a runtime event with target `93.184.216.34:443` and metadata that includes `service_hint=https`.
+
+Collected traces now also get a sibling manifest such as `data/traces/latest-trace.log.meta.json`. When present, the parser automatically merges collector metadata like `collector_session_id`, `collector_target_pid`, and `collector_command` into each observed event before audit correlation.
+
+Traces can also carry a sibling symbol map such as `data/traces/latest-trace.log.symbols.json`. When present, the parser can translate raw fields like `pc=0x4010` or `stack=0x1000>0x4010>0x7777` into semantic hints before function resolution runs.
+
+Traces can also carry a sibling context map such as `data/traces/latest-trace.log.contexts.json`. When present, the parser can join request and trace metadata such as `traceparent`, `request_id`, or `b3` fields onto matching runtime events by `context_key`, `conn_id`, `flow_id`, `socket_id`, `request_id`, or `trace_id`.
+
+The collection flow now stages that sidecar automatically when a collector program has an adjacent symbol file like `emit_symbolized_trace.sh.symbols.json`, or when you pass `--symbol-map /path/to/map.json` to `collect-trace` or `collect-audit`.
+
+Collectors can also emit inline symbol-definition lines directly in the trace stream, for example:
+
+```text
+event=symbol addr=0x4010 value=app:charge_customer
+event=symbol addr=0x7777 value=requests.post
+event=network process=python stack=0x1000>0x4010>0x7777 target=https://malicious.example.com/exfil
+```
+
+During collection, LSA now strips those symbol-definition lines out of the stored trace body, writes a generated `.symbols.json` sidecar, and audits the remaining runtime events against that materialized symbol map.
+
+Collectors can do the same thing for correlation context:
+
+```text
+event=context conn_id=conn-1 traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 request_id=req-123
+event=network process=python comm=python conn_id=conn-1 target=https://api.stripe.com/v1/charges
+```
+
+During collection, LSA strips those `event=context` lines out of the stored trace body, materializes a `.contexts.json` sidecar, and joins that context back onto matching runtime events before correlation runs.
+
+The FastAPI surface now mirrors the live collection workflow with:
+
+```text
+POST /collect-trace
+POST /collect-audit
+POST /jobs/audit-trace
+POST /jobs/collect-audit
+GET /jobs
+GET /jobs/{job_id}
+GET /workers
+GET /workers/{worker_id}
+GET /workers/{worker_id}/heartbeats
+GET /workers/{worker_id}/heartbeat-rollups
+GET /jobs/{job_id}/lease-events
+GET /jobs/{job_id}/lease-event-rollups
+GET /analytics/control-plane
+GET /control-plane-alerts
+POST /control-plane-alerts/{alert_id}/acknowledge
+GET /control-plane-alert-silences
+POST /control-plane-alert-silences
+POST /control-plane-alert-silences/{silence_id}/cancel
+GET /control-plane-oncall-schedules
+POST /control-plane-oncall-schedules
+POST /control-plane-oncall-schedules/{schedule_id}/cancel
+POST /maintenance/prune-history
+POST /maintenance/emit-control-plane-alerts
+POST /maintenance/process-control-plane-alert-followups
+```
+
+Those endpoints return the staged `trace_metadata_path` and `trace_symbol_map_path` alongside the collected trace or audit result.
+They also return `trace_context_map_path` when collection generated or staged a context sidecar.
+
+When `LSA_API_KEY` is set, every endpoint except `/health` requires either `X-API-Key: <token>` or `Authorization: Bearer <token>`.
+
+The `/health` endpoint now reports whether auth is enabled, whether the local control-plane database is ready, whether the API is running in `embedded` or `external` worker mode, and how many workers are currently heartbeating. Long-running or collector-backed audits can also be submitted asynchronously through `/jobs/*`, which persist `queued`, `running`, `completed`, and `failed` states in `data/control_plane.db` along with their serialized result payloads.
+
+Production shape now assumes a split deployment by default: the API accepts and persists jobs, while a separate `lsa worker` process drains the queue. If you explicitly set `LSA_RUN_EMBEDDED_WORKER=1`, the API will also start an embedded worker for single-process development. In both modes, startup recovery requeues stale `running` jobs before processing resumes. `/health` reports `worker_running`, `active_workers`, `queued_jobs`, and `running_jobs`, while job records now include `claimed_by_worker_id` and `lease_expires_at` so operators can see which worker owns a running lease. Workers also renew those leases while a job is still running, and a healthy worker can reclaim an expired lease from a stale owner without waiting for a process restart. Worker records are queryable through `/workers/*`.
+
+The control plane now also keeps append-only history for worker heartbeats and job lease transitions. That means you can inspect not just the latest worker row or job row, but the timeline of `lease_claimed`, `lease_renewed`, `lease_expired_requeued`, `job_completed`, and `job_failed` events, plus the corresponding worker heartbeat trail through `/workers/{worker_id}/heartbeats` and `/jobs/{job_id}/lease-events`.
+
+History retention is now time-based and configurable. Worker heartbeat history defaults to `14` days, job lease event history defaults to `30` days, and the worker performs periodic maintenance in the background. Older raw history is compacted into daily rollup tables before it is removed, so the control plane keeps coarse longitudinal visibility without keeping every row forever. You can also trigger maintenance directly through `lsa prune-history` or `POST /maintenance/prune-history`, and inspect the summarized buckets through the rollup endpoints and CLI commands.
+
+Those same rollups now feed a control-plane analytics surface for operators. `GET /analytics/control-plane?days=30` and `lsa control-plane-analytics --days 30` summarize queue shape, current worker health, lease churn, and job throughput over a bounded time window by merging both raw recent history and already-compacted day buckets. That keeps the newest operating window accurate instead of making the post-compaction timeline look artificially sparse.
+
+The analytics response now also includes an `evaluation` block with:
+
+```text
+status=healthy|degraded|critical
+findings=[...]
+thresholds={...}
+```
+
+Current built-in findings cover:
+- queued backlog above warning or critical thresholds
+- stale workers above warning or critical thresholds
+- expired lease requeue churn above warning or critical thresholds
+- elevated job failure rate once enough finished jobs exist in the window
+- queued work with zero active workers, which is treated as critical
+
+Those findings can now flow into a durable control-plane alert pipeline. The worker evaluates the control plane on a schedule, deduplicates repeated alert signatures inside a configurable cooldown window, persists emitted alerts in SQLite, writes them to a JSONL sink, and can optionally POST the same payload to a webhook.
+
+Thresholds are configurable through environment variables:
+
+```text
+LSA_ANALYTICS_QUEUE_WARNING_THRESHOLD
+LSA_ANALYTICS_QUEUE_CRITICAL_THRESHOLD
+LSA_ANALYTICS_STALE_WORKER_WARNING_THRESHOLD
+LSA_ANALYTICS_STALE_WORKER_CRITICAL_THRESHOLD
+LSA_ANALYTICS_EXPIRED_LEASE_WARNING_THRESHOLD
+LSA_ANALYTICS_EXPIRED_LEASE_CRITICAL_THRESHOLD
+LSA_ANALYTICS_JOB_FAILURE_RATE_WARNING_THRESHOLD
+LSA_ANALYTICS_JOB_FAILURE_RATE_CRITICAL_THRESHOLD
+LSA_ANALYTICS_JOB_FAILURE_RATE_MIN_SAMPLES
+```
+
+Alert emission is controlled through:
+
+```text
+LSA_CONTROL_PLANE_ALERTS_ENABLED
+LSA_CONTROL_PLANE_ALERT_WINDOW_DAYS
+LSA_CONTROL_PLANE_ALERT_INTERVAL_SECONDS
+LSA_CONTROL_PLANE_ALERT_DEDUP_WINDOW_SECONDS
+LSA_CONTROL_PLANE_ALERT_REMINDER_INTERVAL_SECONDS
+LSA_CONTROL_PLANE_ALERT_ESCALATION_INTERVAL_SECONDS
+LSA_CONTROL_PLANE_ALERT_WEBHOOK_URL
+LSA_CONTROL_PLANE_ALERT_ESCALATION_WEBHOOK_URL
+```
+
+By default, emitted alerts are also appended to `data/control_plane_alerts.jsonl`. Operators can force a fresh evaluation and emission cycle with `lsa emit-control-plane-alerts --force` or `POST /maintenance/emit-control-plane-alerts`, then inspect persisted alert history through `lsa list-control-plane-alerts` or `GET /control-plane-alerts`.
+
+Timed follow-ups are now part of the same lifecycle. If a degraded or critical incident stays unacknowledged, `lsa process-control-plane-alert-followups --force` or `POST /maintenance/process-control-plane-alert-followups` can emit reminders or escalations immediately, while the worker also checks for them on its normal alert cadence. Escalations can be routed to a separate webhook target through `LSA_CONTROL_PLANE_ALERT_ESCALATION_WEBHOOK_URL`.
+
+Alert delivery can now also follow persisted on-call schedules. A schedule defines:
+- team name
+- IANA timezone like `UTC` or `Asia/Kolkata`
+- weekdays as `0-6` for Monday-Sunday
+- a local start and end time
+- optional route-specific webhook and escalation webhook overrides
+
+When a schedule is active, emitted incidents, reminders, and escalations include the selected route in their payload and prefer the route-specific webhooks over the global defaults.
+
+Alert records can now also be acknowledged in place. Acknowledgement does not suppress future alerts by itself; it marks that a human has taken ownership of a specific emission and records who acknowledged it plus an optional note.
+
+Acknowledging either the original incident alert or a reminder/escalation follow-up marks the root incident as owned and stops further follow-up emissions for that incident.
+
+Silences are a separate control. A silence matches either an exact `alert_key`, a `finding_code`, or both, and suppresses future degraded or critical alert emissions for a bounded duration. Silenced conditions still appear in analytics; the silence only changes outbound alert delivery. Recovery alerts are not silenced, so operators can still see when the control plane returns to healthy after a muted incident window.
+
+When a trace includes fields like `fd`, `tid`, or collector-scoped PID metadata, enrichment now derives stable `socket_id` and `flow_id` values automatically. That gives the resolver stronger binding keys than plain process-name continuity on real runtime traces.
+
+If an upstream collector can emit code-level hints, the resolver now prefers them before heuristic matching. Useful fields include:
+
+```text
+qualname=charge_customer
+module=app function_name=charge_customer
+source_file=app.py line=4
+stack=worker_loop>app.charge_customer>requests.post
+call_stack=scheduler|app.py:4|requests.post
+symbol=app:charge_customer
+frame_symbol=app.py:4
+```
+
+Those hints let the audit path attribute drift directly to the intended function even when the runtime process label is generic. When a collector only has rough symbol strings, enrichment now normalizes common forms like `app:charge_customer` into canonical module/function hints before resolution. When a stack-like hint is used, the resolved event also records which stack entry won via `trace_hint_value` and `trace_hint_index`.
+
+For lower-level collector output, a symbol sidecar can bridge addresses into those same hints. Example:
+
+```json
+{
+  "symbols": {
+    "0x4010": "app:charge_customer",
+    "0x7777": "requests.post"
+  }
+}
+```
+
+You can also provide a local alias map at `data/destination_aliases.json`, for example:
+
+```json
+{
+  "93.184.216.34": "api.stripe.com",
+  "10.0.0.5:8080": "internal-billing.local"
+}
+```
+
+When present, alias matches are considered during drift comparison and preserved in event metadata.
+
+When traces include correlation keys such as `request_id=req-123` or `trace_id=trace-abc`, the auditor can carry a resolved function identity across related events in the same runtime sequence.
+
+Common tracing headers are normalized automatically, so collectors do not need to pre-convert them into LSA-specific keys. Supported examples include:
+
+```text
+traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+b3=4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1-a2fb4a1d1a96d312
+x-request-id=req-123
+otel.trace_id=4bf92f3577b34da6a3ce929d0e0e4736
+otel.span_id=00f067aa0ba902b7
+uber-trace-id=4bf92f3577b34da6:00f067aa0ba902b7:a2fb4a1d1a96d312:1
+baggage=request_id=req-123,tenant=acme
+```
+
+These are normalized into canonical `trace_id`, `span_id`, `parent_span_id`, and `request_id` fields before correlation runs.
+
+Each audit now also returns an `explanation` object with a concise summary, impacted functions, unexpected targets, primary session key, and supporting evidence lines. This makes the result easier to feed into dashboards or operator review flows without re-deriving the narrative from raw events.
+
+## Repository shape
+
+```text
+living-systems-auditor/
+├── lsa/
+│   ├── api/
+│   ├── cli/
+│   ├── core/
+│   ├── drift/
+│   ├── ingest/
+│   └── remediation/
+├── tests/
+├── docs/
+├── dashboard/
+├── ebpf/
+└── docker/
+```
+
+## Near-term roadmap
+
+1. Replace the Python-only parser with tree-sitter for multi-language support.
+2. Swap the rule-based remediation stub with a local LLM adapter.
+3. Push collector-side context further so live traces emit richer correlation and identity fields directly.
+4. Replace the local API-key model with a fuller auth and multi-tenant identity layer.
+5. Move background jobs off in-process threads and onto a durable worker model.
+
+## Flashpoint target
+
+The first real proof point is not a large feature list. It is one credible case where the system flags semantic drift before a service failure is obvious, and produces an explanation an engineer would actually trust.
