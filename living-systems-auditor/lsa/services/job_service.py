@@ -10,9 +10,10 @@ from uuid import uuid4
 
 from lsa.drift.trace_parser import load_trace_events
 from lsa.services.audit_service import AuditService
+from lsa.services.control_plane_alert_service import ControlPlaneAlertService
 from lsa.services.trace_collection_service import TraceCollectionRequest, TraceCollectionService
 from lsa.storage.files import JobRepository
-from lsa.storage.models import JobRecord, WorkerRecord
+from lsa.storage.models import ControlPlaneAlertRecord, JobLeaseEventRecord, JobRecord, WorkerHeartbeatRecord, WorkerRecord
 
 
 @dataclass(slots=True)
@@ -23,6 +24,12 @@ class JobService:
     worker_mode: str = "standalone"
     poll_interval_seconds: float = 0.1
     heartbeat_timeout_seconds: float = 5.0
+    worker_history_retention_days: int = 14
+    job_lease_history_retention_days: int = 30
+    history_prune_interval_seconds: float = 300.0
+    control_plane_alert_service: ControlPlaneAlertService | None = None
+    control_plane_alert_interval_seconds: float = 60.0
+    control_plane_alerts_enabled: bool = True
     _worker_thread: Thread | None = field(init=False, default=None)
     _stop_event: Event = field(init=False, default_factory=Event)
     _lock: Lock = field(init=False, default_factory=Lock)
@@ -30,6 +37,8 @@ class JobService:
     _worker_started_at: str = field(init=False)
     _host_name: str = field(init=False)
     _process_id: int = field(init=False)
+    _last_prune_at: float = field(init=False, default=0.0)
+    _last_alert_emit_at: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
         self._worker_started_at = _utc_now()
@@ -44,6 +53,7 @@ class JobService:
             self.job_repository.requeue_incomplete()
             self._stop_event.clear()
             self._mark_worker_running(current_job_id=None)
+            self.prune_history(force=True)
             self._worker_thread = Thread(
                 target=self._worker_loop,
                 daemon=True,
@@ -71,6 +81,124 @@ class JobService:
     def active_worker_count(self) -> int:
         return self.job_repository.count_workers_seen_since(self._heartbeat_threshold())
 
+    def emit_control_plane_alerts_if_due(self) -> list[ControlPlaneAlertRecord]:
+        if not self.control_plane_alerts_enabled or self.control_plane_alert_service is None:
+            return []
+        now = monotonic()
+        if now - self._last_alert_emit_at < self.control_plane_alert_interval_seconds:
+            return []
+        emitted = self.emit_control_plane_alerts()
+        if emitted:
+            return emitted
+        return self.process_control_plane_alert_follow_ups()
+
+    def emit_control_plane_alerts(self, *, force: bool = False) -> list[ControlPlaneAlertRecord]:
+        if not self.control_plane_alerts_enabled or self.control_plane_alert_service is None:
+            return []
+        alerts = self.control_plane_alert_service.emit_alerts(force=force)
+        self._last_alert_emit_at = monotonic()
+        return alerts
+
+    def process_control_plane_alert_follow_ups(self, *, force: bool = False) -> list[ControlPlaneAlertRecord]:
+        if not self.control_plane_alerts_enabled or self.control_plane_alert_service is None:
+            return []
+        alerts = self.control_plane_alert_service.process_follow_ups(force=force)
+        self._last_alert_emit_at = monotonic()
+        return alerts
+
+    def list_control_plane_alerts(self, limit: int | None = None) -> list[ControlPlaneAlertRecord]:
+        if self.control_plane_alert_service is None:
+            return self.job_repository.list_control_plane_alerts(limit)
+        return self.control_plane_alert_service.list_alerts(limit)
+
+    def acknowledge_control_plane_alert(
+        self,
+        *,
+        alert_id: str,
+        acknowledged_by: str,
+        acknowledgement_note: str | None = None,
+    ) -> ControlPlaneAlertRecord:
+        if self.control_plane_alert_service is None:
+            return self.job_repository.acknowledge_control_plane_alert(
+                alert_id=alert_id,
+                acknowledged_at=_utc_now(),
+                acknowledged_by=acknowledged_by,
+                acknowledgement_note=acknowledgement_note,
+            )
+        return self.control_plane_alert_service.acknowledge_alert(
+            alert_id=alert_id,
+            acknowledged_by=acknowledged_by,
+            acknowledgement_note=acknowledgement_note,
+        )
+
+    def create_control_plane_alert_silence(
+        self,
+        *,
+        created_by: str,
+        reason: str,
+        duration_minutes: int,
+        match_alert_key: str | None = None,
+        match_finding_code: str | None = None,
+    ):
+        if self.control_plane_alert_service is None:
+            raise RuntimeError("Control-plane alert service is not configured.")
+        return self.control_plane_alert_service.create_silence(
+            created_by=created_by,
+            reason=reason,
+            duration_minutes=duration_minutes,
+            match_alert_key=match_alert_key,
+            match_finding_code=match_finding_code,
+        )
+
+    def list_control_plane_alert_silences(self, *, active_only: bool = False):
+        if self.control_plane_alert_service is None:
+            return self.job_repository.list_control_plane_alert_silences()
+        return self.control_plane_alert_service.list_silences(active_only=active_only)
+
+    def cancel_control_plane_alert_silence(self, *, silence_id: str, cancelled_by: str):
+        if self.control_plane_alert_service is None:
+            raise RuntimeError("Control-plane alert service is not configured.")
+        return self.control_plane_alert_service.cancel_silence(
+            silence_id=silence_id,
+            cancelled_by=cancelled_by,
+        )
+
+    def prune_history_if_due(self) -> dict[str, int]:
+        now = monotonic()
+        if now - self._last_prune_at < self.history_prune_interval_seconds:
+            return {
+                "worker_heartbeats_compacted": 0,
+                "job_lease_events_compacted": 0,
+                "worker_heartbeats_pruned": 0,
+                "job_lease_events_pruned": 0,
+            }
+        return self.prune_history()
+
+    def prune_history(self, *, force: bool = False) -> dict[str, int]:
+        now = monotonic()
+        if not force and now - self._last_prune_at < self.history_prune_interval_seconds:
+            return {
+                "worker_heartbeats_compacted": 0,
+                "job_lease_events_compacted": 0,
+                "worker_heartbeats_pruned": 0,
+                "job_lease_events_pruned": 0,
+            }
+        worker_cutoff = (
+            datetime.now(UTC) - timedelta(days=self.worker_history_retention_days)
+        ).isoformat()
+        lease_cutoff = (
+            datetime.now(UTC) - timedelta(days=self.job_lease_history_retention_days)
+        ).isoformat()
+        worker_heartbeats_compacted = self.job_repository.compact_worker_heartbeats_before(worker_cutoff)
+        job_lease_events_compacted = self.job_repository.compact_job_lease_events_before(lease_cutoff)
+        self._last_prune_at = now
+        return {
+            "worker_heartbeats_compacted": worker_heartbeats_compacted,
+            "job_lease_events_compacted": job_lease_events_compacted,
+            "worker_heartbeats_pruned": worker_heartbeats_compacted,
+            "job_lease_events_pruned": job_lease_events_compacted,
+        }
+
     def submit_audit_trace(self, request_payload: dict) -> JobRecord:
         return self.job_repository.create(job_type="audit-trace", request_payload=request_payload)
 
@@ -82,6 +210,12 @@ class JobService:
 
     def list_workers(self) -> list[WorkerRecord]:
         return self.job_repository.list_workers()
+
+    def list_worker_heartbeats(self, worker_id: str) -> list[WorkerHeartbeatRecord]:
+        return self.job_repository.list_worker_heartbeats(worker_id)
+
+    def list_job_lease_events(self, job_id: str) -> list[JobLeaseEventRecord]:
+        return self.job_repository.list_job_lease_events(job_id)
 
     def get_job(self, job_id: str) -> JobRecord:
         return self.job_repository.get(job_id)
@@ -110,10 +244,13 @@ class JobService:
         self.job_repository.requeue_incomplete()
         self._stop_event.clear()
         self._mark_worker_running(current_job_id=None)
+        self.prune_history(force=True)
         processed_jobs = 0
         idle_started_at = monotonic()
         try:
             while not self._stop_event.is_set():
+                self.prune_history_if_due()
+                self.emit_control_plane_alerts_if_due()
                 if max_jobs is not None and processed_jobs >= max_jobs:
                     break
                 processed = self.process_next_job()
@@ -130,6 +267,16 @@ class JobService:
         return processed_jobs
 
     def process_next_job(self) -> bool:
+        expired_jobs = self.job_repository.requeue_expired_leases(_utc_now())
+        for expired_job in expired_jobs:
+            self._record_lease_event(
+                job_id=expired_job.job_id,
+                worker_id=expired_job.claimed_by_worker_id,
+                event_type="lease_expired_requeued",
+                details={
+                    "previous_lease_expires_at": expired_job.lease_expires_at,
+                },
+            )
         record = self.job_repository.claim_next_queued(
             started_at=_utc_now(),
             worker_id=self._worker_id,
@@ -137,6 +284,14 @@ class JobService:
         )
         if record is None:
             return False
+        self._record_lease_event(
+            job_id=record.job_id,
+            worker_id=self._worker_id,
+            event_type="lease_claimed",
+            details={
+                "lease_expires_at": record.lease_expires_at,
+            },
+        )
         self._heartbeat(current_job_id=record.job_id)
         self._execute_claimed_job(record)
         self._heartbeat(current_job_id=None)
@@ -144,6 +299,8 @@ class JobService:
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
+            self.prune_history_if_due()
+            self.emit_control_plane_alerts_if_due()
             processed = self.process_next_job()
             if not processed:
                 self._heartbeat(current_job_id=None)
@@ -151,6 +308,7 @@ class JobService:
                 continue
 
     def _execute_claimed_job(self, record: JobRecord) -> None:
+        renew_stop_event, renew_thread = self._start_lease_renewer(record.job_id)
         try:
             result_payload = self._run_job(record)
         except Exception as exc:
@@ -160,6 +318,12 @@ class JobService:
             failed.completed_at = _utc_now()
             failed.lease_expires_at = None
             self.job_repository.save(failed)
+            self._record_lease_event(
+                job_id=record.job_id,
+                worker_id=self._worker_id,
+                event_type="job_failed",
+                details={"error": str(exc)},
+            )
         else:
             completed = self.job_repository.get(record.job_id)
             completed.status = "completed"
@@ -168,6 +332,15 @@ class JobService:
             completed.completed_at = _utc_now()
             completed.lease_expires_at = None
             self.job_repository.save(completed)
+            self._record_lease_event(
+                job_id=record.job_id,
+                worker_id=self._worker_id,
+                event_type="job_completed",
+                details={},
+            )
+        finally:
+            renew_stop_event.set()
+            renew_thread.join(timeout=1)
 
     def _run_job(self, record: JobRecord) -> dict:
         if record.job_type == "audit-trace":
@@ -241,15 +414,25 @@ class JobService:
         }
 
     def _heartbeat(self, *, current_job_id: str | None) -> None:
+        recorded_at = _utc_now()
         self.job_repository.save_worker(
             WorkerRecord(
                 worker_id=self._worker_id,
                 mode=self.worker_mode,
                 status="running",
                 started_at=self._worker_started_at,
-                last_heartbeat_at=_utc_now(),
+                last_heartbeat_at=recorded_at,
                 host_name=self._host_name,
                 process_id=self._process_id,
+                current_job_id=current_job_id,
+            )
+        )
+        self.job_repository.append_worker_heartbeat(
+            WorkerHeartbeatRecord(
+                heartbeat_id=uuid4().hex[:16],
+                worker_id=self._worker_id,
+                recorded_at=recorded_at,
+                status="running",
                 current_job_id=current_job_id,
             )
         )
@@ -258,16 +441,75 @@ class JobService:
         self._heartbeat(current_job_id=current_job_id)
 
     def _mark_worker_stopped(self) -> None:
+        recorded_at = _utc_now()
         self.job_repository.save_worker(
             WorkerRecord(
                 worker_id=self._worker_id,
                 mode=self.worker_mode,
                 status="stopped",
                 started_at=self._worker_started_at,
-                last_heartbeat_at=_utc_now(),
+                last_heartbeat_at=recorded_at,
                 host_name=self._host_name,
                 process_id=self._process_id,
                 current_job_id=None,
+            )
+        )
+        self.job_repository.append_worker_heartbeat(
+            WorkerHeartbeatRecord(
+                heartbeat_id=uuid4().hex[:16],
+                worker_id=self._worker_id,
+                recorded_at=recorded_at,
+                status="stopped",
+                current_job_id=None,
+            )
+        )
+
+    def _start_lease_renewer(self, job_id: str) -> tuple[Event, Thread]:
+        stop_event = Event()
+        thread = Thread(
+            target=self._lease_renewal_loop,
+            args=(job_id, stop_event),
+            daemon=True,
+            name=f"lsa-lease-renewer-{job_id}",
+        )
+        thread.start()
+        return stop_event, thread
+
+    def _lease_renewal_loop(self, job_id: str, stop_event: Event) -> None:
+        renew_interval = max(self.heartbeat_timeout_seconds / 2, 0.1)
+        while not stop_event.wait(renew_interval):
+            next_lease_expires_at = self._lease_expires_at()
+            renewed = self.job_repository.renew_lease(
+                job_id=job_id,
+                worker_id=self._worker_id,
+                lease_expires_at=next_lease_expires_at,
+            )
+            if not renewed:
+                break
+            self._record_lease_event(
+                job_id=job_id,
+                worker_id=self._worker_id,
+                event_type="lease_renewed",
+                details={"lease_expires_at": next_lease_expires_at},
+            )
+            self._heartbeat(current_job_id=job_id)
+
+    def _record_lease_event(
+        self,
+        *,
+        job_id: str,
+        worker_id: str | None,
+        event_type: str,
+        details: dict,
+    ) -> None:
+        self.job_repository.append_job_lease_event(
+            JobLeaseEventRecord(
+                event_id=uuid4().hex[:16],
+                job_id=job_id,
+                worker_id=worker_id,
+                event_type=event_type,
+                recorded_at=_utc_now(),
+                details=details,
             )
         )
 

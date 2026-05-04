@@ -8,7 +8,14 @@ from lsa.core.intent_graph import IntentGraph
 from lsa.ingest.graph_builder import GraphBuilder
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import AuditRepository, JobRepository, SnapshotRepository
-from lsa.storage.models import WorkerRecord
+from lsa.storage.models import (
+    ControlPlaneAlertRecord,
+    ControlPlaneOnCallScheduleRecord,
+    ControlPlaneAlertSilenceRecord,
+    JobLeaseEventRecord,
+    WorkerHeartbeatRecord,
+    WorkerRecord,
+)
 from lsa.storage.models import AuditRecord
 
 
@@ -113,6 +120,196 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(fetched.current_job_id, "job-test")
             self.assertEqual(len(repo.list_workers()), 1)
             self.assertEqual(repo.count_workers_seen_since("2026-05-04T00:00:00+00:00"), 1)
+
+    def test_job_repository_persists_heartbeat_and_lease_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            heartbeat = WorkerHeartbeatRecord(
+                heartbeat_id="heartbeat-test",
+                worker_id="worker-test",
+                recorded_at="2026-05-04T00:00:02+00:00",
+                status="running",
+                current_job_id="job-test",
+            )
+            lease_event = JobLeaseEventRecord(
+                event_id="lease-event-test",
+                job_id="job-test",
+                worker_id="worker-test",
+                event_type="lease_claimed",
+                recorded_at="2026-05-04T00:00:03+00:00",
+                details={"lease_expires_at": "2026-05-04T00:00:08+00:00"},
+            )
+
+            repo.append_worker_heartbeat(heartbeat)
+            repo.append_job_lease_event(lease_event)
+
+            heartbeats = repo.list_worker_heartbeats("worker-test")
+            lease_events = repo.list_job_lease_events("job-test")
+            self.assertEqual(len(heartbeats), 1)
+            self.assertEqual(heartbeats[0].heartbeat_id, "heartbeat-test")
+            self.assertEqual(len(lease_events), 1)
+            self.assertEqual(lease_events[0].event_id, "lease-event-test")
+
+    def test_job_repository_prunes_old_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            repo.append_worker_heartbeat(
+                WorkerHeartbeatRecord(
+                    heartbeat_id="heartbeat-old",
+                    worker_id="worker-test",
+                    recorded_at="2020-01-01T00:00:00+00:00",
+                    status="running",
+                    current_job_id=None,
+                )
+            )
+            repo.append_job_lease_event(
+                JobLeaseEventRecord(
+                    event_id="lease-event-old",
+                    job_id="job-test",
+                    worker_id="worker-test",
+                    event_type="lease_claimed",
+                    recorded_at="2020-01-01T00:00:00+00:00",
+                    details={},
+                )
+            )
+
+            self.assertEqual(repo.prune_worker_heartbeats_before("2021-01-01T00:00:00+00:00"), 1)
+            self.assertEqual(repo.prune_job_lease_events_before("2021-01-01T00:00:00+00:00"), 1)
+            self.assertEqual(len(repo.list_worker_heartbeats("worker-test")), 0)
+            self.assertEqual(len(repo.list_job_lease_events("job-test")), 0)
+
+    def test_job_repository_compacts_old_history_into_rollups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            repo.append_worker_heartbeat(
+                WorkerHeartbeatRecord(
+                    heartbeat_id="heartbeat-old-1",
+                    worker_id="worker-test",
+                    recorded_at="2020-01-01T00:00:00+00:00",
+                    status="running",
+                    current_job_id=None,
+                )
+            )
+            repo.append_worker_heartbeat(
+                WorkerHeartbeatRecord(
+                    heartbeat_id="heartbeat-old-2",
+                    worker_id="worker-test",
+                    recorded_at="2020-01-01T01:00:00+00:00",
+                    status="running",
+                    current_job_id=None,
+                )
+            )
+            repo.append_job_lease_event(
+                JobLeaseEventRecord(
+                    event_id="lease-event-old-1",
+                    job_id="job-test",
+                    worker_id="worker-test",
+                    event_type="lease_claimed",
+                    recorded_at="2020-01-01T00:00:00+00:00",
+                    details={},
+                )
+            )
+            repo.append_job_lease_event(
+                JobLeaseEventRecord(
+                    event_id="lease-event-old-2",
+                    job_id="job-test",
+                    worker_id="worker-test",
+                    event_type="lease_claimed",
+                    recorded_at="2020-01-01T02:00:00+00:00",
+                    details={},
+                )
+            )
+
+            self.assertEqual(repo.compact_worker_heartbeats_before("2021-01-01T00:00:00+00:00"), 2)
+            self.assertEqual(repo.compact_job_lease_events_before("2021-01-01T00:00:00+00:00"), 2)
+            worker_rollups = repo.list_worker_heartbeat_rollups("worker-test")
+            lease_rollups = repo.list_job_lease_event_rollups("job-test")
+            self.assertEqual(len(repo.list_worker_heartbeats("worker-test")), 0)
+            self.assertEqual(len(repo.list_job_lease_events("job-test")), 0)
+            self.assertEqual(len(worker_rollups), 1)
+            self.assertEqual(worker_rollups[0].event_count, 2)
+            self.assertEqual(len(lease_rollups), 1)
+            self.assertEqual(lease_rollups[0].event_count, 2)
+
+    def test_job_repository_persists_control_plane_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            alert = ControlPlaneAlertRecord(
+                alert_id="alert-test",
+                created_at="2026-05-04T00:00:00+00:00",
+                alert_key="control-plane:critical:queue_backlog",
+                status="critical",
+                severity="critical",
+                summary="Queued job backlog is above the configured critical threshold.",
+                finding_codes=["queue_backlog"],
+                delivery_state="delivered",
+                payload={"report": {"evaluation": {"status": "critical"}}},
+                error=None,
+            )
+            repo.append_control_plane_alert(alert)
+
+            listed = repo.list_control_plane_alerts()
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0].alert_id, "alert-test")
+            self.assertEqual(repo.latest_control_plane_alert_by_key(alert.alert_key).alert_id, "alert-test")  # type: ignore[union-attr]
+            acknowledged = repo.acknowledge_control_plane_alert(
+                alert_id="alert-test",
+                acknowledged_at="2026-05-04T00:05:00+00:00",
+                acknowledged_by="operator-a",
+                acknowledgement_note="Acked for review",
+            )
+            self.assertEqual(acknowledged.acknowledged_by, "operator-a")
+
+    def test_job_repository_persists_control_plane_alert_silences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            silence = ControlPlaneAlertSilenceRecord(
+                silence_id="silence-test",
+                created_at="2026-05-04T00:00:00+00:00",
+                created_by="operator-a",
+                reason="Deployment",
+                match_finding_code="queue_backlog",
+                starts_at="2026-05-04T00:00:00+00:00",
+                expires_at="2026-05-04T01:00:00+00:00",
+            )
+            repo.append_control_plane_alert_silence(silence)
+            self.assertEqual(len(repo.list_control_plane_alert_silences()), 1)
+            cancelled = repo.cancel_control_plane_alert_silence(
+                silence_id="silence-test",
+                cancelled_at="2026-05-04T00:30:00+00:00",
+                cancelled_by="operator-a",
+            )
+            self.assertEqual(cancelled.cancelled_by, "operator-a")
+
+    def test_job_repository_persists_control_plane_oncall_schedules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            schedule = ControlPlaneOnCallScheduleRecord(
+                schedule_id="schedule-test",
+                created_at="2026-05-04T00:00:00+00:00",
+                created_by="operator-a",
+                team_name="platform",
+                timezone_name="UTC",
+                weekdays=[0, 1, 2],
+                start_time="09:00",
+                end_time="17:00",
+                webhook_url="https://example.com/team",
+                escalation_webhook_url="https://example.com/escalate",
+            )
+            repo.append_control_plane_oncall_schedule(schedule)
+            self.assertEqual(len(repo.list_control_plane_oncall_schedules()), 1)
+            cancelled = repo.cancel_control_plane_oncall_schedule(
+                schedule_id="schedule-test",
+                cancelled_at="2026-05-04T12:00:00+00:00",
+                cancelled_by="operator-a",
+            )
+            self.assertEqual(cancelled.cancelled_by, "operator-a")
 
     def test_snapshot_repository_imports_legacy_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

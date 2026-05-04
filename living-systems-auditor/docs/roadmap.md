@@ -35,6 +35,16 @@
 - Recover stale `running` jobs on startup so the local worker can resume after a process restart.
 - Split queue execution into a standalone worker process so the API can run without owning job execution.
 - Track worker heartbeats and job leases explicitly so the API can report live execution health instead of only queue depth.
+- Renew active leases during long-running jobs and let healthy workers reclaim expired leases from stale owners.
+- Persist append-only heartbeat and lease-event history so ownership changes can be reviewed after incidents.
+- Enforce retention windows and explicit pruning for the new history tables so forensic state does not grow unbounded.
+- Compact older raw heartbeat and lease-event records into daily summaries before pruning them.
+- Expose control-plane analytics over API and CLI so operators can review worker health, lease churn, and queue throughput across mixed raw and rolled-up history.
+- Add config-backed control-plane evaluation so analytics windows can be marked healthy, degraded, or critical with explicit findings.
+- Persist and emit deduplicated control-plane alerts so degraded or critical evaluations can reach operators through durable local sinks and optional webhooks.
+- Add acknowledgement and bounded silencing so operators can own or temporarily mute specific control-plane alert classes without losing analytics visibility.
+- Add reminder timers and escalation routing so unacknowledged incidents can follow an explicit follow-up path.
+- Add calendar-aware on-call schedules so alert routing can follow team coverage windows instead of one global destination.
 - Add drift thresholds for new hosts, latency shifts, and novel exception classes.
 - Capture repeatable demo traces for the first live proof point.
 
@@ -46,8 +56,15 @@
 - Add operator review loops so the system can learn from accepted and rejected reports.
 - Replace in-process background threads with a durable worker/executor model.
 - Extend the standalone worker into a supervised multi-worker model with explicit concurrency control and heartbeats.
-- Add lease renewal and stale-worker takeover logic for long-running jobs.
+- Add worker heartbeat history and lease event auditing for forensic visibility.
+- Add retention, pruning, and rollup policy for the growing heartbeat and lease-event history tables.
+- Add historical rollups and summary compaction so old heartbeat and lease-event data can stay queryable at lower cost.
 - Replace the single shared API-key model with tenant-aware identity, authz, and audit logging.
+- Add alerting hooks and operator SLO thresholds on top of the new control-plane analytics surface.
+- Add acknowledgement, silencing, and escalation policy on top of control-plane alert history.
+- Add escalation routing, reminder timers, and on-call policy on top of acknowledgements and silences.
+- Add calendar-aware on-call schedules and team routing on top of the current reminder/escalation primitives.
+- Add rotation-aware handoffs and holiday overrides on top of the current schedule-based routing.
 
 ## Flashpoint note
 

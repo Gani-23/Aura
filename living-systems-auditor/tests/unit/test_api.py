@@ -7,6 +7,9 @@ import unittest
 from fastapi.testclient import TestClient
 
 from lsa.api import main as api_main
+from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
+from lsa.services.control_plane_alert_service import ControlPlaneAlertService
+from lsa.storage.models import JobLeaseEventRecord, WorkerHeartbeatRecord
 
 
 class ApiTests(unittest.TestCase):
@@ -20,6 +23,8 @@ class ApiTests(unittest.TestCase):
             api_main.settings = api_main.resolve_workspace_settings(tmpdir)
             api_main.settings.api_key = "test-key"
             api_main.settings.run_embedded_worker = True
+            api_main.settings.worker_history_retention_days = 1
+            api_main.settings.job_lease_history_retention_days = 1
             api_main.settings.data_dir.mkdir(parents=True, exist_ok=True)
             api_main.settings.destination_aliases_path.write_text(
                 json.dumps({"93.184.216.34": "api.stripe.com"}),
@@ -41,12 +46,41 @@ class ApiTests(unittest.TestCase):
                 settings=api_main.settings,
             )
             api_main.trace_collection_service = api_main.TraceCollectionService(settings=api_main.settings)
+            api_main.analytics_service = AnalyticsService(
+                job_repository=api_main.job_repository,
+                heartbeat_timeout_seconds=api_main.settings.worker_heartbeat_timeout_seconds,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    queue_warning_threshold=api_main.settings.analytics_queue_warning_threshold,
+                    queue_critical_threshold=api_main.settings.analytics_queue_critical_threshold,
+                    stale_worker_warning_threshold=api_main.settings.analytics_stale_worker_warning_threshold,
+                    stale_worker_critical_threshold=api_main.settings.analytics_stale_worker_critical_threshold,
+                    expired_lease_warning_threshold=api_main.settings.analytics_expired_lease_warning_threshold,
+                    expired_lease_critical_threshold=api_main.settings.analytics_expired_lease_critical_threshold,
+                    job_failure_rate_warning_threshold=api_main.settings.analytics_job_failure_rate_warning_threshold,
+                    job_failure_rate_critical_threshold=api_main.settings.analytics_job_failure_rate_critical_threshold,
+                    job_failure_rate_min_samples=api_main.settings.analytics_job_failure_rate_min_samples,
+                ),
+            )
+            api_main.control_plane_alert_service = ControlPlaneAlertService(
+                job_repository=api_main.job_repository,
+                analytics_service=api_main.analytics_service,
+                window_days=api_main.settings.control_plane_alert_window_days,
+                dedup_window_seconds=api_main.settings.control_plane_alert_dedup_window_seconds,
+                sink_path=str(api_main.settings.control_plane_alert_sink_path),
+                webhook_url=api_main.settings.control_plane_alert_webhook_url,
+            )
             api_main.job_service = api_main.JobService(
                 job_repository=api_main.job_repository,
                 audit_service=api_main.audit_service,
                 trace_collection_service=api_main.trace_collection_service,
                 worker_mode="embedded",
                 heartbeat_timeout_seconds=api_main.settings.worker_heartbeat_timeout_seconds,
+                worker_history_retention_days=api_main.settings.worker_history_retention_days,
+                job_lease_history_retention_days=api_main.settings.job_lease_history_retention_days,
+                history_prune_interval_seconds=api_main.settings.history_prune_interval_seconds,
+                control_plane_alert_service=api_main.control_plane_alert_service,
+                control_plane_alert_interval_seconds=api_main.settings.control_plane_alert_interval_seconds,
+                control_plane_alerts_enabled=api_main.settings.control_plane_alerts_enabled,
             )
             auth_headers = {"X-API-Key": "test-key"}
             with TestClient(api_main.app) as client:
@@ -278,6 +312,126 @@ class ApiTests(unittest.TestCase):
                 worker_detail = client.get(f"/workers/{worker_id}", headers=auth_headers)
                 self.assertEqual(worker_detail.status_code, 200)
                 self.assertEqual(worker_detail.json()["mode"], "embedded")
+                worker_heartbeats = client.get(f"/workers/{worker_id}/heartbeats", headers=auth_headers)
+                self.assertEqual(worker_heartbeats.status_code, 200)
+                self.assertGreaterEqual(len(worker_heartbeats.json()), 1)
+                lease_events = client.get(
+                    f"/jobs/{collect_job_payload['job_id']}/lease-events",
+                    headers=auth_headers,
+                )
+                self.assertEqual(lease_events.status_code, 200)
+                self.assertTrue(any(item["event_type"] == "lease_claimed" for item in lease_events.json()))
+
+                api_main.job_repository.append_worker_heartbeat(
+                    WorkerHeartbeatRecord(
+                        heartbeat_id="heartbeat-old",
+                        worker_id=worker_id,
+                        recorded_at="2020-01-01T00:00:00+00:00",
+                        status="running",
+                        current_job_id=None,
+                    )
+                )
+                api_main.job_repository.append_job_lease_event(
+                    JobLeaseEventRecord(
+                        event_id="lease-event-old",
+                        job_id=collect_job_payload["job_id"],
+                        worker_id=worker_id,
+                        event_type="lease_claimed",
+                        recorded_at="2020-01-01T00:00:00+00:00",
+                        details={},
+                    )
+                )
+                prune_response = client.post("/maintenance/prune-history", headers=auth_headers)
+                self.assertEqual(prune_response.status_code, 200)
+                self.assertGreaterEqual(prune_response.json()["worker_heartbeats_compacted"], 1)
+                self.assertGreaterEqual(prune_response.json()["job_lease_events_compacted"], 1)
+                self.assertGreaterEqual(prune_response.json()["worker_heartbeats_pruned"], 1)
+                self.assertGreaterEqual(prune_response.json()["job_lease_events_pruned"], 1)
+                heartbeat_rollups = client.get(f"/workers/{worker_id}/heartbeat-rollups", headers=auth_headers)
+                self.assertEqual(heartbeat_rollups.status_code, 200)
+                self.assertGreaterEqual(len(heartbeat_rollups.json()), 1)
+                lease_rollups = client.get(
+                    f"/jobs/{collect_job_payload['job_id']}/lease-event-rollups",
+                    headers=auth_headers,
+                )
+                self.assertEqual(lease_rollups.status_code, 200)
+                self.assertGreaterEqual(len(lease_rollups.json()), 1)
+                analytics = client.get("/analytics/control-plane?days=30", headers=auth_headers)
+                self.assertEqual(analytics.status_code, 200)
+                analytics_payload = analytics.json()
+                self.assertEqual(analytics_payload["window_days"], 30)
+                self.assertGreaterEqual(analytics_payload["queue"]["completed_jobs"], 2)
+                self.assertGreaterEqual(analytics_payload["workers"]["total_workers_seen"], 1)
+                self.assertGreaterEqual(analytics_payload["leases"]["total_events"], 1)
+                self.assertEqual(len(analytics_payload["jobs"]["days"]), 30)
+                self.assertIn("evaluation", analytics_payload)
+                self.assertIn("status", analytics_payload["evaluation"])
+                self.assertIn("thresholds", analytics_payload["evaluation"])
+                alert_emit = client.post("/maintenance/emit-control-plane-alerts", headers=auth_headers)
+                self.assertEqual(alert_emit.status_code, 200)
+                alert_payload = alert_emit.json()
+                self.assertIn("emitted_count", alert_payload)
+                followup_emit = client.post("/maintenance/process-control-plane-alert-followups", headers=auth_headers)
+                self.assertEqual(followup_emit.status_code, 200)
+                self.assertIn("emitted_count", followup_emit.json())
+                alert_list = client.get("/control-plane-alerts", headers=auth_headers)
+                self.assertEqual(alert_list.status_code, 200)
+                self.assertGreaterEqual(len(alert_list.json()), alert_payload["emitted_count"])
+                if alert_list.json():
+                    alert_id = alert_list.json()[0]["alert_id"]
+                    ack_response = client.post(
+                        f"/control-plane-alerts/{alert_id}/acknowledge",
+                        json={"acknowledged_by": "operator-api", "acknowledgement_note": "Watching"},
+                        headers=auth_headers,
+                    )
+                    self.assertEqual(ack_response.status_code, 200)
+                    self.assertEqual(ack_response.json()["acknowledged_by"], "operator-api")
+                silence_response = client.post(
+                    "/control-plane-alert-silences",
+                    json={
+                        "created_by": "operator-api",
+                        "reason": "maintenance",
+                        "duration_minutes": 15,
+                        "match_finding_code": "queue_without_active_workers",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(silence_response.status_code, 200)
+                silence_id = silence_response.json()["silence_id"]
+                silence_list = client.get("/control-plane-alert-silences?active_only=true", headers=auth_headers)
+                self.assertEqual(silence_list.status_code, 200)
+                self.assertGreaterEqual(len(silence_list.json()), 1)
+                cancel_silence = client.post(
+                    f"/control-plane-alert-silences/{silence_id}/cancel",
+                    json={"cancelled_by": "operator-api"},
+                    headers=auth_headers,
+                )
+                self.assertEqual(cancel_silence.status_code, 200)
+                self.assertEqual(cancel_silence.json()["cancelled_by"], "operator-api")
+                schedule_response = client.post(
+                    "/control-plane-oncall-schedules",
+                    json={
+                        "created_by": "operator-api",
+                        "team_name": "platform-api",
+                        "timezone_name": "UTC",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "start_time": "00:00",
+                        "end_time": "23:59",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(schedule_response.status_code, 200)
+                schedule_id = schedule_response.json()["schedule_id"]
+                schedule_list = client.get("/control-plane-oncall-schedules?active_only=true", headers=auth_headers)
+                self.assertEqual(schedule_list.status_code, 200)
+                self.assertGreaterEqual(len(schedule_list.json()), 1)
+                schedule_cancel = client.post(
+                    f"/control-plane-oncall-schedules/{schedule_id}/cancel",
+                    json={"cancelled_by": "operator-api"},
+                    headers=auth_headers,
+                )
+                self.assertEqual(schedule_cancel.status_code, 200)
+                self.assertEqual(schedule_cancel.json()["cancelled_by"], "operator-api")
 
                 stored_audits = client.get("/audits", headers=auth_headers)
                 self.assertEqual(stored_audits.status_code, 200)

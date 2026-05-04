@@ -3,21 +3,37 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi import Query
 
 from lsa.api.models import (
+    AcknowledgeControlPlaneAlertRequest,
     AuditRecordPayload,
     AuditRequest,
     AuditResponse,
     AuditTraceRequest,
+    CancelControlPlaneAlertSilenceRequest,
+    CancelControlPlaneOnCallScheduleRequest,
     CollectAuditRequest,
     CollectAuditResponse,
     CollectTraceRequest,
     CollectTraceResponse,
+    ControlPlaneAnalyticsResponse,
+    ControlPlaneAlertRecordPayload,
+    ControlPlaneAlertSilencePayload,
+    ControlPlaneOnCallSchedulePayload,
+    CreateControlPlaneAlertSilenceRequest,
+    CreateControlPlaneOnCallScheduleRequest,
+    EmitControlPlaneAlertsResponse,
     HealthResponse,
     IngestRequest,
     IngestResponse,
+    JobLeaseEventPayload,
+    JobLeaseEventRollupPayload,
     JobRecordPayload,
+    PruneHistoryResponse,
     SnapshotRecordPayload,
+    WorkerHeartbeatPayload,
+    WorkerHeartbeatRollupPayload,
     WorkerRecordPayload,
 )
 from lsa.core.intent_graph import IntentGraph
@@ -26,6 +42,8 @@ from lsa.drift.models import ObservedEvent
 from lsa.drift.trace_parser import load_trace_events
 from lsa.remediation.llm_client import RuleBasedLLMClient
 from lsa.services.audit_service import AuditService
+from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
+from lsa.services.control_plane_alert_service import ControlPlaneAlertService
 from lsa.services.ingest_service import IngestService
 from lsa.services.job_service import JobService
 from lsa.services.trace_collection_service import TraceCollectionRequest, TraceCollectionService
@@ -48,12 +66,44 @@ audit_service = AuditService(
     settings=settings,
 )
 trace_collection_service = TraceCollectionService(settings=settings)
+analytics_service = AnalyticsService(
+    job_repository=job_repository,
+    heartbeat_timeout_seconds=settings.worker_heartbeat_timeout_seconds,
+    default_thresholds=ControlPlaneAlertThresholds(
+        queue_warning_threshold=settings.analytics_queue_warning_threshold,
+        queue_critical_threshold=settings.analytics_queue_critical_threshold,
+        stale_worker_warning_threshold=settings.analytics_stale_worker_warning_threshold,
+        stale_worker_critical_threshold=settings.analytics_stale_worker_critical_threshold,
+        expired_lease_warning_threshold=settings.analytics_expired_lease_warning_threshold,
+        expired_lease_critical_threshold=settings.analytics_expired_lease_critical_threshold,
+        job_failure_rate_warning_threshold=settings.analytics_job_failure_rate_warning_threshold,
+        job_failure_rate_critical_threshold=settings.analytics_job_failure_rate_critical_threshold,
+        job_failure_rate_min_samples=settings.analytics_job_failure_rate_min_samples,
+    ),
+)
+control_plane_alert_service = ControlPlaneAlertService(
+    job_repository=job_repository,
+    analytics_service=analytics_service,
+    window_days=settings.control_plane_alert_window_days,
+    dedup_window_seconds=settings.control_plane_alert_dedup_window_seconds,
+    reminder_interval_seconds=settings.control_plane_alert_reminder_interval_seconds,
+    escalation_interval_seconds=settings.control_plane_alert_escalation_interval_seconds,
+    sink_path=str(settings.control_plane_alert_sink_path),
+    webhook_url=settings.control_plane_alert_webhook_url,
+    escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
+)
 job_service = JobService(
     job_repository=job_repository,
     audit_service=audit_service,
     trace_collection_service=trace_collection_service,
     worker_mode="embedded",
     heartbeat_timeout_seconds=settings.worker_heartbeat_timeout_seconds,
+    worker_history_retention_days=settings.worker_history_retention_days,
+    job_lease_history_retention_days=settings.job_lease_history_retention_days,
+    history_prune_interval_seconds=settings.history_prune_interval_seconds,
+    control_plane_alert_service=control_plane_alert_service,
+    control_plane_alert_interval_seconds=settings.control_plane_alert_interval_seconds,
+    control_plane_alerts_enabled=settings.control_plane_alerts_enabled,
 )
 
 
@@ -147,6 +197,24 @@ async def get_job(job_id: str) -> JobRecordPayload:
     return JobRecordPayload(**record.to_dict())
 
 
+@app.get("/jobs/{job_id}/lease-events", response_model=list[JobLeaseEventPayload], dependencies=[Depends(require_api_key)])
+async def list_job_lease_events(job_id: str) -> list[JobLeaseEventPayload]:
+    try:
+        job_service.get_job(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' was not found.") from exc
+    return [JobLeaseEventPayload(**record.to_dict()) for record in job_service.list_job_lease_events(job_id)]
+
+
+@app.get("/jobs/{job_id}/lease-event-rollups", response_model=list[JobLeaseEventRollupPayload], dependencies=[Depends(require_api_key)])
+async def list_job_lease_event_rollups(job_id: str) -> list[JobLeaseEventRollupPayload]:
+    try:
+        job_service.get_job(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' was not found.") from exc
+    return [JobLeaseEventRollupPayload(**record.to_dict()) for record in job_repository.list_job_lease_event_rollups(job_id)]
+
+
 @app.get("/workers", response_model=list[WorkerRecordPayload], dependencies=[Depends(require_api_key)])
 async def list_workers() -> list[WorkerRecordPayload]:
     return [WorkerRecordPayload(**record.to_dict()) for record in job_service.list_workers()]
@@ -159,6 +227,203 @@ async def get_worker(worker_id: str) -> WorkerRecordPayload:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Worker '{worker_id}' was not found.") from exc
     return WorkerRecordPayload(**record.to_dict())
+
+
+@app.get("/workers/{worker_id}/heartbeats", response_model=list[WorkerHeartbeatPayload], dependencies=[Depends(require_api_key)])
+async def list_worker_heartbeats(worker_id: str) -> list[WorkerHeartbeatPayload]:
+    try:
+        job_service.get_worker(worker_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Worker '{worker_id}' was not found.") from exc
+    return [WorkerHeartbeatPayload(**record.to_dict()) for record in job_service.list_worker_heartbeats(worker_id)]
+
+
+@app.get("/workers/{worker_id}/heartbeat-rollups", response_model=list[WorkerHeartbeatRollupPayload], dependencies=[Depends(require_api_key)])
+async def list_worker_heartbeat_rollups(worker_id: str) -> list[WorkerHeartbeatRollupPayload]:
+    try:
+        job_service.get_worker(worker_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Worker '{worker_id}' was not found.") from exc
+    return [WorkerHeartbeatRollupPayload(**record.to_dict()) for record in job_repository.list_worker_heartbeat_rollups(worker_id)]
+
+
+@app.post("/maintenance/prune-history", response_model=PruneHistoryResponse, dependencies=[Depends(require_api_key)])
+async def prune_history() -> PruneHistoryResponse:
+    result = job_service.prune_history(force=True)
+    return PruneHistoryResponse(**result)
+
+
+@app.post(
+    "/maintenance/emit-control-plane-alerts",
+    response_model=EmitControlPlaneAlertsResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def emit_control_plane_alerts() -> EmitControlPlaneAlertsResponse:
+    alerts = job_service.emit_control_plane_alerts(force=True)
+    return EmitControlPlaneAlertsResponse(
+        emitted_count=len(alerts),
+        alerts=[ControlPlaneAlertRecordPayload(**record.to_dict()) for record in alerts],
+    )
+
+
+@app.post(
+    "/maintenance/process-control-plane-alert-followups",
+    response_model=EmitControlPlaneAlertsResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def process_control_plane_alert_followups() -> EmitControlPlaneAlertsResponse:
+    alerts = job_service.process_control_plane_alert_follow_ups(force=True)
+    return EmitControlPlaneAlertsResponse(
+        emitted_count=len(alerts),
+        alerts=[ControlPlaneAlertRecordPayload(**record.to_dict()) for record in alerts],
+    )
+
+
+@app.get(
+    "/analytics/control-plane",
+    response_model=ControlPlaneAnalyticsResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_control_plane_analytics(days: int = Query(default=30, ge=1, le=365)) -> ControlPlaneAnalyticsResponse:
+    report = analytics_service.build_control_plane_analytics(days=days)
+    return ControlPlaneAnalyticsResponse(**report.to_dict())
+
+
+@app.get(
+    "/control-plane-alerts",
+    response_model=list[ControlPlaneAlertRecordPayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_control_plane_alerts(limit: int = Query(default=50, ge=1, le=500)) -> list[ControlPlaneAlertRecordPayload]:
+    return [ControlPlaneAlertRecordPayload(**record.to_dict()) for record in job_service.list_control_plane_alerts(limit)]
+
+
+@app.post(
+    "/control-plane-alerts/{alert_id}/acknowledge",
+    response_model=ControlPlaneAlertRecordPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def acknowledge_control_plane_alert(
+    alert_id: str,
+    request: AcknowledgeControlPlaneAlertRequest,
+) -> ControlPlaneAlertRecordPayload:
+    try:
+        record = job_service.acknowledge_control_plane_alert(
+            alert_id=alert_id,
+            acknowledged_by=request.acknowledged_by,
+            acknowledgement_note=request.acknowledgement_note,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Control-plane alert '{alert_id}' was not found.") from exc
+    return ControlPlaneAlertRecordPayload(**record.to_dict())
+
+
+@app.get(
+    "/control-plane-alert-silences",
+    response_model=list[ControlPlaneAlertSilencePayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_control_plane_alert_silences(
+    active_only: bool = Query(default=False),
+) -> list[ControlPlaneAlertSilencePayload]:
+    return [
+        ControlPlaneAlertSilencePayload(**record.to_dict())
+        for record in job_service.list_control_plane_alert_silences(active_only=active_only)
+    ]
+
+
+@app.post(
+    "/control-plane-alert-silences",
+    response_model=ControlPlaneAlertSilencePayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def create_control_plane_alert_silence(
+    request: CreateControlPlaneAlertSilenceRequest,
+) -> ControlPlaneAlertSilencePayload:
+    record = job_service.create_control_plane_alert_silence(
+        created_by=request.created_by,
+        reason=request.reason,
+        duration_minutes=request.duration_minutes,
+        match_alert_key=request.match_alert_key,
+        match_finding_code=request.match_finding_code,
+    )
+    return ControlPlaneAlertSilencePayload(**record.to_dict())
+
+
+@app.post(
+    "/control-plane-alert-silences/{silence_id}/cancel",
+    response_model=ControlPlaneAlertSilencePayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def cancel_control_plane_alert_silence(
+    silence_id: str,
+    request: CancelControlPlaneAlertSilenceRequest,
+) -> ControlPlaneAlertSilencePayload:
+    try:
+        record = job_service.cancel_control_plane_alert_silence(
+            silence_id=silence_id,
+            cancelled_by=request.cancelled_by,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Control-plane alert silence '{silence_id}' was not found.") from exc
+    return ControlPlaneAlertSilencePayload(**record.to_dict())
+
+
+@app.get(
+    "/control-plane-oncall-schedules",
+    response_model=list[ControlPlaneOnCallSchedulePayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_control_plane_oncall_schedules(
+    active_only: bool = Query(default=False),
+) -> list[ControlPlaneOnCallSchedulePayload]:
+    return [
+        ControlPlaneOnCallSchedulePayload(**record.to_dict())
+        for record in control_plane_alert_service.list_oncall_schedules(active_only=active_only)
+    ]
+
+
+@app.post(
+    "/control-plane-oncall-schedules",
+    response_model=ControlPlaneOnCallSchedulePayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def create_control_plane_oncall_schedule(
+    request: CreateControlPlaneOnCallScheduleRequest,
+) -> ControlPlaneOnCallSchedulePayload:
+    try:
+        record = control_plane_alert_service.create_oncall_schedule(
+            created_by=request.created_by,
+            team_name=request.team_name,
+            timezone_name=request.timezone_name,
+            weekdays=request.weekdays,
+            start_time=request.start_time,
+            end_time=request.end_time,
+            webhook_url=request.webhook_url,
+            escalation_webhook_url=request.escalation_webhook_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneOnCallSchedulePayload(**record.to_dict())
+
+
+@app.post(
+    "/control-plane-oncall-schedules/{schedule_id}/cancel",
+    response_model=ControlPlaneOnCallSchedulePayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def cancel_control_plane_oncall_schedule(
+    schedule_id: str,
+    request: CancelControlPlaneOnCallScheduleRequest,
+) -> ControlPlaneOnCallSchedulePayload:
+    try:
+        record = control_plane_alert_service.cancel_oncall_schedule(
+            schedule_id=schedule_id,
+            cancelled_by=request.cancelled_by,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Control-plane on-call schedule '{schedule_id}' was not found.") from exc
+    return ControlPlaneOnCallSchedulePayload(**record.to_dict())
 
 
 @app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_api_key)])

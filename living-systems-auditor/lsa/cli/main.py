@@ -12,6 +12,8 @@ from lsa.drift.signal_processor import load_events
 from lsa.drift.trace_parser import load_trace_events
 from lsa.remediation.llm_client import RuleBasedLLMClient
 from lsa.services.audit_service import AuditService
+from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
+from lsa.services.control_plane_alert_service import ControlPlaneAlertService
 from lsa.services.ingest_service import IngestService
 from lsa.services.job_service import JobService
 from lsa.services.trace_collection_service import TraceCollectionRequest, TraceCollectionService
@@ -34,12 +36,44 @@ audit_service = AuditService(
     settings=settings,
 )
 trace_collection_service = TraceCollectionService(settings=settings)
+analytics_service = AnalyticsService(
+    job_repository=job_repository,
+    heartbeat_timeout_seconds=settings.worker_heartbeat_timeout_seconds,
+    default_thresholds=ControlPlaneAlertThresholds(
+        queue_warning_threshold=settings.analytics_queue_warning_threshold,
+        queue_critical_threshold=settings.analytics_queue_critical_threshold,
+        stale_worker_warning_threshold=settings.analytics_stale_worker_warning_threshold,
+        stale_worker_critical_threshold=settings.analytics_stale_worker_critical_threshold,
+        expired_lease_warning_threshold=settings.analytics_expired_lease_warning_threshold,
+        expired_lease_critical_threshold=settings.analytics_expired_lease_critical_threshold,
+        job_failure_rate_warning_threshold=settings.analytics_job_failure_rate_warning_threshold,
+        job_failure_rate_critical_threshold=settings.analytics_job_failure_rate_critical_threshold,
+        job_failure_rate_min_samples=settings.analytics_job_failure_rate_min_samples,
+    ),
+)
+control_plane_alert_service = ControlPlaneAlertService(
+    job_repository=job_repository,
+    analytics_service=analytics_service,
+    window_days=settings.control_plane_alert_window_days,
+    dedup_window_seconds=settings.control_plane_alert_dedup_window_seconds,
+    reminder_interval_seconds=settings.control_plane_alert_reminder_interval_seconds,
+    escalation_interval_seconds=settings.control_plane_alert_escalation_interval_seconds,
+    sink_path=str(settings.control_plane_alert_sink_path),
+    webhook_url=settings.control_plane_alert_webhook_url,
+    escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
+)
 job_service = JobService(
     job_repository=job_repository,
     audit_service=audit_service,
     trace_collection_service=trace_collection_service,
     worker_mode="standalone",
     heartbeat_timeout_seconds=settings.worker_heartbeat_timeout_seconds,
+    worker_history_retention_days=settings.worker_history_retention_days,
+    job_lease_history_retention_days=settings.job_lease_history_retention_days,
+    history_prune_interval_seconds=settings.history_prune_interval_seconds,
+    control_plane_alert_service=control_plane_alert_service,
+    control_plane_alert_interval_seconds=settings.control_plane_alert_interval_seconds,
+    control_plane_alerts_enabled=settings.control_plane_alerts_enabled,
 )
 
 
@@ -109,6 +143,91 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("list-audits", help="List persisted audit records.")
     subparsers.add_parser("list-jobs", help="List persisted job records.")
     subparsers.add_parser("list-workers", help="List persisted worker records.")
+    worker_heartbeats = subparsers.add_parser("list-worker-heartbeats", help="List recorded heartbeats for a worker.")
+    worker_heartbeats.add_argument("worker_id")
+    worker_heartbeat_rollups = subparsers.add_parser(
+        "list-worker-heartbeat-rollups",
+        help="List daily heartbeat rollups for a worker.",
+    )
+    worker_heartbeat_rollups.add_argument("worker_id")
+    job_lease_events = subparsers.add_parser("list-job-lease-events", help="List recorded lease events for a job.")
+    job_lease_events.add_argument("job_id")
+    job_lease_event_rollups = subparsers.add_parser(
+        "list-job-lease-event-rollups",
+        help="List daily lease-event rollups for a job.",
+    )
+    job_lease_event_rollups.add_argument("job_id")
+    control_plane_analytics = subparsers.add_parser(
+        "control-plane-analytics",
+        help="Show operational trends for queue, workers, and lease activity.",
+    )
+    control_plane_analytics.add_argument("--days", type=int, default=30)
+    emit_control_plane_alerts = subparsers.add_parser(
+        "emit-control-plane-alerts",
+        help="Force emission of current control-plane alerts through configured targets.",
+    )
+    emit_control_plane_alerts.add_argument("--force", action="store_true")
+    process_control_plane_alert_followups = subparsers.add_parser(
+        "process-control-plane-alert-followups",
+        help="Force reminder/escalation follow-up processing for active control-plane alerts.",
+    )
+    process_control_plane_alert_followups.add_argument("--force", action="store_true")
+    list_control_plane_alerts = subparsers.add_parser(
+        "list-control-plane-alerts",
+        help="List persisted control-plane alert emissions.",
+    )
+    list_control_plane_alerts.add_argument("--limit", type=int, default=50)
+    acknowledge_control_plane_alert = subparsers.add_parser(
+        "acknowledge-control-plane-alert",
+        help="Acknowledge a persisted control-plane alert.",
+    )
+    acknowledge_control_plane_alert.add_argument("alert_id")
+    acknowledge_control_plane_alert.add_argument("--by", required=True)
+    acknowledge_control_plane_alert.add_argument("--note", default=None)
+    create_control_plane_alert_silence = subparsers.add_parser(
+        "create-control-plane-alert-silence",
+        help="Silence future control-plane alerts by alert key or finding code for a fixed duration.",
+    )
+    create_control_plane_alert_silence.add_argument("--by", required=True)
+    create_control_plane_alert_silence.add_argument("--reason", required=True)
+    create_control_plane_alert_silence.add_argument("--duration-minutes", type=int, required=True)
+    create_control_plane_alert_silence.add_argument("--alert-key", default=None)
+    create_control_plane_alert_silence.add_argument("--finding-code", default=None)
+    list_control_plane_alert_silences = subparsers.add_parser(
+        "list-control-plane-alert-silences",
+        help="List control-plane alert silences.",
+    )
+    list_control_plane_alert_silences.add_argument("--active-only", action="store_true")
+    cancel_control_plane_alert_silence = subparsers.add_parser(
+        "cancel-control-plane-alert-silence",
+        help="Cancel a control-plane alert silence.",
+    )
+    cancel_control_plane_alert_silence.add_argument("silence_id")
+    cancel_control_plane_alert_silence.add_argument("--by", required=True)
+    create_control_plane_oncall_schedule = subparsers.add_parser(
+        "create-control-plane-oncall-schedule",
+        help="Create a timezone-aware on-call route for control-plane alerts.",
+    )
+    create_control_plane_oncall_schedule.add_argument("--by", required=True)
+    create_control_plane_oncall_schedule.add_argument("--team", required=True)
+    create_control_plane_oncall_schedule.add_argument("--timezone", required=True)
+    create_control_plane_oncall_schedule.add_argument("--weekdays", nargs="+", type=int, required=True)
+    create_control_plane_oncall_schedule.add_argument("--start-time", required=True)
+    create_control_plane_oncall_schedule.add_argument("--end-time", required=True)
+    create_control_plane_oncall_schedule.add_argument("--webhook-url", default=None)
+    create_control_plane_oncall_schedule.add_argument("--escalation-webhook-url", default=None)
+    list_control_plane_oncall_schedules = subparsers.add_parser(
+        "list-control-plane-oncall-schedules",
+        help="List control-plane on-call schedules.",
+    )
+    list_control_plane_oncall_schedules.add_argument("--active-only", action="store_true")
+    cancel_control_plane_oncall_schedule = subparsers.add_parser(
+        "cancel-control-plane-oncall-schedule",
+        help="Cancel a control-plane on-call schedule.",
+    )
+    cancel_control_plane_oncall_schedule.add_argument("schedule_id")
+    cancel_control_plane_oncall_schedule.add_argument("--by", required=True)
+    subparsers.add_parser("prune-history", help="Prune retained worker heartbeat and lease-event history.")
 
     return parser
 
@@ -312,6 +431,135 @@ def run_worker(
     return 0
 
 
+def run_prune_history() -> int:
+    payload = job_service.prune_history(force=True)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def run_control_plane_analytics(*, days: int) -> int:
+    payload = analytics_service.build_control_plane_analytics(days=days).to_dict()
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def run_emit_control_plane_alerts(*, force: bool) -> int:
+    alerts = job_service.emit_control_plane_alerts(force=force)
+    payload = {
+        "emitted_count": len(alerts),
+        "alerts": [record.to_dict() for record in alerts],
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def run_process_control_plane_alert_followups(*, force: bool) -> int:
+    alerts = job_service.process_control_plane_alert_follow_ups(force=force)
+    payload = {
+        "emitted_count": len(alerts),
+        "alerts": [record.to_dict() for record in alerts],
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def run_list_control_plane_alerts(*, limit: int) -> int:
+    print(json.dumps([record.to_dict() for record in job_service.list_control_plane_alerts(limit)], indent=2))
+    return 0
+
+
+def run_acknowledge_control_plane_alert(*, alert_id: str, acknowledged_by: str, acknowledgement_note: str | None) -> int:
+    record = job_service.acknowledge_control_plane_alert(
+        alert_id=alert_id,
+        acknowledged_by=acknowledged_by,
+        acknowledgement_note=acknowledgement_note,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_create_control_plane_alert_silence(
+    *,
+    created_by: str,
+    reason: str,
+    duration_minutes: int,
+    match_alert_key: str | None,
+    match_finding_code: str | None,
+) -> int:
+    record = job_service.create_control_plane_alert_silence(
+        created_by=created_by,
+        reason=reason,
+        duration_minutes=duration_minutes,
+        match_alert_key=match_alert_key,
+        match_finding_code=match_finding_code,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_list_control_plane_alert_silences(*, active_only: bool) -> int:
+    print(
+        json.dumps(
+            [record.to_dict() for record in job_service.list_control_plane_alert_silences(active_only=active_only)],
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_cancel_control_plane_alert_silence(*, silence_id: str, cancelled_by: str) -> int:
+    record = job_service.cancel_control_plane_alert_silence(
+        silence_id=silence_id,
+        cancelled_by=cancelled_by,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_create_control_plane_oncall_schedule(
+    *,
+    created_by: str,
+    team_name: str,
+    timezone_name: str,
+    weekdays: list[int],
+    start_time: str,
+    end_time: str,
+    webhook_url: str | None,
+    escalation_webhook_url: str | None,
+) -> int:
+    record = control_plane_alert_service.create_oncall_schedule(
+        created_by=created_by,
+        team_name=team_name,
+        timezone_name=timezone_name,
+        weekdays=weekdays,
+        start_time=start_time,
+        end_time=end_time,
+        webhook_url=webhook_url,
+        escalation_webhook_url=escalation_webhook_url,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_list_control_plane_oncall_schedules(*, active_only: bool) -> int:
+    print(
+        json.dumps(
+            [record.to_dict() for record in control_plane_alert_service.list_oncall_schedules(active_only=active_only)],
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_cancel_control_plane_oncall_schedule(*, schedule_id: str, cancelled_by: str) -> int:
+    record = control_plane_alert_service.cancel_oncall_schedule(
+        schedule_id=schedule_id,
+        cancelled_by=cancelled_by,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
 def _print_observation_result(result: ObservationResult) -> None:
     payload = {
         "command": result.command,
@@ -433,6 +681,67 @@ def main() -> int:
     if args.command == "list-workers":
         print(json.dumps([record.to_dict() for record in job_repository.list_workers()], indent=2))
         return 0
+    if args.command == "list-worker-heartbeats":
+        print(json.dumps([record.to_dict() for record in job_repository.list_worker_heartbeats(args.worker_id)], indent=2))
+        return 0
+    if args.command == "list-worker-heartbeat-rollups":
+        print(json.dumps([record.to_dict() for record in job_repository.list_worker_heartbeat_rollups(args.worker_id)], indent=2))
+        return 0
+    if args.command == "list-job-lease-events":
+        print(json.dumps([record.to_dict() for record in job_repository.list_job_lease_events(args.job_id)], indent=2))
+        return 0
+    if args.command == "list-job-lease-event-rollups":
+        print(json.dumps([record.to_dict() for record in job_repository.list_job_lease_event_rollups(args.job_id)], indent=2))
+        return 0
+    if args.command == "control-plane-analytics":
+        return run_control_plane_analytics(days=args.days)
+    if args.command == "emit-control-plane-alerts":
+        return run_emit_control_plane_alerts(force=args.force)
+    if args.command == "process-control-plane-alert-followups":
+        return run_process_control_plane_alert_followups(force=args.force)
+    if args.command == "list-control-plane-alerts":
+        return run_list_control_plane_alerts(limit=args.limit)
+    if args.command == "acknowledge-control-plane-alert":
+        return run_acknowledge_control_plane_alert(
+            alert_id=args.alert_id,
+            acknowledged_by=args.by,
+            acknowledgement_note=args.note,
+        )
+    if args.command == "create-control-plane-alert-silence":
+        return run_create_control_plane_alert_silence(
+            created_by=args.by,
+            reason=args.reason,
+            duration_minutes=args.duration_minutes,
+            match_alert_key=args.alert_key,
+            match_finding_code=args.finding_code,
+        )
+    if args.command == "list-control-plane-alert-silences":
+        return run_list_control_plane_alert_silences(active_only=args.active_only)
+    if args.command == "cancel-control-plane-alert-silence":
+        return run_cancel_control_plane_alert_silence(
+            silence_id=args.silence_id,
+            cancelled_by=args.by,
+        )
+    if args.command == "create-control-plane-oncall-schedule":
+        return run_create_control_plane_oncall_schedule(
+            created_by=args.by,
+            team_name=args.team,
+            timezone_name=args.timezone,
+            weekdays=args.weekdays,
+            start_time=args.start_time,
+            end_time=args.end_time,
+            webhook_url=args.webhook_url,
+            escalation_webhook_url=args.escalation_webhook_url,
+        )
+    if args.command == "list-control-plane-oncall-schedules":
+        return run_list_control_plane_oncall_schedules(active_only=args.active_only)
+    if args.command == "cancel-control-plane-oncall-schedule":
+        return run_cancel_control_plane_oncall_schedule(
+            schedule_id=args.schedule_id,
+            cancelled_by=args.by,
+        )
+    if args.command == "prune-history":
+        return run_prune_history()
     parser.error(f"Unknown command: {args.command}")
     return 2
 

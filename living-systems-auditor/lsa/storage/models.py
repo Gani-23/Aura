@@ -158,3 +158,242 @@ class WorkerRecord:
             process_id=payload["process_id"],
             current_job_id=payload.get("current_job_id"),
         )
+
+
+@dataclass(slots=True)
+class WorkerHeartbeatRecord:
+    heartbeat_id: str
+    worker_id: str
+    recorded_at: str
+    status: str
+    current_job_id: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "heartbeat_id": self.heartbeat_id,
+            "worker_id": self.worker_id,
+            "recorded_at": self.recorded_at,
+            "status": self.status,
+            "current_job_id": self.current_job_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "WorkerHeartbeatRecord":
+        return cls(
+            heartbeat_id=payload["heartbeat_id"],
+            worker_id=payload["worker_id"],
+            recorded_at=payload["recorded_at"],
+            status=payload["status"],
+            current_job_id=payload.get("current_job_id"),
+        )
+
+
+@dataclass(slots=True)
+class JobLeaseEventRecord:
+    event_id: str
+    job_id: str
+    worker_id: str | None
+    event_type: str
+    recorded_at: str
+    details: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_id": self.event_id,
+            "job_id": self.job_id,
+            "worker_id": self.worker_id,
+            "event_type": self.event_type,
+            "recorded_at": self.recorded_at,
+            "details": dict(self.details),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "JobLeaseEventRecord":
+        return cls(
+            event_id=payload["event_id"],
+            job_id=payload["job_id"],
+            worker_id=payload.get("worker_id"),
+            event_type=payload["event_type"],
+            recorded_at=payload["recorded_at"],
+            details=dict(payload.get("details", {})),
+        )
+
+
+@dataclass(slots=True)
+class WorkerHeartbeatRollupRecord:
+    day_bucket: str
+    worker_id: str
+    status: str
+    current_job_id: str | None
+    event_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "day_bucket": self.day_bucket,
+            "worker_id": self.worker_id,
+            "status": self.status,
+            "current_job_id": self.current_job_id,
+            "event_count": self.event_count,
+        }
+
+
+@dataclass(slots=True)
+class JobLeaseEventRollupRecord:
+    day_bucket: str
+    job_id: str
+    worker_id: str | None
+    event_type: str
+    event_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "day_bucket": self.day_bucket,
+            "job_id": self.job_id,
+            "worker_id": self.worker_id,
+            "event_type": self.event_type,
+            "event_count": self.event_count,
+        }
+
+
+@dataclass(slots=True)
+class ControlPlaneAlertRecord:
+    alert_id: str
+    created_at: str
+    alert_key: str
+    status: str
+    severity: str
+    summary: str
+    finding_codes: list[str] = field(default_factory=list)
+    delivery_state: str = "skipped"
+    payload: dict = field(default_factory=dict)
+    error: str | None = None
+    acknowledged_at: str | None = None
+    acknowledged_by: str | None = None
+    acknowledgement_note: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "alert_id": self.alert_id,
+            "created_at": self.created_at,
+            "alert_key": self.alert_key,
+            "status": self.status,
+            "severity": self.severity,
+            "summary": self.summary,
+            "finding_codes": list(self.finding_codes),
+            "delivery_state": self.delivery_state,
+            "payload": dict(self.payload),
+            "error": self.error,
+            "acknowledged_at": self.acknowledged_at,
+            "acknowledged_by": self.acknowledged_by,
+            "acknowledgement_note": self.acknowledgement_note,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ControlPlaneAlertRecord":
+        return cls(
+            alert_id=payload["alert_id"],
+            created_at=payload["created_at"],
+            alert_key=payload["alert_key"],
+            status=payload["status"],
+            severity=payload["severity"],
+            summary=payload["summary"],
+            finding_codes=list(payload.get("finding_codes", [])),
+            delivery_state=payload.get("delivery_state", "skipped"),
+            payload=dict(payload.get("payload", {})),
+            error=payload.get("error"),
+            acknowledged_at=payload.get("acknowledged_at"),
+            acknowledged_by=payload.get("acknowledged_by"),
+            acknowledgement_note=payload.get("acknowledgement_note"),
+        )
+
+
+@dataclass(slots=True)
+class ControlPlaneAlertSilenceRecord:
+    silence_id: str
+    created_at: str
+    created_by: str
+    reason: str
+    match_alert_key: str | None = None
+    match_finding_code: str | None = None
+    starts_at: str | None = None
+    expires_at: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "silence_id": self.silence_id,
+            "created_at": self.created_at,
+            "created_by": self.created_by,
+            "reason": self.reason,
+            "match_alert_key": self.match_alert_key,
+            "match_finding_code": self.match_finding_code,
+            "starts_at": self.starts_at,
+            "expires_at": self.expires_at,
+            "cancelled_at": self.cancelled_at,
+            "cancelled_by": self.cancelled_by,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ControlPlaneAlertSilenceRecord":
+        return cls(
+            silence_id=payload["silence_id"],
+            created_at=payload["created_at"],
+            created_by=payload["created_by"],
+            reason=payload["reason"],
+            match_alert_key=payload.get("match_alert_key"),
+            match_finding_code=payload.get("match_finding_code"),
+            starts_at=payload.get("starts_at"),
+            expires_at=payload.get("expires_at"),
+            cancelled_at=payload.get("cancelled_at"),
+            cancelled_by=payload.get("cancelled_by"),
+        )
+
+
+@dataclass(slots=True)
+class ControlPlaneOnCallScheduleRecord:
+    schedule_id: str
+    created_at: str
+    created_by: str
+    team_name: str
+    timezone_name: str
+    weekdays: list[int] = field(default_factory=list)
+    start_time: str = "00:00"
+    end_time: str = "23:59"
+    webhook_url: str | None = None
+    escalation_webhook_url: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "schedule_id": self.schedule_id,
+            "created_at": self.created_at,
+            "created_by": self.created_by,
+            "team_name": self.team_name,
+            "timezone_name": self.timezone_name,
+            "weekdays": list(self.weekdays),
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "webhook_url": self.webhook_url,
+            "escalation_webhook_url": self.escalation_webhook_url,
+            "cancelled_at": self.cancelled_at,
+            "cancelled_by": self.cancelled_by,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ControlPlaneOnCallScheduleRecord":
+        return cls(
+            schedule_id=payload["schedule_id"],
+            created_at=payload["created_at"],
+            created_by=payload["created_by"],
+            team_name=payload["team_name"],
+            timezone_name=payload["timezone_name"],
+            weekdays=list(payload.get("weekdays", [])),
+            start_time=payload.get("start_time", "00:00"),
+            end_time=payload.get("end_time", "23:59"),
+            webhook_url=payload.get("webhook_url"),
+            escalation_webhook_url=payload.get("escalation_webhook_url"),
+            cancelled_at=payload.get("cancelled_at"),
+            cancelled_by=payload.get("cancelled_by"),
+        )

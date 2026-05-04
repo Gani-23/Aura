@@ -208,3 +208,234 @@ class WorkerRecordPayload(BaseModel):
     host_name: str
     process_id: int
     current_job_id: str | None = None
+
+
+class WorkerHeartbeatPayload(BaseModel):
+    heartbeat_id: str
+    worker_id: str
+    recorded_at: str
+    status: str
+    current_job_id: str | None = None
+
+
+class JobLeaseEventPayload(BaseModel):
+    event_id: str
+    job_id: str
+    worker_id: str | None = None
+    event_type: str
+    recorded_at: str
+    details: dict[str, Any]
+
+
+class PruneHistoryResponse(BaseModel):
+    worker_heartbeats_compacted: int
+    job_lease_events_compacted: int
+    worker_heartbeats_pruned: int
+    job_lease_events_pruned: int
+
+
+class ControlPlaneAlertRecordPayload(BaseModel):
+    alert_id: str
+    created_at: str
+    alert_key: str
+    status: str
+    severity: str
+    summary: str
+    finding_codes: list[str]
+    delivery_state: str
+    payload: dict[str, Any]
+    error: str | None = None
+    acknowledged_at: str | None = None
+    acknowledged_by: str | None = None
+    acknowledgement_note: str | None = None
+
+
+class EmitControlPlaneAlertsResponse(BaseModel):
+    emitted_count: int
+    alerts: list[ControlPlaneAlertRecordPayload]
+
+
+class AcknowledgeControlPlaneAlertRequest(BaseModel):
+    acknowledged_by: str
+    acknowledgement_note: str | None = None
+
+
+class ControlPlaneAlertSilencePayload(BaseModel):
+    silence_id: str
+    created_at: str
+    created_by: str
+    reason: str
+    match_alert_key: str | None = None
+    match_finding_code: str | None = None
+    starts_at: str | None = None
+    expires_at: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
+
+
+class CreateControlPlaneAlertSilenceRequest(BaseModel):
+    created_by: str
+    reason: str
+    duration_minutes: int = Field(..., ge=1)
+    match_alert_key: str | None = None
+    match_finding_code: str | None = None
+
+    @model_validator(mode="after")
+    def validate_matcher(self) -> "CreateControlPlaneAlertSilenceRequest":
+        if not self.match_alert_key and not self.match_finding_code:
+            raise ValueError("Either match_alert_key or match_finding_code must be provided.")
+        return self
+
+
+class CancelControlPlaneAlertSilenceRequest(BaseModel):
+    cancelled_by: str
+
+
+class ControlPlaneOnCallSchedulePayload(BaseModel):
+    schedule_id: str
+    created_at: str
+    created_by: str
+    team_name: str
+    timezone_name: str
+    weekdays: list[int]
+    start_time: str
+    end_time: str
+    webhook_url: str | None = None
+    escalation_webhook_url: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
+
+
+class CreateControlPlaneOnCallScheduleRequest(BaseModel):
+    created_by: str
+    team_name: str
+    timezone_name: str
+    weekdays: list[int]
+    start_time: str
+    end_time: str
+    webhook_url: str | None = None
+    escalation_webhook_url: str | None = None
+
+
+class CancelControlPlaneOnCallScheduleRequest(BaseModel):
+    cancelled_by: str
+
+
+class WorkerHeartbeatRollupPayload(BaseModel):
+    day_bucket: str
+    worker_id: str
+    status: str
+    current_job_id: str | None = None
+    event_count: int
+
+
+class JobLeaseEventRollupPayload(BaseModel):
+    day_bucket: str
+    job_id: str
+    worker_id: str | None = None
+    event_type: str
+    event_count: int
+
+
+class QueueAnalyticsPayload(BaseModel):
+    total_jobs: int
+    queued_jobs: int
+    running_jobs: int
+    completed_jobs: int
+    failed_jobs: int
+
+
+class WorkerDailyAnalyticsPayload(BaseModel):
+    day_bucket: str
+    total_heartbeats: int
+    active_worker_count: int
+    busy_worker_count: int
+    stopped_worker_count: int
+
+
+class WorkerAnalyticsPayload(BaseModel):
+    active_workers: int
+    busy_workers: int
+    idle_workers: int
+    stale_workers: int
+    total_workers_seen: int
+    days: list[WorkerDailyAnalyticsPayload]
+
+
+class LeaseDailyAnalyticsPayload(BaseModel):
+    day_bucket: str
+    total_events: int
+    claimed_count: int
+    renewed_count: int
+    expired_requeue_count: int
+    completed_count: int
+    failed_count: int
+    affected_job_count: int
+    affected_worker_count: int
+
+
+class LeaseAnalyticsPayload(BaseModel):
+    total_events: int
+    claimed_count: int
+    renewed_count: int
+    expired_requeue_count: int
+    completed_count: int
+    failed_count: int
+    days: list[LeaseDailyAnalyticsPayload]
+
+
+class JobDailyAnalyticsPayload(BaseModel):
+    day_bucket: str
+    created_count: int
+    started_count: int
+    completed_count: int
+    failed_count: int
+
+
+class JobAnalyticsPayload(BaseModel):
+    submitted_count: int
+    started_count: int
+    completed_count: int
+    failed_count: int
+    success_rate: float | None = None
+    days: list[JobDailyAnalyticsPayload]
+
+
+class ControlPlaneAlertThresholdsPayload(BaseModel):
+    queue_warning_threshold: int
+    queue_critical_threshold: int
+    stale_worker_warning_threshold: int
+    stale_worker_critical_threshold: int
+    expired_lease_warning_threshold: int
+    expired_lease_critical_threshold: int
+    job_failure_rate_warning_threshold: float
+    job_failure_rate_critical_threshold: float
+    job_failure_rate_min_samples: int
+
+
+class ControlPlaneFindingPayload(BaseModel):
+    severity: str
+    code: str
+    metric: str
+    summary: str
+    observed_value: float
+    threshold_value: float | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class ControlPlaneEvaluationPayload(BaseModel):
+    status: str
+    findings: list[ControlPlaneFindingPayload]
+    thresholds: ControlPlaneAlertThresholdsPayload
+
+
+class ControlPlaneAnalyticsResponse(BaseModel):
+    generated_at: str
+    window_days: int
+    window_start_day: str
+    window_end_day: str
+    queue: QueueAnalyticsPayload
+    workers: WorkerAnalyticsPayload
+    leases: LeaseAnalyticsPayload
+    jobs: JobAnalyticsPayload
+    evaluation: ControlPlaneEvaluationPayload

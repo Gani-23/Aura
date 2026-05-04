@@ -9,7 +9,19 @@ from uuid import uuid4
 from lsa.core.intent_graph import IntentGraph
 from lsa.core.models import IntentGraphSnapshot
 from lsa.settings import WorkspaceSettings
-from lsa.storage.models import AuditRecord, JobRecord, SnapshotRecord, WorkerRecord
+from lsa.storage.models import (
+    AuditRecord,
+    ControlPlaneAlertRecord,
+    ControlPlaneOnCallScheduleRecord,
+    ControlPlaneAlertSilenceRecord,
+    JobLeaseEventRecord,
+    JobLeaseEventRollupRecord,
+    JobRecord,
+    SnapshotRecord,
+    WorkerHeartbeatRecord,
+    WorkerHeartbeatRollupRecord,
+    WorkerRecord,
+)
 
 
 def _utc_now() -> str:
@@ -101,9 +113,104 @@ class _ControlPlaneDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_workers_last_heartbeat_at
                     ON workers (last_heartbeat_at DESC);
+
+                CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                    heartbeat_id TEXT PRIMARY KEY,
+                    worker_id TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    current_job_id TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_worker_heartbeats_worker_id
+                    ON worker_heartbeats (worker_id, recorded_at DESC);
+
+                CREATE TABLE IF NOT EXISTS worker_heartbeat_rollups (
+                    day_bucket TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    current_job_id TEXT,
+                    event_count INTEGER NOT NULL,
+                    PRIMARY KEY (day_bucket, worker_id, status, current_job_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS job_lease_events (
+                    event_id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    worker_id TEXT,
+                    event_type TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    details_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_job_lease_events_job_id
+                    ON job_lease_events (job_id, recorded_at DESC);
+
+                CREATE TABLE IF NOT EXISTS job_lease_event_rollups (
+                    day_bucket TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    worker_id TEXT,
+                    event_type TEXT NOT NULL,
+                    event_count INTEGER NOT NULL,
+                    PRIMARY KEY (day_bucket, job_id, worker_id, event_type)
+                );
+
+                CREATE TABLE IF NOT EXISTS control_plane_alerts (
+                    alert_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    alert_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    finding_codes_json TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    error TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_control_plane_alerts_created_at
+                    ON control_plane_alerts (created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_control_plane_alerts_alert_key
+                    ON control_plane_alerts (alert_key, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS control_plane_alert_silences (
+                    silence_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    match_alert_key TEXT,
+                    match_finding_code TEXT,
+                    starts_at TEXT,
+                    expires_at TEXT,
+                    cancelled_at TEXT,
+                    cancelled_by TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_control_plane_alert_silences_created_at
+                    ON control_plane_alert_silences (created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS control_plane_oncall_schedules (
+                    schedule_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    team_name TEXT NOT NULL,
+                    timezone_name TEXT NOT NULL,
+                    weekdays_json TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    webhook_url TEXT,
+                    escalation_webhook_url TEXT,
+                    cancelled_at TEXT,
+                    cancelled_by TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_control_plane_oncall_schedules_created_at
+                    ON control_plane_oncall_schedules (created_at DESC);
                 """
             )
         self._ensure_job_columns()
+        self._ensure_control_plane_alert_columns()
 
     def _ensure_job_columns(self) -> None:
         existing_columns = self._table_columns("jobs")
@@ -121,6 +228,19 @@ class _ControlPlaneDatabase:
         with self._connect() as connection:
             rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         return {str(row["name"]) for row in rows}
+
+    def _ensure_control_plane_alert_columns(self) -> None:
+        existing_columns = self._table_columns("control_plane_alerts")
+        additions = {
+            "acknowledged_at": "TEXT",
+            "acknowledged_by": "TEXT",
+            "acknowledgement_note": "TEXT",
+        }
+        with self._connect() as connection:
+            for column_name, column_type in additions.items():
+                if column_name in existing_columns:
+                    continue
+                connection.execute(f"ALTER TABLE control_plane_alerts ADD COLUMN {column_name} {column_type}")
 
     def _import_legacy_records(self) -> None:
         self._import_legacy_snapshots()
@@ -576,6 +696,79 @@ class _ControlPlaneDatabase:
             )
         return cursor.rowcount
 
+    def requeue_expired_leases(self, reference_timestamp: str) -> list[JobRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json,
+                    result_payload_json,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                FROM jobs
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                ORDER BY lease_expires_at ASC
+                """,
+                (reference_timestamp,),
+            ).fetchall()
+            if not rows:
+                return []
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued',
+                    started_at = NULL,
+                    error = NULL,
+                    claimed_by_worker_id = NULL,
+                    lease_expires_at = NULL
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (reference_timestamp,),
+            )
+        if cursor.rowcount == 0:
+            return []
+        return [
+            JobRecord(
+                job_id=row["job_id"],
+                created_at=row["created_at"],
+                job_type=row["job_type"],
+                status=row["status"],
+                request_payload=dict(json.loads(row["request_payload_json"])),
+                result_payload=dict(json.loads(row["result_payload_json"])),
+                error=row["error"],
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                claimed_by_worker_id=row["claimed_by_worker_id"],
+                lease_expires_at=row["lease_expires_at"],
+            )
+            for row in rows
+        ]
+
+    def renew_job_lease(self, *, job_id: str, worker_id: str, lease_expires_at: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET lease_expires_at = ?
+                WHERE job_id = ?
+                  AND status = 'running'
+                  AND claimed_by_worker_id = ?
+                """,
+                (lease_expires_at, job_id, worker_id),
+            )
+        return cursor.rowcount > 0
+
     def count_jobs_with_status(self, status: str) -> int:
         with self._connect() as connection:
             row = connection.execute(
@@ -699,6 +892,800 @@ class _ControlPlaneDatabase:
             ).fetchone()
         assert row is not None
         return int(row["count"])
+
+    def append_worker_heartbeat(self, record: WorkerHeartbeatRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO worker_heartbeats (
+                    heartbeat_id,
+                    worker_id,
+                    recorded_at,
+                    status,
+                    current_job_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.heartbeat_id,
+                    record.worker_id,
+                    record.recorded_at,
+                    record.status,
+                    record.current_job_id,
+                ),
+            )
+
+    def list_worker_heartbeats(self, worker_id: str | None = None) -> list[WorkerHeartbeatRecord]:
+        with self._connect() as connection:
+            if worker_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        heartbeat_id,
+                        worker_id,
+                        recorded_at,
+                        status,
+                        current_job_id
+                    FROM worker_heartbeats
+                    ORDER BY recorded_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        heartbeat_id,
+                        worker_id,
+                        recorded_at,
+                        status,
+                        current_job_id
+                    FROM worker_heartbeats
+                    WHERE worker_id = ?
+                    ORDER BY recorded_at DESC
+                    """,
+                    (worker_id,),
+                ).fetchall()
+        return [
+            WorkerHeartbeatRecord(
+                heartbeat_id=row["heartbeat_id"],
+                worker_id=row["worker_id"],
+                recorded_at=row["recorded_at"],
+                status=row["status"],
+                current_job_id=row["current_job_id"],
+            )
+            for row in rows
+        ]
+
+    def append_job_lease_event(self, record: JobLeaseEventRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO job_lease_events (
+                    event_id,
+                    job_id,
+                    worker_id,
+                    event_type,
+                    recorded_at,
+                    details_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.event_id,
+                    record.job_id,
+                    record.worker_id,
+                    record.event_type,
+                    record.recorded_at,
+                    _json_dumps(record.details),
+                ),
+            )
+
+    def list_job_lease_events(self, job_id: str | None = None) -> list[JobLeaseEventRecord]:
+        with self._connect() as connection:
+            if job_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        event_id,
+                        job_id,
+                        worker_id,
+                        event_type,
+                        recorded_at,
+                        details_json
+                    FROM job_lease_events
+                    ORDER BY recorded_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        event_id,
+                        job_id,
+                        worker_id,
+                        event_type,
+                        recorded_at,
+                        details_json
+                    FROM job_lease_events
+                    WHERE job_id = ?
+                    ORDER BY recorded_at DESC
+                    """,
+                    (job_id,),
+                ).fetchall()
+        return [
+            JobLeaseEventRecord(
+                event_id=row["event_id"],
+                job_id=row["job_id"],
+                worker_id=row["worker_id"],
+                event_type=row["event_type"],
+                recorded_at=row["recorded_at"],
+                details=dict(json.loads(row["details_json"])),
+            )
+            for row in rows
+        ]
+
+    def prune_worker_heartbeats_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM worker_heartbeats
+                WHERE recorded_at < ?
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def prune_job_lease_events_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM job_lease_events
+                WHERE recorded_at < ?
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def compact_worker_heartbeats_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    substr(recorded_at, 1, 10) AS day_bucket,
+                    worker_id,
+                    status,
+                    current_job_id,
+                    COUNT(*) AS event_count
+                FROM worker_heartbeats
+                WHERE recorded_at < ?
+                GROUP BY substr(recorded_at, 1, 10), worker_id, status, current_job_id
+                """,
+                (cutoff_timestamp,),
+            ).fetchall()
+            if not rows:
+                return 0
+            connection.executemany(
+                """
+                INSERT INTO worker_heartbeat_rollups (
+                    day_bucket,
+                    worker_id,
+                    status,
+                    current_job_id,
+                    event_count
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day_bucket, worker_id, status, current_job_id) DO UPDATE SET
+                    event_count = worker_heartbeat_rollups.event_count + excluded.event_count
+                """,
+                [
+                    (
+                        row["day_bucket"],
+                        row["worker_id"],
+                        row["status"],
+                        row["current_job_id"],
+                        row["event_count"],
+                    )
+                    for row in rows
+                ],
+            )
+            cursor = connection.execute(
+                """
+                DELETE FROM worker_heartbeats
+                WHERE recorded_at < ?
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def compact_job_lease_events_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    substr(recorded_at, 1, 10) AS day_bucket,
+                    job_id,
+                    worker_id,
+                    event_type,
+                    COUNT(*) AS event_count
+                FROM job_lease_events
+                WHERE recorded_at < ?
+                GROUP BY substr(recorded_at, 1, 10), job_id, worker_id, event_type
+                """,
+                (cutoff_timestamp,),
+            ).fetchall()
+            if not rows:
+                return 0
+            connection.executemany(
+                """
+                INSERT INTO job_lease_event_rollups (
+                    day_bucket,
+                    job_id,
+                    worker_id,
+                    event_type,
+                    event_count
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day_bucket, job_id, worker_id, event_type) DO UPDATE SET
+                    event_count = job_lease_event_rollups.event_count + excluded.event_count
+                """,
+                [
+                    (
+                        row["day_bucket"],
+                        row["job_id"],
+                        row["worker_id"],
+                        row["event_type"],
+                        row["event_count"],
+                    )
+                    for row in rows
+                ],
+            )
+            cursor = connection.execute(
+                """
+                DELETE FROM job_lease_events
+                WHERE recorded_at < ?
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def list_worker_heartbeat_rollups(self, worker_id: str | None = None) -> list[WorkerHeartbeatRollupRecord]:
+        with self._connect() as connection:
+            if worker_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT day_bucket, worker_id, status, current_job_id, event_count
+                    FROM worker_heartbeat_rollups
+                    ORDER BY day_bucket DESC, worker_id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT day_bucket, worker_id, status, current_job_id, event_count
+                    FROM worker_heartbeat_rollups
+                    WHERE worker_id = ?
+                    ORDER BY day_bucket DESC, worker_id ASC
+                    """,
+                    (worker_id,),
+                ).fetchall()
+        return [
+            WorkerHeartbeatRollupRecord(
+                day_bucket=row["day_bucket"],
+                worker_id=row["worker_id"],
+                status=row["status"],
+                current_job_id=row["current_job_id"],
+                event_count=row["event_count"],
+            )
+            for row in rows
+        ]
+
+    def list_job_lease_event_rollups(self, job_id: str | None = None) -> list[JobLeaseEventRollupRecord]:
+        with self._connect() as connection:
+            if job_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT day_bucket, job_id, worker_id, event_type, event_count
+                    FROM job_lease_event_rollups
+                    ORDER BY day_bucket DESC, job_id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT day_bucket, job_id, worker_id, event_type, event_count
+                    FROM job_lease_event_rollups
+                    WHERE job_id = ?
+                    ORDER BY day_bucket DESC, job_id ASC
+                    """,
+                    (job_id,),
+                ).fetchall()
+        return [
+            JobLeaseEventRollupRecord(
+                day_bucket=row["day_bucket"],
+                job_id=row["job_id"],
+                worker_id=row["worker_id"],
+                event_type=row["event_type"],
+                event_count=row["event_count"],
+            )
+            for row in rows
+        ]
+
+    def insert_control_plane_alert(self, record: ControlPlaneAlertRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_alerts (
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json,
+                    delivery_state,
+                    payload_json,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.alert_id,
+                    record.created_at,
+                    record.alert_key,
+                    record.status,
+                    record.severity,
+                    record.summary,
+                    _json_dumps(record.finding_codes),
+                    record.delivery_state,
+                    _json_dumps(record.payload),
+                    record.error,
+                    record.acknowledged_at,
+                    record.acknowledged_by,
+                    record.acknowledgement_note,
+                ),
+            )
+
+    def list_control_plane_alerts(self, limit: int | None = None) -> list[ControlPlaneAlertRecord]:
+        query = """
+            SELECT
+                alert_id,
+                created_at,
+                alert_key,
+                status,
+                severity,
+                summary,
+                finding_codes_json,
+                delivery_state,
+                payload_json,
+                error,
+                acknowledged_at,
+                acknowledged_by,
+                acknowledgement_note
+            FROM control_plane_alerts
+            ORDER BY created_at DESC
+        """
+        parameters: tuple[object, ...] = ()
+        if limit is not None:
+            query += "\nLIMIT ?"
+            parameters = (limit,)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            ControlPlaneAlertRecord(
+                alert_id=row["alert_id"],
+                created_at=row["created_at"],
+                alert_key=row["alert_key"],
+                status=row["status"],
+                severity=row["severity"],
+                summary=row["summary"],
+                finding_codes=list(json.loads(row["finding_codes_json"])),
+                delivery_state=row["delivery_state"],
+                payload=dict(json.loads(row["payload_json"])),
+                error=row["error"],
+                acknowledged_at=row["acknowledged_at"],
+                acknowledged_by=row["acknowledged_by"],
+                acknowledgement_note=row["acknowledgement_note"],
+            )
+            for row in rows
+        ]
+
+    def fetch_control_plane_alert(self, alert_id: str) -> ControlPlaneAlertRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json,
+                    delivery_state,
+                    payload_json,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                FROM control_plane_alerts
+                WHERE alert_id = ?
+                """,
+                (alert_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ControlPlaneAlertRecord(
+            alert_id=row["alert_id"],
+            created_at=row["created_at"],
+            alert_key=row["alert_key"],
+            status=row["status"],
+            severity=row["severity"],
+            summary=row["summary"],
+            finding_codes=list(json.loads(row["finding_codes_json"])),
+            delivery_state=row["delivery_state"],
+            payload=dict(json.loads(row["payload_json"])),
+            error=row["error"],
+            acknowledged_at=row["acknowledged_at"],
+            acknowledged_by=row["acknowledged_by"],
+            acknowledgement_note=row["acknowledgement_note"],
+        )
+
+    def fetch_latest_control_plane_alert(self) -> ControlPlaneAlertRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json,
+                    delivery_state,
+                    payload_json,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                FROM control_plane_alerts
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return ControlPlaneAlertRecord(
+            alert_id=row["alert_id"],
+            created_at=row["created_at"],
+            alert_key=row["alert_key"],
+            status=row["status"],
+            severity=row["severity"],
+            summary=row["summary"],
+            finding_codes=list(json.loads(row["finding_codes_json"])),
+            delivery_state=row["delivery_state"],
+            payload=dict(json.loads(row["payload_json"])),
+            error=row["error"],
+            acknowledged_at=row["acknowledged_at"],
+            acknowledged_by=row["acknowledged_by"],
+            acknowledgement_note=row["acknowledgement_note"],
+        )
+
+    def fetch_latest_control_plane_alert_by_key(self, alert_key: str) -> ControlPlaneAlertRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json,
+                    delivery_state,
+                    payload_json,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                FROM control_plane_alerts
+                WHERE alert_key = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (alert_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ControlPlaneAlertRecord(
+            alert_id=row["alert_id"],
+            created_at=row["created_at"],
+            alert_key=row["alert_key"],
+            status=row["status"],
+            severity=row["severity"],
+            summary=row["summary"],
+            finding_codes=list(json.loads(row["finding_codes_json"])),
+            delivery_state=row["delivery_state"],
+            payload=dict(json.loads(row["payload_json"])),
+            error=row["error"],
+            acknowledged_at=row["acknowledged_at"],
+            acknowledged_by=row["acknowledged_by"],
+            acknowledgement_note=row["acknowledgement_note"],
+        )
+
+    def acknowledge_control_plane_alert(
+        self,
+        *,
+        alert_id: str,
+        acknowledged_at: str,
+        acknowledged_by: str,
+        acknowledgement_note: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_alerts
+                SET acknowledged_at = ?,
+                    acknowledged_by = ?,
+                    acknowledgement_note = ?
+                WHERE alert_id = ?
+                """,
+                (acknowledged_at, acknowledged_by, acknowledgement_note, alert_id),
+            )
+        return cursor.rowcount > 0
+
+    def insert_control_plane_alert_silence(self, record: ControlPlaneAlertSilenceRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_alert_silences (
+                    silence_id,
+                    created_at,
+                    created_by,
+                    reason,
+                    match_alert_key,
+                    match_finding_code,
+                    starts_at,
+                    expires_at,
+                    cancelled_at,
+                    cancelled_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.silence_id,
+                    record.created_at,
+                    record.created_by,
+                    record.reason,
+                    record.match_alert_key,
+                    record.match_finding_code,
+                    record.starts_at,
+                    record.expires_at,
+                    record.cancelled_at,
+                    record.cancelled_by,
+                ),
+            )
+
+    def list_control_plane_alert_silences(self) -> list[ControlPlaneAlertSilenceRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    silence_id,
+                    created_at,
+                    created_by,
+                    reason,
+                    match_alert_key,
+                    match_finding_code,
+                    starts_at,
+                    expires_at,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_alert_silences
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [
+            ControlPlaneAlertSilenceRecord(
+                silence_id=row["silence_id"],
+                created_at=row["created_at"],
+                created_by=row["created_by"],
+                reason=row["reason"],
+                match_alert_key=row["match_alert_key"],
+                match_finding_code=row["match_finding_code"],
+                starts_at=row["starts_at"],
+                expires_at=row["expires_at"],
+                cancelled_at=row["cancelled_at"],
+                cancelled_by=row["cancelled_by"],
+            )
+            for row in rows
+        ]
+
+    def fetch_control_plane_alert_silence(self, silence_id: str) -> ControlPlaneAlertSilenceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    silence_id,
+                    created_at,
+                    created_by,
+                    reason,
+                    match_alert_key,
+                    match_finding_code,
+                    starts_at,
+                    expires_at,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_alert_silences
+                WHERE silence_id = ?
+                """,
+                (silence_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ControlPlaneAlertSilenceRecord(
+            silence_id=row["silence_id"],
+            created_at=row["created_at"],
+            created_by=row["created_by"],
+            reason=row["reason"],
+            match_alert_key=row["match_alert_key"],
+            match_finding_code=row["match_finding_code"],
+            starts_at=row["starts_at"],
+            expires_at=row["expires_at"],
+            cancelled_at=row["cancelled_at"],
+            cancelled_by=row["cancelled_by"],
+        )
+
+    def cancel_control_plane_alert_silence(
+        self,
+        *,
+        silence_id: str,
+        cancelled_at: str,
+        cancelled_by: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_alert_silences
+                SET cancelled_at = ?,
+                    cancelled_by = ?
+                WHERE silence_id = ?
+                  AND cancelled_at IS NULL
+                """,
+                (cancelled_at, cancelled_by, silence_id),
+            )
+        return cursor.rowcount > 0
+
+    def insert_control_plane_oncall_schedule(self, record: ControlPlaneOnCallScheduleRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_oncall_schedules (
+                    schedule_id,
+                    created_at,
+                    created_by,
+                    team_name,
+                    timezone_name,
+                    weekdays_json,
+                    start_time,
+                    end_time,
+                    webhook_url,
+                    escalation_webhook_url,
+                    cancelled_at,
+                    cancelled_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.schedule_id,
+                    record.created_at,
+                    record.created_by,
+                    record.team_name,
+                    record.timezone_name,
+                    _json_dumps(record.weekdays),
+                    record.start_time,
+                    record.end_time,
+                    record.webhook_url,
+                    record.escalation_webhook_url,
+                    record.cancelled_at,
+                    record.cancelled_by,
+                ),
+            )
+
+    def list_control_plane_oncall_schedules(self) -> list[ControlPlaneOnCallScheduleRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    schedule_id,
+                    created_at,
+                    created_by,
+                    team_name,
+                    timezone_name,
+                    weekdays_json,
+                    start_time,
+                    end_time,
+                    webhook_url,
+                    escalation_webhook_url,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_oncall_schedules
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [
+            ControlPlaneOnCallScheduleRecord(
+                schedule_id=row["schedule_id"],
+                created_at=row["created_at"],
+                created_by=row["created_by"],
+                team_name=row["team_name"],
+                timezone_name=row["timezone_name"],
+                weekdays=list(json.loads(row["weekdays_json"])),
+                start_time=row["start_time"],
+                end_time=row["end_time"],
+                webhook_url=row["webhook_url"],
+                escalation_webhook_url=row["escalation_webhook_url"],
+                cancelled_at=row["cancelled_at"],
+                cancelled_by=row["cancelled_by"],
+            )
+            for row in rows
+        ]
+
+    def fetch_control_plane_oncall_schedule(self, schedule_id: str) -> ControlPlaneOnCallScheduleRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    schedule_id,
+                    created_at,
+                    created_by,
+                    team_name,
+                    timezone_name,
+                    weekdays_json,
+                    start_time,
+                    end_time,
+                    webhook_url,
+                    escalation_webhook_url,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_oncall_schedules
+                WHERE schedule_id = ?
+                """,
+                (schedule_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ControlPlaneOnCallScheduleRecord(
+            schedule_id=row["schedule_id"],
+            created_at=row["created_at"],
+            created_by=row["created_by"],
+            team_name=row["team_name"],
+            timezone_name=row["timezone_name"],
+            weekdays=list(json.loads(row["weekdays_json"])),
+            start_time=row["start_time"],
+            end_time=row["end_time"],
+            webhook_url=row["webhook_url"],
+            escalation_webhook_url=row["escalation_webhook_url"],
+            cancelled_at=row["cancelled_at"],
+            cancelled_by=row["cancelled_by"],
+        )
+
+    def cancel_control_plane_oncall_schedule(
+        self,
+        *,
+        schedule_id: str,
+        cancelled_at: str,
+        cancelled_by: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_oncall_schedules
+                SET cancelled_at = ?,
+                    cancelled_by = ?
+                WHERE schedule_id = ?
+                  AND cancelled_at IS NULL
+                """,
+                (cancelled_at, cancelled_by, schedule_id),
+            )
+        return cursor.rowcount > 0
 
 
 class SnapshotRepository:
@@ -831,6 +1818,16 @@ class JobRepository:
     def count_by_status(self, status: str) -> int:
         return self.database.count_jobs_with_status(status)
 
+    def requeue_expired_leases(self, reference_timestamp: str) -> list[JobRecord]:
+        return self.database.requeue_expired_leases(reference_timestamp)
+
+    def renew_lease(self, *, job_id: str, worker_id: str, lease_expires_at: str) -> bool:
+        return self.database.renew_job_lease(
+            job_id=job_id,
+            worker_id=worker_id,
+            lease_expires_at=lease_expires_at,
+        )
+
     def save_worker(self, record: WorkerRecord) -> WorkerRecord:
         self.database.upsert_worker(record)
         return record
@@ -846,3 +1843,136 @@ class JobRepository:
 
     def count_workers_seen_since(self, threshold_timestamp: str) -> int:
         return self.database.count_workers_seen_since(threshold_timestamp)
+
+    def append_worker_heartbeat(self, record: WorkerHeartbeatRecord) -> WorkerHeartbeatRecord:
+        self.database.append_worker_heartbeat(record)
+        return record
+
+    def list_worker_heartbeats(self, worker_id: str | None = None) -> list[WorkerHeartbeatRecord]:
+        return self.database.list_worker_heartbeats(worker_id)
+
+    def append_job_lease_event(self, record: JobLeaseEventRecord) -> JobLeaseEventRecord:
+        self.database.append_job_lease_event(record)
+        return record
+
+    def list_job_lease_events(self, job_id: str | None = None) -> list[JobLeaseEventRecord]:
+        return self.database.list_job_lease_events(job_id)
+
+    def prune_worker_heartbeats_before(self, cutoff_timestamp: str) -> int:
+        return self.database.prune_worker_heartbeats_before(cutoff_timestamp)
+
+    def prune_job_lease_events_before(self, cutoff_timestamp: str) -> int:
+        return self.database.prune_job_lease_events_before(cutoff_timestamp)
+
+    def compact_worker_heartbeats_before(self, cutoff_timestamp: str) -> int:
+        return self.database.compact_worker_heartbeats_before(cutoff_timestamp)
+
+    def compact_job_lease_events_before(self, cutoff_timestamp: str) -> int:
+        return self.database.compact_job_lease_events_before(cutoff_timestamp)
+
+    def list_worker_heartbeat_rollups(self, worker_id: str | None = None) -> list[WorkerHeartbeatRollupRecord]:
+        return self.database.list_worker_heartbeat_rollups(worker_id)
+
+    def list_job_lease_event_rollups(self, job_id: str | None = None) -> list[JobLeaseEventRollupRecord]:
+        return self.database.list_job_lease_event_rollups(job_id)
+
+    def append_control_plane_alert(self, record: ControlPlaneAlertRecord) -> ControlPlaneAlertRecord:
+        self.database.insert_control_plane_alert(record)
+        return record
+
+    def list_control_plane_alerts(self, limit: int | None = None) -> list[ControlPlaneAlertRecord]:
+        return self.database.list_control_plane_alerts(limit)
+
+    def latest_control_plane_alert(self) -> ControlPlaneAlertRecord | None:
+        return self.database.fetch_latest_control_plane_alert()
+
+    def latest_control_plane_alert_by_key(self, alert_key: str) -> ControlPlaneAlertRecord | None:
+        return self.database.fetch_latest_control_plane_alert_by_key(alert_key)
+
+    def get_control_plane_alert(self, alert_id: str) -> ControlPlaneAlertRecord:
+        record = self.database.fetch_control_plane_alert(alert_id)
+        if record is None:
+            raise FileNotFoundError(f"Control-plane alert '{alert_id}' was not found.")
+        return record
+
+    def acknowledge_control_plane_alert(
+        self,
+        *,
+        alert_id: str,
+        acknowledged_at: str,
+        acknowledged_by: str,
+        acknowledgement_note: str | None,
+    ) -> ControlPlaneAlertRecord:
+        updated = self.database.acknowledge_control_plane_alert(
+            alert_id=alert_id,
+            acknowledged_at=acknowledged_at,
+            acknowledged_by=acknowledged_by,
+            acknowledgement_note=acknowledgement_note,
+        )
+        if not updated:
+            raise FileNotFoundError(f"Control-plane alert '{alert_id}' was not found.")
+        return self.get_control_plane_alert(alert_id)
+
+    def append_control_plane_alert_silence(
+        self,
+        record: ControlPlaneAlertSilenceRecord,
+    ) -> ControlPlaneAlertSilenceRecord:
+        self.database.insert_control_plane_alert_silence(record)
+        return record
+
+    def list_control_plane_alert_silences(self) -> list[ControlPlaneAlertSilenceRecord]:
+        return self.database.list_control_plane_alert_silences()
+
+    def get_control_plane_alert_silence(self, silence_id: str) -> ControlPlaneAlertSilenceRecord:
+        record = self.database.fetch_control_plane_alert_silence(silence_id)
+        if record is None:
+            raise FileNotFoundError(f"Control-plane alert silence '{silence_id}' was not found.")
+        return record
+
+    def cancel_control_plane_alert_silence(
+        self,
+        *,
+        silence_id: str,
+        cancelled_at: str,
+        cancelled_by: str,
+    ) -> ControlPlaneAlertSilenceRecord:
+        updated = self.database.cancel_control_plane_alert_silence(
+            silence_id=silence_id,
+            cancelled_at=cancelled_at,
+            cancelled_by=cancelled_by,
+        )
+        if not updated:
+            raise FileNotFoundError(f"Control-plane alert silence '{silence_id}' was not found.")
+        return self.get_control_plane_alert_silence(silence_id)
+
+    def append_control_plane_oncall_schedule(
+        self,
+        record: ControlPlaneOnCallScheduleRecord,
+    ) -> ControlPlaneOnCallScheduleRecord:
+        self.database.insert_control_plane_oncall_schedule(record)
+        return record
+
+    def list_control_plane_oncall_schedules(self) -> list[ControlPlaneOnCallScheduleRecord]:
+        return self.database.list_control_plane_oncall_schedules()
+
+    def get_control_plane_oncall_schedule(self, schedule_id: str) -> ControlPlaneOnCallScheduleRecord:
+        record = self.database.fetch_control_plane_oncall_schedule(schedule_id)
+        if record is None:
+            raise FileNotFoundError(f"Control-plane on-call schedule '{schedule_id}' was not found.")
+        return record
+
+    def cancel_control_plane_oncall_schedule(
+        self,
+        *,
+        schedule_id: str,
+        cancelled_at: str,
+        cancelled_by: str,
+    ) -> ControlPlaneOnCallScheduleRecord:
+        updated = self.database.cancel_control_plane_oncall_schedule(
+            schedule_id=schedule_id,
+            cancelled_at=cancelled_at,
+            cancelled_by=cancelled_by,
+        )
+        if not updated:
+            raise FileNotFoundError(f"Control-plane on-call schedule '{schedule_id}' was not found.")
+        return self.get_control_plane_oncall_schedule(schedule_id)
