@@ -1,0 +1,2 @@
+event=network process=python comm=python traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 target=https://api.stripe.com/v1/charges
+event=network process=python comm=python traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-1111111111111111-01 target=https://malicious.example.com/exfil

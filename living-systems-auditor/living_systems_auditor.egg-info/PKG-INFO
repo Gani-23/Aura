@@ -1,0 +1,202 @@
+Metadata-Version: 2.4
+Name: living-systems-auditor
+Version: 0.1.0
+Summary: Intent-aware drift detection for software systems.
+Author: Gani
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: pydantic>=2.8.0
+Requires-Dist: uvicorn>=0.30.0
+Provides-Extra: dev
+Requires-Dist: httpx>=0.28.0; extra == "dev"
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+
+# Living Systems Auditor
+
+Living Systems Auditor is a Python-first scaffold for an intent-aware runtime auditor. This repo starts with a minimal vertical slice:
+
+- ingest a Python codebase and build an intent graph snapshot
+- normalize observed runtime events
+- parse raw trace logs into normalized runtime events
+- detect drift when observed network calls fall outside declared or inferred intent
+- generate a structured remediation report
+- expose the flow through a CLI and FastAPI surface
+- persist snapshots and audit runs so the system can be inspected over time
+
+## What works today
+
+- Python source ingestion using the standard library `ast` module
+- simple function and module extraction
+- external URL and hostname inference from common HTTP call patterns
+- drift detection for unexpected outbound network activity
+- markdown remediation reports written to disk
+- CLI commands for `ingest` and `audit`
+- local persistence for snapshots and audit history
+- API endpoints to list and fetch persisted snapshots and audits
+- API endpoints for live trace collection and collect-and-audit flows
+- trace-based audit flow for `logfmt`-style lines and raw `bpftrace` connect output
+- trace collection commands that can capture observer stdout straight into auditable trace files
+- structured connect-event enrichment with `pid`, `tid`, `fd`, `process`, `daddr`, `dport`, and service hints
+- optional destination alias resolution via trace hints or `data/destination_aliases.json`
+- correlation-aware function binding across `request_id`, `trace_id`, `span_id`, `conn_id`, and process/socket context
+- normalization of common tracing propagation formats like `traceparent`, `b3`, and `x-request-id` into canonical correlation fields
+- normalization of OpenTelemetry-style attribute names, Jaeger `uber-trace-id`, and `baggage` strings into canonical correlation fields
+- top-level audit explanations that summarize the primary drift storyline before the detailed session payloads and remediation reports
+- automatic trace sidecar manifests that preserve collection context such as collector session id, target PID, and observer command
+- derived `socket_id` and `flow_id` correlation keys when collector and observer metadata are rich enough to support them
+- explicit function-resolution hints through trace metadata like `qualname`, `module` + `function_name`, or `source_file` + `line`
+- stack-aware function-resolution hints through metadata like `stack`, `call_stack`, `frames`, or `callsite`
+- raw symbol normalization for collector outputs like `app:charge_customer`, `app::charge_customer`, or `app.py:4`
+- trace-local symbol map sidecars that resolve raw addresses into semantic function and stack hints
+- collection-time staging of symbol maps so `collect-trace` and `collect-audit` can publish trace-local `.symbols.json` artifacts automatically
+- inline symbol-definition extraction so collectors can emit `event=symbol ...` lines directly and let LSA materialize the symbol sidecar
+- trace-local context map sidecars that join request and trace metadata onto raw runtime events before correlation
+
+## Quick start
+
+```bash
+cd living-systems-auditor
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+lsa ingest tests/fixtures/sample_service --out data/intent_graphs/sample.json
+lsa audit data/intent_graphs/sample.json tests/fixtures/sample_events.json --out-dir data/reports
+lsa parse-trace tests/fixtures/sample_trace.log --trace-format auto
+lsa audit-trace demo-snapshot tests/fixtures/sample_trace.log --snapshot-id --trace-format auto
+lsa collect-trace 1234 --program ebpf/network_observer.bt --duration 5 --out data/traces/live.log
+lsa collect-audit demo-snapshot 1234 --snapshot-id --program ebpf/network_observer.bt --trace-format bpftrace
+lsa list-snapshots
+lsa list-audits
+```
+
+Example enriched trace line:
+
+```text
+event=network process=python comm=python pid=4242 tid=4242 fd=9 daddr=93.184.216.34 dport=443
+```
+
+This normalizes into a runtime event with target `93.184.216.34:443` and metadata that includes `service_hint=https`.
+
+Collected traces now also get a sibling manifest such as `data/traces/latest-trace.log.meta.json`. When present, the parser automatically merges collector metadata like `collector_session_id`, `collector_target_pid`, and `collector_command` into each observed event before audit correlation.
+
+Traces can also carry a sibling symbol map such as `data/traces/latest-trace.log.symbols.json`. When present, the parser can translate raw fields like `pc=0x4010` or `stack=0x1000>0x4010>0x7777` into semantic hints before function resolution runs.
+
+Traces can also carry a sibling context map such as `data/traces/latest-trace.log.contexts.json`. When present, the parser can join request and trace metadata such as `traceparent`, `request_id`, or `b3` fields onto matching runtime events by `context_key`, `conn_id`, `flow_id`, `socket_id`, `request_id`, or `trace_id`.
+
+The collection flow now stages that sidecar automatically when a collector program has an adjacent symbol file like `emit_symbolized_trace.sh.symbols.json`, or when you pass `--symbol-map /path/to/map.json` to `collect-trace` or `collect-audit`.
+
+Collectors can also emit inline symbol-definition lines directly in the trace stream, for example:
+
+```text
+event=symbol addr=0x4010 value=app:charge_customer
+event=symbol addr=0x7777 value=requests.post
+event=network process=python stack=0x1000>0x4010>0x7777 target=https://malicious.example.com/exfil
+```
+
+During collection, LSA now strips those symbol-definition lines out of the stored trace body, writes a generated `.symbols.json` sidecar, and audits the remaining runtime events against that materialized symbol map.
+
+Collectors can do the same thing for correlation context:
+
+```text
+event=context conn_id=conn-1 traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 request_id=req-123
+event=network process=python comm=python conn_id=conn-1 target=https://api.stripe.com/v1/charges
+```
+
+During collection, LSA strips those `event=context` lines out of the stored trace body, materializes a `.contexts.json` sidecar, and joins that context back onto matching runtime events before correlation runs.
+
+The FastAPI surface now mirrors the live collection workflow with:
+
+```text
+POST /collect-trace
+POST /collect-audit
+```
+
+Those endpoints return the staged `trace_metadata_path` and `trace_symbol_map_path` alongside the collected trace or audit result.
+They also return `trace_context_map_path` when collection generated or staged a context sidecar.
+
+When a trace includes fields like `fd`, `tid`, or collector-scoped PID metadata, enrichment now derives stable `socket_id` and `flow_id` values automatically. That gives the resolver stronger binding keys than plain process-name continuity on real runtime traces.
+
+If an upstream collector can emit code-level hints, the resolver now prefers them before heuristic matching. Useful fields include:
+
+```text
+qualname=charge_customer
+module=app function_name=charge_customer
+source_file=app.py line=4
+stack=worker_loop>app.charge_customer>requests.post
+call_stack=scheduler|app.py:4|requests.post
+symbol=app:charge_customer
+frame_symbol=app.py:4
+```
+
+Those hints let the audit path attribute drift directly to the intended function even when the runtime process label is generic. When a collector only has rough symbol strings, enrichment now normalizes common forms like `app:charge_customer` into canonical module/function hints before resolution. When a stack-like hint is used, the resolved event also records which stack entry won via `trace_hint_value` and `trace_hint_index`.
+
+For lower-level collector output, a symbol sidecar can bridge addresses into those same hints. Example:
+
+```json
+{
+  "symbols": {
+    "0x4010": "app:charge_customer",
+    "0x7777": "requests.post"
+  }
+}
+```
+
+You can also provide a local alias map at `data/destination_aliases.json`, for example:
+
+```json
+{
+  "93.184.216.34": "api.stripe.com",
+  "10.0.0.5:8080": "internal-billing.local"
+}
+```
+
+When present, alias matches are considered during drift comparison and preserved in event metadata.
+
+When traces include correlation keys such as `request_id=req-123` or `trace_id=trace-abc`, the auditor can carry a resolved function identity across related events in the same runtime sequence.
+
+Common tracing headers are normalized automatically, so collectors do not need to pre-convert them into LSA-specific keys. Supported examples include:
+
+```text
+traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+b3=4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1-a2fb4a1d1a96d312
+x-request-id=req-123
+otel.trace_id=4bf92f3577b34da6a3ce929d0e0e4736
+otel.span_id=00f067aa0ba902b7
+uber-trace-id=4bf92f3577b34da6:00f067aa0ba902b7:a2fb4a1d1a96d312:1
+baggage=request_id=req-123,tenant=acme
+```
+
+These are normalized into canonical `trace_id`, `span_id`, `parent_span_id`, and `request_id` fields before correlation runs.
+
+Each audit now also returns an `explanation` object with a concise summary, impacted functions, unexpected targets, primary session key, and supporting evidence lines. This makes the result easier to feed into dashboards or operator review flows without re-deriving the narrative from raw events.
+
+## Repository shape
+
+```text
+living-systems-auditor/
+├── lsa/
+│   ├── api/
+│   ├── cli/
+│   ├── core/
+│   ├── drift/
+│   ├── ingest/
+│   └── remediation/
+├── tests/
+├── docs/
+├── dashboard/
+├── ebpf/
+└── docker/
+```
+
+## Near-term roadmap
+
+1. Replace the Python-only parser with tree-sitter for multi-language support.
+2. Swap the rule-based remediation stub with a local LLM adapter.
+3. Push collector-side context further so live traces emit richer correlation and identity fields directly.
+4. Replace the file-based workspace store with a proper database-backed control plane.
+
+## Flashpoint target
+
+The first real proof point is not a large feature list. It is one credible case where the system flags semantic drift before a service failure is obvious, and produces an explanation an engineer would actually trust.

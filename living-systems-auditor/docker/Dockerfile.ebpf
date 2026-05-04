@@ -1,0 +1,12 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bpftrace \
+    python3-bpfcc \
+    linux-headers-generic \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /observer
+COPY ebpf /observer
+
+CMD ["bash"]

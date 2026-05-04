@@ -1,0 +1,12 @@
+[
+  {
+    "function": "charge_customer",
+    "event_type": "network",
+    "target": "https://api.stripe.com/v1/charges"
+  },
+  {
+    "function": "charge_customer",
+    "event_type": "network",
+    "target": "https://malicious.example.com/exfil"
+  }
+]

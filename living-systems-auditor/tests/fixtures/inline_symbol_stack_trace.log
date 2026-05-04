@@ -1,0 +1,4 @@
+event=symbol addr=0x1000 value=worker_loop
+event=symbol addr=0x4010 value=app:charge_customer
+event=symbol addr=0x7777 value=requests.post
+event=network process=python stack=0x1000>0x4010>0x7777 target=https://malicious.example.com/exfil

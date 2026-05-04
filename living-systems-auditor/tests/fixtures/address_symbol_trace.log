@@ -1,0 +1,1 @@
+event=network process=python pc=0x4010 target=https://malicious.example.com/exfil

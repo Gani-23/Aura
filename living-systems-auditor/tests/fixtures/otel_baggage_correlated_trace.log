@@ -1,0 +1,2 @@
+event=network process=python comm=python otel.trace_id=4bf92f3577b34da6a3ce929d0e0e4736 otel.span_id=00f067aa0ba902b7 baggage=request_id=req-123,tenant=acme target=https://api.stripe.com/v1/charges
+event=network process=python comm=python otel.trace_id=4bf92f3577b34da6a3ce929d0e0e4736 otel.span_id=1111111111111111 baggage=request_id=req-123,tenant=acme target=https://malicious.example.com/exfil

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "living-systems-auditor"
+version = "0.1.0"
+description = "Intent-aware drift detection for software systems."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "Gani" }
+]
+dependencies = [
+  "fastapi>=0.115.0",
+  "pydantic>=2.8.0",
+  "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28.0",
+  "pytest>=8.3.0",
+]
+
+[project.scripts]
+lsa = "lsa.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+include = ["lsa*"]

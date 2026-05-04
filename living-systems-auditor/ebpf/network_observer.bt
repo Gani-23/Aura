@@ -1,0 +1,17 @@
+#!/usr/bin/env bpftrace
+
+tracepoint:syscalls:sys_enter_connect
+/pid == $1/
+{
+  $addr = (struct sockaddr_in *)args->uservaddr;
+  printf(
+    "event=network process=%s comm=%s pid=%d tid=%d fd=%d daddr=%s dport=%d\n",
+    comm,
+    comm,
+    pid,
+    tid,
+    args->fd,
+    ntop($addr->sin_addr.s_addr),
+    ntohs($addr->sin_port)
+  );
+}

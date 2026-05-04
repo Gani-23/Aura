@@ -1,0 +1,1 @@
+event=network process=python module=app function_name=charge_customer target=https://malicious.example.com/exfil

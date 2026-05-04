@@ -1,0 +1,2 @@
+CONNECT python 443
+event=network process=billing-worker comm=billing-worker pid=812 tid=901 fd=14 daddr=10.0.0.5 dport=8080

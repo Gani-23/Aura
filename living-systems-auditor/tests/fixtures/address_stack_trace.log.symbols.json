@@ -1,0 +1,7 @@
+{
+  "symbols": {
+    "0x1000": "worker_loop",
+    "0x4010": "app:charge_customer",
+    "0x7777": "requests.post"
+  }
+}

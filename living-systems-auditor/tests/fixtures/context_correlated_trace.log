@@ -1,0 +1,2 @@
+event=network process=python comm=python conn_id=conn-1 target=https://api.stripe.com/v1/charges
+event=network process=python comm=python conn_id=conn-1 target=https://malicious.example.com/exfil
