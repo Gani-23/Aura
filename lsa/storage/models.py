@@ -236,6 +236,16 @@ class WorkerHeartbeatRollupRecord:
             "event_count": self.event_count,
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict) -> "WorkerHeartbeatRollupRecord":
+        return cls(
+            day_bucket=payload["day_bucket"],
+            worker_id=payload["worker_id"],
+            status=payload["status"],
+            current_job_id=payload.get("current_job_id"),
+            event_count=int(payload["event_count"]),
+        )
+
 
 @dataclass(slots=True)
 class JobLeaseEventRollupRecord:
@@ -253,6 +263,47 @@ class JobLeaseEventRollupRecord:
             "event_type": self.event_type,
             "event_count": self.event_count,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "JobLeaseEventRollupRecord":
+        return cls(
+            day_bucket=payload["day_bucket"],
+            job_id=payload["job_id"],
+            worker_id=payload.get("worker_id"),
+            event_type=payload["event_type"],
+            event_count=int(payload["event_count"]),
+        )
+
+
+@dataclass(slots=True)
+class ControlPlaneMaintenanceEventRecord:
+    event_id: str
+    recorded_at: str
+    event_type: str
+    changed_by: str
+    reason: str | None = None
+    details: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_id": self.event_id,
+            "recorded_at": self.recorded_at,
+            "event_type": self.event_type,
+            "changed_by": self.changed_by,
+            "reason": self.reason,
+            "details": dict(self.details),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ControlPlaneMaintenanceEventRecord":
+        return cls(
+            event_id=payload["event_id"],
+            recorded_at=payload["recorded_at"],
+            event_type=payload["event_type"],
+            changed_by=payload["changed_by"],
+            reason=payload.get("reason"),
+            details=dict(payload.get("details", {})),
+        )
 
 
 @dataclass(slots=True)
@@ -461,6 +512,11 @@ class ControlPlaneOnCallChangeRequestRecord:
     effective_end_date: str | None = None
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    assigned_at: str | None = None
+    assigned_by: str | None = None
+    assignment_note: str | None = None
     decision_at: str | None = None
     decided_by: str | None = None
     decided_by_team: str | None = None
@@ -491,6 +547,11 @@ class ControlPlaneOnCallChangeRequestRecord:
             "effective_end_date": self.effective_end_date,
             "webhook_url": self.webhook_url,
             "escalation_webhook_url": self.escalation_webhook_url,
+            "assigned_to": self.assigned_to,
+            "assigned_to_team": self.assigned_to_team,
+            "assigned_at": self.assigned_at,
+            "assigned_by": self.assigned_by,
+            "assignment_note": self.assignment_note,
             "decision_at": self.decision_at,
             "decided_by": self.decided_by,
             "decided_by_team": self.decided_by_team,
@@ -523,6 +584,11 @@ class ControlPlaneOnCallChangeRequestRecord:
             effective_end_date=payload.get("effective_end_date"),
             webhook_url=payload.get("webhook_url"),
             escalation_webhook_url=payload.get("escalation_webhook_url"),
+            assigned_to=payload.get("assigned_to"),
+            assigned_to_team=payload.get("assigned_to_team"),
+            assigned_at=payload.get("assigned_at"),
+            assigned_by=payload.get("assigned_by"),
+            assignment_note=payload.get("assignment_note"),
             decision_at=payload.get("decision_at"),
             decided_by=payload.get("decided_by"),
             decided_by_team=payload.get("decided_by_team"),

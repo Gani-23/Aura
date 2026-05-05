@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from lsa.storage.files import JobRepository
-from lsa.storage.models import ControlPlaneOnCallScheduleRecord
+from lsa.storage.models import ControlPlaneOnCallChangeRequestRecord, ControlPlaneOnCallScheduleRecord
 
 
 def _utc_now() -> datetime:
@@ -184,18 +184,50 @@ class OnCallConflictSummary:
 
 
 @dataclass(slots=True)
+class OnCallPendingReviewSample:
+    request_id: str
+    created_at: str
+    team_name: str
+    rotation_name: str | None
+    age_hours: float
+    change_reason: str | None
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "created_at": self.created_at,
+            "team_name": self.team_name,
+            "rotation_name": self.rotation_name,
+            "age_hours": self.age_hours,
+            "change_reason": self.change_reason,
+            "assigned_to": self.assigned_to,
+            "assigned_to_team": self.assigned_to_team,
+        }
+
+
+@dataclass(slots=True)
 class OnCallAnalyticsSummary:
     total_schedules: int
     active_schedules: int
     conflict_count: int
+    pending_review_count: int = 0
+    stale_pending_review_count: int = 0
+    oldest_pending_review_age_hours: float | None = None
     conflicts: list[OnCallConflictSummary] = field(default_factory=list)
+    pending_review_samples: list[OnCallPendingReviewSample] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "total_schedules": self.total_schedules,
             "active_schedules": self.active_schedules,
             "conflict_count": self.conflict_count,
+            "pending_review_count": self.pending_review_count,
+            "stale_pending_review_count": self.stale_pending_review_count,
+            "oldest_pending_review_age_hours": self.oldest_pending_review_age_hours,
             "conflicts": [item.to_dict() for item in self.conflicts],
+            "pending_review_samples": [item.to_dict() for item in self.pending_review_samples],
         }
 
 
@@ -212,6 +244,9 @@ class ControlPlaneAlertThresholds:
     job_failure_rate_min_samples: int = 3
     oncall_conflict_warning_threshold: int = 1
     oncall_conflict_critical_threshold: int = 3
+    oncall_pending_review_warning_threshold: int = 1
+    oncall_pending_review_critical_threshold: int = 3
+    oncall_pending_review_sla_hours: float = 24.0
 
     def to_dict(self) -> dict:
         return {
@@ -226,6 +261,9 @@ class ControlPlaneAlertThresholds:
             "job_failure_rate_min_samples": self.job_failure_rate_min_samples,
             "oncall_conflict_warning_threshold": self.oncall_conflict_warning_threshold,
             "oncall_conflict_critical_threshold": self.oncall_conflict_critical_threshold,
+            "oncall_pending_review_warning_threshold": self.oncall_pending_review_warning_threshold,
+            "oncall_pending_review_critical_threshold": self.oncall_pending_review_critical_threshold,
+            "oncall_pending_review_sla_hours": self.oncall_pending_review_sla_hours,
         }
 
 
@@ -296,6 +334,7 @@ class ControlPlaneAnalyticsReport:
 @dataclass(slots=True)
 class AnalyticsService:
     job_repository: JobRepository
+    default_environment_name: str = "default"
     heartbeat_timeout_seconds: float = 5.0
     default_thresholds: ControlPlaneAlertThresholds = field(default_factory=ControlPlaneAlertThresholds)
 
@@ -341,8 +380,11 @@ class AnalyticsService:
             day_buckets=day_buckets,
             day_bucket_set=day_bucket_set,
         )
-        oncall_summary = self._build_oncall_summary(now=now)
         effective_thresholds = thresholds or self.default_thresholds
+        oncall_summary = self._build_oncall_summary(
+            now=now,
+            pending_review_sla_hours=effective_thresholds.oncall_pending_review_sla_hours,
+        )
         evaluation = self._build_evaluation(
             queue=queue,
             workers=worker_summary,
@@ -597,11 +639,21 @@ class AnalyticsService:
             days=days,
         )
 
-    def _build_oncall_summary(self, *, now: datetime) -> OnCallAnalyticsSummary:
+    def _build_oncall_summary(
+        self,
+        *,
+        now: datetime,
+        pending_review_sla_hours: float,
+    ) -> OnCallAnalyticsSummary:
         schedules = [
             record
             for record in self.job_repository.list_control_plane_oncall_schedules()
-            if record.cancelled_at is None
+            if record.cancelled_at is None and record.environment_name == self.default_environment_name
+        ]
+        pending_reviews = [
+            record
+            for record in self.job_repository.list_control_plane_oncall_change_requests(status="pending_review")
+            if record.environment_name == self.default_environment_name
         ]
         active_schedules = [
             record
@@ -648,11 +700,43 @@ class AnalyticsService:
             key=lambda item: (-item.priority, -item.specificity, item.window_span_days, item.sample_timestamp),
         )
 
+        pending_review_ages = [
+            (
+                record,
+                max(0.0, (now - datetime.fromisoformat(record.created_at)).total_seconds() / 3600.0),
+            )
+            for record in pending_reviews
+        ]
+        stale_pending_reviews = [
+            (record, age_hours)
+            for record, age_hours in pending_review_ages
+            if age_hours >= pending_review_sla_hours
+        ]
+        stale_pending_reviews.sort(key=lambda item: item[1], reverse=True)
+
         return OnCallAnalyticsSummary(
             total_schedules=len(schedules),
             active_schedules=len(active_schedules),
             conflict_count=len(conflicts),
+            pending_review_count=len(pending_reviews),
+            stale_pending_review_count=len(stale_pending_reviews),
+            oldest_pending_review_age_hours=(
+                max((age_hours for _, age_hours in pending_review_ages), default=None)
+            ),
             conflicts=conflicts,
+            pending_review_samples=[
+                OnCallPendingReviewSample(
+                    request_id=record.request_id,
+                    created_at=record.created_at,
+                    team_name=record.team_name,
+                    rotation_name=record.rotation_name,
+                    age_hours=round(age_hours, 2),
+                    change_reason=record.change_reason,
+                    assigned_to=record.assigned_to,
+                    assigned_to_team=record.assigned_to_team,
+                )
+                for record, age_hours in stale_pending_reviews[:3]
+            ],
         )
 
     def _build_evaluation(
@@ -742,6 +826,23 @@ class AnalyticsService:
                     warning_summary="Ambiguous on-call route overlaps were detected in upcoming schedule coverage.",
                     critical_summary="Too many ambiguous on-call route overlaps were detected in upcoming schedule coverage.",
                     context={"sample_conflicts": sample_conflicts},
+                )
+            )
+
+        if oncall.stale_pending_review_count > 0:
+            findings.extend(
+                self._threshold_findings(
+                    observed_value=oncall.stale_pending_review_count,
+                    warning_threshold=thresholds.oncall_pending_review_warning_threshold,
+                    critical_threshold=thresholds.oncall_pending_review_critical_threshold,
+                    code="oncall_pending_reviews_stale",
+                    metric="oncall.stale_pending_review_count",
+                    warning_summary="Pending on-call change reviews are older than the configured SLA.",
+                    critical_summary="Too many pending on-call change reviews are older than the configured SLA.",
+                    context={
+                        "sla_hours": thresholds.oncall_pending_review_sla_hours,
+                        "sample_requests": [item.to_dict() for item in oncall.pending_review_samples],
+                    },
                 )
             )
 

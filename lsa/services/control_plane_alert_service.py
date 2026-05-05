@@ -415,6 +415,32 @@ class ControlPlaneAlertService:
             applied_schedule_id=applied_schedule.schedule_id,
         )
 
+    def assign_oncall_change_request(
+        self,
+        *,
+        request_id: str,
+        assigned_to: str,
+        assigned_to_team: str | None = None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        request = self.job_repository.get_control_plane_oncall_change_request(request_id)
+        if request.status != "pending_review":
+            raise ValueError(
+                f"On-call change request '{request_id}' is not pending review."
+            )
+        normalized_assigned_to = assigned_to.strip()
+        if not normalized_assigned_to:
+            raise ValueError("assigned_to must not be empty.")
+        return self.job_repository.assign_control_plane_oncall_change_request(
+            request_id=request_id,
+            assigned_to=normalized_assigned_to,
+            assigned_to_team=self._normalize_team(assigned_to_team),
+            assigned_at=_utc_now(),
+            assigned_by=assigned_by,
+            assignment_note=assignment_note,
+        )
+
     def resolve_active_oncall_route(
         self,
         *,

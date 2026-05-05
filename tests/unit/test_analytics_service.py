@@ -6,6 +6,7 @@ from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertTh
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import JobRepository
 from lsa.storage.models import (
+    ControlPlaneOnCallChangeRequestRecord,
     ControlPlaneOnCallScheduleRecord,
     JobLeaseEventRecord,
     JobRecord,
@@ -347,6 +348,104 @@ class AnalyticsServiceTests(unittest.TestCase):
             self.assertGreaterEqual(payload["oncall"]["active_schedules"], 2)
             finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
             self.assertIn("oncall_route_conflicts", finding_codes)
+
+    def test_control_plane_analytics_scopes_oncall_to_environment_and_flags_stale_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            service = AnalyticsService(
+                job_repository=repo,
+                default_environment_name="prod",
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    oncall_conflict_warning_threshold=1,
+                    oncall_conflict_critical_threshold=2,
+                    oncall_pending_review_warning_threshold=1,
+                    oncall_pending_review_critical_threshold=2,
+                    oncall_pending_review_sla_hours=1.0,
+                ),
+            )
+
+            repo.append_control_plane_oncall_schedule(
+                ControlPlaneOnCallScheduleRecord(
+                    schedule_id="schedule-prod-a",
+                    created_at="2026-05-05T00:00:00+00:00",
+                    created_by="operator-a",
+                    environment_name="prod",
+                    team_name="platform-a",
+                    timezone_name="UTC",
+                    weekdays=[0, 1, 2, 3, 4, 5, 6],
+                    start_time="00:00",
+                    end_time="23:59",
+                    priority=100,
+                    rotation_name="primary-a",
+                )
+            )
+            repo.append_control_plane_oncall_schedule(
+                ControlPlaneOnCallScheduleRecord(
+                    schedule_id="schedule-staging-b",
+                    created_at="2026-05-06T00:00:00+00:00",
+                    created_by="operator-b",
+                    environment_name="staging",
+                    team_name="platform-b",
+                    timezone_name="UTC",
+                    weekdays=[0, 1, 2, 3, 4, 5, 6],
+                    start_time="00:00",
+                    end_time="23:59",
+                    priority=100,
+                    rotation_name="primary-b",
+                )
+            )
+            repo.append_control_plane_oncall_change_request(
+                ControlPlaneOnCallChangeRequestRecord(
+                    request_id="request-prod-stale",
+                    created_at=(datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+                    created_by="operator-c",
+                    environment_name="prod",
+                    team_name="platform-a",
+                    timezone_name="UTC",
+                    status="pending_review",
+                    change_reason="Prod overlap waiting on approval.",
+                    review_required=True,
+                    review_reasons=["ambiguous_overlap"],
+                    assigned_to="reviewer-prod",
+                    assigned_to_team="platform",
+                    weekdays=[0, 1, 2, 3, 4, 5, 6],
+                    start_time="00:00",
+                    end_time="23:59",
+                    priority=100,
+                    rotation_name="primary-c",
+                )
+            )
+            repo.append_control_plane_oncall_change_request(
+                ControlPlaneOnCallChangeRequestRecord(
+                    request_id="request-staging-stale",
+                    created_at=(datetime.now(UTC) - timedelta(hours=5)).isoformat(),
+                    created_by="operator-d",
+                    environment_name="staging",
+                    team_name="platform-b",
+                    timezone_name="UTC",
+                    status="pending_review",
+                    change_reason="Staging overlap waiting on approval.",
+                    review_required=True,
+                    review_reasons=["ambiguous_overlap"],
+                    weekdays=[0, 1, 2, 3, 4, 5, 6],
+                    start_time="00:00",
+                    end_time="23:59",
+                    priority=100,
+                    rotation_name="primary-d",
+                )
+            )
+
+            payload = service.build_control_plane_analytics(days=7).to_dict()
+            self.assertEqual(payload["oncall"]["total_schedules"], 1)
+            self.assertEqual(payload["oncall"]["conflict_count"], 0)
+            self.assertEqual(payload["oncall"]["pending_review_count"], 1)
+            self.assertEqual(payload["oncall"]["stale_pending_review_count"], 1)
+            self.assertGreaterEqual(payload["oncall"]["oldest_pending_review_age_hours"], 3.0)
+            self.assertEqual(payload["oncall"]["pending_review_samples"][0]["assigned_to"], "reviewer-prod")
+            finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
+            self.assertIn("oncall_pending_reviews_stale", finding_codes)
 
 
 if __name__ == "__main__":

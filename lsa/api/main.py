@@ -5,9 +5,11 @@ from datetime import datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi import Query
+from fastapi.responses import PlainTextResponse
 
 from lsa.api.models import (
     AcknowledgeControlPlaneAlertRequest,
+    AssignControlPlaneOnCallChangeRequest,
     AuditRecordPayload,
     AuditRequest,
     AuditResponse,
@@ -18,24 +20,31 @@ from lsa.api.models import (
     CollectAuditResponse,
     CollectTraceRequest,
     CollectTraceResponse,
+    ControlPlaneBackupResponse,
     ControlPlaneAnalyticsResponse,
     ControlPlaneAlertRecordPayload,
     ControlPlaneAlertSilencePayload,
+    ControlPlaneMaintenanceEventPayload,
     ControlPlaneOnCallChangeRequestPayload,
     ControlPlaneOnCallRouteResolutionPayload,
     ControlPlaneOnCallSchedulePayload,
+    ControlPlaneMaintenanceModeResponse,
+    ControlPlaneSchemaStatusResponse,
     CreateControlPlaneAlertSilenceRequest,
     CreateControlPlaneOnCallChangeRequest,
     CreateControlPlaneOnCallScheduleRequest,
     EmitControlPlaneAlertsResponse,
+    ExportControlPlaneBackupRequest,
     HealthResponse,
     IngestRequest,
     IngestResponse,
+    ImportControlPlaneBackupRequest,
     JobLeaseEventPayload,
     JobLeaseEventRollupPayload,
     JobRecordPayload,
     PruneHistoryResponse,
     ReviewControlPlaneOnCallChangeRequest,
+    SetControlPlaneMaintenanceModeRequest,
     SnapshotRecordPayload,
     WorkerHeartbeatPayload,
     WorkerHeartbeatRollupPayload,
@@ -49,8 +58,10 @@ from lsa.remediation.llm_client import RuleBasedLLMClient
 from lsa.services.audit_service import AuditService
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
+from lsa.services.control_plane_backup_service import ControlPlaneBackupService
 from lsa.services.ingest_service import IngestService
 from lsa.services.job_service import JobService
+from lsa.services.metrics_service import ControlPlaneMetricsService
 from lsa.services.trace_collection_service import TraceCollectionRequest, TraceCollectionService
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import AuditRepository, JobRepository, SnapshotRepository
@@ -73,6 +84,7 @@ audit_service = AuditService(
 trace_collection_service = TraceCollectionService(settings=settings)
 analytics_service = AnalyticsService(
     job_repository=job_repository,
+    default_environment_name=settings.environment_name,
     heartbeat_timeout_seconds=settings.worker_heartbeat_timeout_seconds,
     default_thresholds=ControlPlaneAlertThresholds(
         queue_warning_threshold=settings.analytics_queue_warning_threshold,
@@ -86,6 +98,9 @@ analytics_service = AnalyticsService(
         job_failure_rate_min_samples=settings.analytics_job_failure_rate_min_samples,
         oncall_conflict_warning_threshold=settings.analytics_oncall_conflict_warning_threshold,
         oncall_conflict_critical_threshold=settings.analytics_oncall_conflict_critical_threshold,
+        oncall_pending_review_warning_threshold=settings.analytics_oncall_pending_review_warning_threshold,
+        oncall_pending_review_critical_threshold=settings.analytics_oncall_pending_review_critical_threshold,
+        oncall_pending_review_sla_hours=settings.analytics_oncall_pending_review_sla_hours,
     ),
 )
 control_plane_alert_service = ControlPlaneAlertService(
@@ -103,6 +118,12 @@ control_plane_alert_service = ControlPlaneAlertService(
     webhook_url=settings.control_plane_alert_webhook_url,
     escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
 )
+control_plane_backup_service = ControlPlaneBackupService(
+    settings=settings,
+    snapshot_repository=snapshot_repository,
+    audit_repository=audit_repository,
+    job_repository=job_repository,
+)
 job_service = JobService(
     job_repository=job_repository,
     audit_service=audit_service,
@@ -115,6 +136,13 @@ job_service = JobService(
     control_plane_alert_service=control_plane_alert_service,
     control_plane_alert_interval_seconds=settings.control_plane_alert_interval_seconds,
     control_plane_alerts_enabled=settings.control_plane_alerts_enabled,
+)
+metrics_service = ControlPlaneMetricsService(
+    job_repository=job_repository,
+    job_service=job_service,
+    analytics_service=analytics_service,
+    environment_name=settings.environment_name,
+    worker_mode="embedded" if settings.run_embedded_worker else "external",
 )
 
 
@@ -147,13 +175,23 @@ def _parse_timestamp_query(raw_value: str | None) -> datetime | None:
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     active_workers = job_service.active_worker_count()
+    database_status = job_repository.database_status()
+    maintenance_mode = job_repository.maintenance_mode_status()
     return HealthResponse(
         status="ok",
         environment_name=settings.environment_name,
         auth_enabled=settings.api_key is not None,
         worker_mode="embedded" if settings.run_embedded_worker else "external",
-        database_path=str(settings.database_path),
-        database_ready=settings.database_path.exists(),
+        database_backend=str(database_status["backend"]),
+        database_url=str(database_status["url"]),
+        database_path=str(database_status["path"]),
+        database_ready=bool(database_status["ready"]),
+        database_writable=bool(database_status["writable"]),
+        database_schema_version=int(database_status["schema_version"]),
+        database_expected_schema_version=int(database_status["expected_schema_version"]),
+        database_schema_ready=bool(database_status["schema_ready"]),
+        database_pending_migration_count=int(database_status["pending_migration_count"]),
+        maintenance_mode_active=bool(maintenance_mode["active"]),
         worker_running=active_workers > 0 if not settings.run_embedded_worker else job_service.is_worker_running(),
         active_workers=active_workers,
         queued_jobs=job_service.count_jobs_by_status("queued"),
@@ -177,6 +215,65 @@ def require_api_key(
         if authorization[len("Bearer ") :].strip() == settings.api_key:
             return
     raise HTTPException(status_code=401, detail="Valid API key required.")
+
+
+def require_control_plane_mutation_allowed() -> None:
+    if job_repository.maintenance_mode_status()["active"]:
+        raise HTTPException(status_code=503, detail="Control-plane maintenance mode is active.")
+
+
+@app.get("/metrics", response_class=PlainTextResponse, dependencies=[Depends(require_api_key)])
+async def metrics(days: int = Query(default=1, ge=1, le=30)) -> PlainTextResponse:
+    return PlainTextResponse(metrics_service.render_prometheus(days=days), media_type="text/plain; version=0.0.4")
+
+
+@app.get(
+    "/maintenance/mode",
+    response_model=ControlPlaneMaintenanceModeResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_control_plane_maintenance_mode() -> ControlPlaneMaintenanceModeResponse:
+    return ControlPlaneMaintenanceModeResponse(**job_repository.maintenance_mode_status())
+
+
+@app.get(
+    "/maintenance/events",
+    response_model=list[ControlPlaneMaintenanceEventPayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_control_plane_maintenance_events(
+    limit: int = Query(default=50, ge=1, le=500),
+) -> list[ControlPlaneMaintenanceEventPayload]:
+    return [
+        ControlPlaneMaintenanceEventPayload(**record.to_dict())
+        for record in job_service.list_control_plane_maintenance_events(limit=limit)
+    ]
+
+
+@app.post(
+    "/maintenance/mode/enable",
+    response_model=ControlPlaneMaintenanceModeResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def enable_control_plane_maintenance_mode(
+    request: SetControlPlaneMaintenanceModeRequest,
+) -> ControlPlaneMaintenanceModeResponse:
+    return ControlPlaneMaintenanceModeResponse(
+        **job_service.enable_maintenance_mode(changed_by=request.changed_by, reason=request.reason)
+    )
+
+
+@app.post(
+    "/maintenance/mode/disable",
+    response_model=ControlPlaneMaintenanceModeResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def disable_control_plane_maintenance_mode(
+    request: SetControlPlaneMaintenanceModeRequest,
+) -> ControlPlaneMaintenanceModeResponse:
+    return ControlPlaneMaintenanceModeResponse(
+        **job_service.disable_maintenance_mode(changed_by=request.changed_by, reason=request.reason)
+    )
 
 
 @app.get("/snapshots", response_model=list[SnapshotRecordPayload], dependencies=[Depends(require_api_key)])
@@ -277,6 +374,66 @@ async def prune_history() -> PruneHistoryResponse:
     return PruneHistoryResponse(**result)
 
 
+@app.get(
+    "/maintenance/control-plane-schema",
+    response_model=ControlPlaneSchemaStatusResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_control_plane_schema_status() -> ControlPlaneSchemaStatusResponse:
+    return ControlPlaneSchemaStatusResponse(**job_repository.schema_status())
+
+
+@app.post(
+    "/maintenance/control-plane-schema/migrate",
+    response_model=ControlPlaneSchemaStatusResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def migrate_control_plane_schema() -> ControlPlaneSchemaStatusResponse:
+    result = job_repository.migrate_schema()
+    job_service.record_maintenance_event(
+        event_type="schema_migrated",
+        changed_by="api",
+        details=result,
+    )
+    return ControlPlaneSchemaStatusResponse(**result)
+
+
+@app.post(
+    "/maintenance/export-control-plane-backup",
+    response_model=ControlPlaneBackupResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def export_control_plane_backup(request: ExportControlPlaneBackupRequest) -> ControlPlaneBackupResponse:
+    summary = control_plane_backup_service.export_bundle(request.output_path)
+    job_service.record_maintenance_event(
+        event_type="backup_exported",
+        changed_by="api",
+        details=summary.to_dict(),
+    )
+    return ControlPlaneBackupResponse(**summary.to_dict())
+
+
+@app.post(
+    "/maintenance/import-control-plane-backup",
+    response_model=ControlPlaneBackupResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def import_control_plane_backup(request: ImportControlPlaneBackupRequest) -> ControlPlaneBackupResponse:
+    try:
+        summary = control_plane_backup_service.import_bundle(
+            request.input_path,
+            replace_existing=request.replace_existing,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job_service.record_maintenance_event(
+        event_type="backup_imported",
+        changed_by="api",
+        details=summary.to_dict(),
+    )
+    return ControlPlaneBackupResponse(**summary.to_dict())
+
+
 @app.post(
     "/maintenance/emit-control-plane-alerts",
     response_model=EmitControlPlaneAlertsResponse,
@@ -325,7 +482,7 @@ async def list_control_plane_alerts(limit: int = Query(default=50, ge=1, le=500)
 @app.post(
     "/control-plane-alerts/{alert_id}/acknowledge",
     response_model=ControlPlaneAlertRecordPayload,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
 )
 async def acknowledge_control_plane_alert(
     alert_id: str,
@@ -359,7 +516,7 @@ async def list_control_plane_alert_silences(
 @app.post(
     "/control-plane-alert-silences",
     response_model=ControlPlaneAlertSilencePayload,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
 )
 async def create_control_plane_alert_silence(
     request: CreateControlPlaneAlertSilenceRequest,
@@ -377,7 +534,7 @@ async def create_control_plane_alert_silence(
 @app.post(
     "/control-plane-alert-silences/{silence_id}/cancel",
     response_model=ControlPlaneAlertSilencePayload,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
 )
 async def cancel_control_plane_alert_silence(
     silence_id: str,
@@ -428,7 +585,7 @@ async def get_control_plane_oncall_change_request(
 @app.post(
     "/control-plane-oncall-change-requests",
     response_model=ControlPlaneOnCallChangeRequestPayload,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
 )
 async def create_control_plane_oncall_change_request(
     request: CreateControlPlaneOnCallChangeRequest,
@@ -458,9 +615,36 @@ async def create_control_plane_oncall_change_request(
 
 
 @app.post(
+    "/control-plane-oncall-change-requests/{request_id}/assign",
+    response_model=ControlPlaneOnCallChangeRequestPayload,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
+async def assign_control_plane_oncall_change_request(
+    request_id: str,
+    request: AssignControlPlaneOnCallChangeRequest,
+) -> ControlPlaneOnCallChangeRequestPayload:
+    try:
+        record = control_plane_alert_service.assign_oncall_change_request(
+            request_id=request_id,
+            assigned_to=request.assigned_to,
+            assigned_to_team=request.assigned_to_team,
+            assigned_by=request.assigned_by,
+            assignment_note=request.assignment_note,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Control-plane on-call change request '{request_id}' was not found.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneOnCallChangeRequestPayload(**record.to_dict())
+
+
+@app.post(
     "/control-plane-oncall-change-requests/{request_id}/review",
     response_model=ControlPlaneOnCallChangeRequestPayload,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
 )
 async def review_control_plane_oncall_change_request(
     request_id: str,
@@ -516,7 +700,7 @@ async def resolve_control_plane_oncall_schedule(
 @app.post(
     "/control-plane-oncall-schedules",
     response_model=ControlPlaneOnCallSchedulePayload,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
 )
 async def create_control_plane_oncall_schedule(
     request: CreateControlPlaneOnCallScheduleRequest,
@@ -552,7 +736,7 @@ async def create_control_plane_oncall_schedule(
 @app.post(
     "/control-plane-oncall-schedules/{schedule_id}/cancel",
     response_model=ControlPlaneOnCallSchedulePayload,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
 )
 async def cancel_control_plane_oncall_schedule(
     schedule_id: str,
@@ -568,7 +752,11 @@ async def cancel_control_plane_oncall_schedule(
     return ControlPlaneOnCallSchedulePayload(**record.to_dict())
 
 
-@app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/ingest",
+    response_model=IngestResponse,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
 async def ingest_codebase(request: IngestRequest) -> IngestResponse:
     result = ingest_service.ingest(
         request.repo_path,
@@ -585,7 +773,11 @@ async def ingest_codebase(request: IngestRequest) -> IngestResponse:
     )
 
 
-@app.post("/audit", response_model=AuditResponse, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/audit",
+    response_model=AuditResponse,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
 async def audit_runtime(request: AuditRequest) -> AuditResponse:
     try:
         result = audit_service.audit(
@@ -612,7 +804,11 @@ async def audit_runtime(request: AuditRequest) -> AuditResponse:
     )
 
 
-@app.post("/audit-trace", response_model=AuditResponse, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/audit-trace",
+    response_model=AuditResponse,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
 async def audit_trace(request: AuditTraceRequest) -> AuditResponse:
     try:
         trace_events = load_trace_events(request.trace_path, trace_format=request.trace_format)
@@ -640,13 +836,22 @@ async def audit_trace(request: AuditTraceRequest) -> AuditResponse:
     )
 
 
-@app.post("/jobs/audit-trace", response_model=JobRecordPayload, status_code=202, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/jobs/audit-trace",
+    response_model=JobRecordPayload,
+    status_code=202,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
 async def submit_audit_trace_job(request: AuditTraceRequest) -> JobRecordPayload:
     job = job_service.submit_audit_trace(request.model_dump())
     return JobRecordPayload(**job.to_dict())
 
 
-@app.post("/collect-trace", response_model=CollectTraceResponse, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/collect-trace",
+    response_model=CollectTraceResponse,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
 async def collect_trace(request: CollectTraceRequest) -> CollectTraceResponse:
     try:
         result = trace_collection_service.collect(_build_trace_collection_request(request))
@@ -665,13 +870,22 @@ async def collect_trace(request: CollectTraceRequest) -> CollectTraceResponse:
     )
 
 
-@app.post("/jobs/collect-audit", response_model=JobRecordPayload, status_code=202, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/jobs/collect-audit",
+    response_model=JobRecordPayload,
+    status_code=202,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
 async def submit_collect_audit_job(request: CollectAuditRequest) -> JobRecordPayload:
     job = job_service.submit_collect_audit(request.model_dump())
     return JobRecordPayload(**job.to_dict())
 
 
-@app.post("/collect-audit", response_model=CollectAuditResponse, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/collect-audit",
+    response_model=CollectAuditResponse,
+    dependencies=[Depends(require_api_key), Depends(require_control_plane_mutation_allowed)],
+)
 async def collect_audit(request: CollectAuditRequest) -> CollectAuditResponse:
     try:
         observation = trace_collection_service.collect(_build_trace_collection_request(request))

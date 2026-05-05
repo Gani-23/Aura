@@ -15,8 +15,10 @@ from lsa.remediation.llm_client import RuleBasedLLMClient
 from lsa.services.audit_service import AuditService
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
+from lsa.services.control_plane_backup_service import ControlPlaneBackupService
 from lsa.services.ingest_service import IngestService
 from lsa.services.job_service import JobService
+from lsa.services.metrics_service import ControlPlaneMetricsService
 from lsa.services.trace_collection_service import TraceCollectionRequest, TraceCollectionService
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import AuditRepository, JobRepository, SnapshotRepository
@@ -39,6 +41,7 @@ audit_service = AuditService(
 trace_collection_service = TraceCollectionService(settings=settings)
 analytics_service = AnalyticsService(
     job_repository=job_repository,
+    default_environment_name=settings.environment_name,
     heartbeat_timeout_seconds=settings.worker_heartbeat_timeout_seconds,
     default_thresholds=ControlPlaneAlertThresholds(
         queue_warning_threshold=settings.analytics_queue_warning_threshold,
@@ -52,6 +55,9 @@ analytics_service = AnalyticsService(
         job_failure_rate_min_samples=settings.analytics_job_failure_rate_min_samples,
         oncall_conflict_warning_threshold=settings.analytics_oncall_conflict_warning_threshold,
         oncall_conflict_critical_threshold=settings.analytics_oncall_conflict_critical_threshold,
+        oncall_pending_review_warning_threshold=settings.analytics_oncall_pending_review_warning_threshold,
+        oncall_pending_review_critical_threshold=settings.analytics_oncall_pending_review_critical_threshold,
+        oncall_pending_review_sla_hours=settings.analytics_oncall_pending_review_sla_hours,
     ),
 )
 control_plane_alert_service = ControlPlaneAlertService(
@@ -69,6 +75,12 @@ control_plane_alert_service = ControlPlaneAlertService(
     webhook_url=settings.control_plane_alert_webhook_url,
     escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
 )
+control_plane_backup_service = ControlPlaneBackupService(
+    settings=settings,
+    snapshot_repository=snapshot_repository,
+    audit_repository=audit_repository,
+    job_repository=job_repository,
+)
 job_service = JobService(
     job_repository=job_repository,
     audit_service=audit_service,
@@ -81,6 +93,13 @@ job_service = JobService(
     control_plane_alert_service=control_plane_alert_service,
     control_plane_alert_interval_seconds=settings.control_plane_alert_interval_seconds,
     control_plane_alerts_enabled=settings.control_plane_alerts_enabled,
+)
+metrics_service = ControlPlaneMetricsService(
+    job_repository=job_repository,
+    job_service=job_service,
+    analytics_service=analytics_service,
+    environment_name=settings.environment_name,
+    worker_mode="standalone",
 )
 
 
@@ -169,6 +188,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show operational trends for queue, workers, and lease activity.",
     )
     control_plane_analytics.add_argument("--days", type=int, default=30)
+    control_plane_metrics = subparsers.add_parser(
+        "control-plane-metrics",
+        help="Render Prometheus-style control-plane metrics.",
+    )
+    control_plane_metrics.add_argument("--days", type=int, default=1)
+    subparsers.add_parser(
+        "control-plane-maintenance-mode",
+        help="Show the current control-plane maintenance mode state.",
+    )
+    list_control_plane_maintenance_events = subparsers.add_parser(
+        "list-control-plane-maintenance-events",
+        help="List persisted control-plane maintenance events.",
+    )
+    list_control_plane_maintenance_events.add_argument("--limit", type=int, default=50)
+    enable_control_plane_maintenance_mode = subparsers.add_parser(
+        "enable-control-plane-maintenance-mode",
+        help="Enable control-plane maintenance mode to pause worker job execution.",
+    )
+    enable_control_plane_maintenance_mode.add_argument("--by", required=True)
+    enable_control_plane_maintenance_mode.add_argument("--reason", default=None)
+    disable_control_plane_maintenance_mode = subparsers.add_parser(
+        "disable-control-plane-maintenance-mode",
+        help="Disable control-plane maintenance mode and resume normal API mutations and worker execution.",
+    )
+    disable_control_plane_maintenance_mode.add_argument("--by", required=True)
+    disable_control_plane_maintenance_mode.add_argument("--reason", default=None)
     emit_control_plane_alerts = subparsers.add_parser(
         "emit-control-plane-alerts",
         help="Force emission of current control-plane alerts through configured targets.",
@@ -270,6 +315,15 @@ def build_parser() -> argparse.ArgumentParser:
     review_control_plane_oncall_change_request.add_argument("--reviewer-team", default=None)
     review_control_plane_oncall_change_request.add_argument("--reviewer-role", default=None)
     review_control_plane_oncall_change_request.add_argument("--note", default=None)
+    assign_control_plane_oncall_change_request = subparsers.add_parser(
+        "assign-control-plane-oncall-change-request",
+        help="Assign a pending control-plane on-call change request to an owner.",
+    )
+    assign_control_plane_oncall_change_request.add_argument("request_id")
+    assign_control_plane_oncall_change_request.add_argument("--assigned-to", required=True)
+    assign_control_plane_oncall_change_request.add_argument("--assigned-team", default=None)
+    assign_control_plane_oncall_change_request.add_argument("--by", required=True)
+    assign_control_plane_oncall_change_request.add_argument("--note", default=None)
     list_control_plane_oncall_schedules = subparsers.add_parser(
         "list-control-plane-oncall-schedules",
         help="List control-plane on-call schedules.",
@@ -286,6 +340,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cancel_control_plane_oncall_schedule.add_argument("schedule_id")
     cancel_control_plane_oncall_schedule.add_argument("--by", required=True)
+    subparsers.add_parser(
+        "control-plane-schema",
+        help="Show the current control-plane schema version and applied migrations.",
+    )
+    subparsers.add_parser(
+        "migrate-control-plane-schema",
+        help="Apply idempotent control-plane schema migrations and report the resulting version state.",
+    )
+    export_control_plane_backup = subparsers.add_parser(
+        "export-control-plane-backup",
+        help="Export the full control-plane state into a versioned JSON backup bundle.",
+    )
+    export_control_plane_backup.add_argument("--out", required=True)
+    import_control_plane_backup = subparsers.add_parser(
+        "import-control-plane-backup",
+        help="Restore the full control-plane state from a versioned JSON backup bundle.",
+    )
+    import_control_plane_backup.add_argument("input_path")
+    import_control_plane_backup.add_argument("--replace-existing", action="store_true")
     subparsers.add_parser("prune-history", help="Prune retained worker heartbeat and lease-event history.")
 
     return parser
@@ -496,9 +569,56 @@ def run_prune_history() -> int:
     return 0
 
 
+def run_control_plane_schema() -> int:
+    print(json.dumps(job_repository.schema_status(), indent=2))
+    return 0
+
+
+def run_migrate_control_plane_schema() -> int:
+    print(json.dumps(job_repository.migrate_schema(), indent=2))
+    return 0
+
+
+def run_export_control_plane_backup(*, output_path: str) -> int:
+    summary = control_plane_backup_service.export_bundle(output_path)
+    print(json.dumps(summary.to_dict(), indent=2))
+    return 0
+
+
+def run_import_control_plane_backup(*, input_path: str, replace_existing: bool) -> int:
+    summary = control_plane_backup_service.import_bundle(input_path, replace_existing=replace_existing)
+    print(json.dumps(summary.to_dict(), indent=2))
+    return 0
+
+
 def run_control_plane_analytics(*, days: int) -> int:
     payload = analytics_service.build_control_plane_analytics(days=days).to_dict()
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def run_control_plane_metrics(*, days: int) -> int:
+    print(metrics_service.render_prometheus(days=days), end="")
+    return 0
+
+
+def run_control_plane_maintenance_mode() -> int:
+    print(json.dumps(job_repository.maintenance_mode_status(), indent=2))
+    return 0
+
+
+def run_list_control_plane_maintenance_events(*, limit: int) -> int:
+    print(json.dumps([record.to_dict() for record in job_service.list_control_plane_maintenance_events(limit=limit)], indent=2))
+    return 0
+
+
+def run_enable_control_plane_maintenance_mode(*, changed_by: str, reason: str | None) -> int:
+    print(json.dumps(job_service.enable_maintenance_mode(changed_by=changed_by, reason=reason), indent=2))
+    return 0
+
+
+def run_disable_control_plane_maintenance_mode(*, changed_by: str, reason: str | None) -> int:
+    print(json.dumps(job_service.disable_maintenance_mode(changed_by=changed_by, reason=reason), indent=2))
     return 0
 
 
@@ -696,6 +816,25 @@ def run_review_control_plane_oncall_change_request(
     return 0
 
 
+def run_assign_control_plane_oncall_change_request(
+    *,
+    request_id: str,
+    assigned_to: str,
+    assigned_to_team: str | None,
+    assigned_by: str,
+    assignment_note: str | None,
+) -> int:
+    record = control_plane_alert_service.assign_oncall_change_request(
+        request_id=request_id,
+        assigned_to=assigned_to,
+        assigned_to_team=assigned_to_team,
+        assigned_by=assigned_by,
+        assignment_note=assignment_note,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
 def run_list_control_plane_oncall_schedules(*, active_only: bool) -> int:
     print(
         json.dumps(
@@ -867,6 +1006,16 @@ def main() -> int:
         return 0
     if args.command == "control-plane-analytics":
         return run_control_plane_analytics(days=args.days)
+    if args.command == "control-plane-metrics":
+        return run_control_plane_metrics(days=args.days)
+    if args.command == "control-plane-maintenance-mode":
+        return run_control_plane_maintenance_mode()
+    if args.command == "list-control-plane-maintenance-events":
+        return run_list_control_plane_maintenance_events(limit=args.limit)
+    if args.command == "enable-control-plane-maintenance-mode":
+        return run_enable_control_plane_maintenance_mode(changed_by=args.by, reason=args.reason)
+    if args.command == "disable-control-plane-maintenance-mode":
+        return run_disable_control_plane_maintenance_mode(changed_by=args.by, reason=args.reason)
     if args.command == "emit-control-plane-alerts":
         return run_emit_control_plane_alerts(force=args.force)
     if args.command == "process-control-plane-alert-followups":
@@ -947,6 +1096,14 @@ def main() -> int:
             reviewed_by_role=args.reviewer_role,
             review_note=args.note,
         )
+    if args.command == "assign-control-plane-oncall-change-request":
+        return run_assign_control_plane_oncall_change_request(
+            request_id=args.request_id,
+            assigned_to=args.assigned_to,
+            assigned_to_team=args.assigned_team,
+            assigned_by=args.by,
+            assignment_note=args.note,
+        )
     if args.command == "list-control-plane-oncall-schedules":
         return run_list_control_plane_oncall_schedules(active_only=args.active_only)
     if args.command == "resolve-control-plane-oncall-route":
@@ -955,6 +1112,17 @@ def main() -> int:
         return run_cancel_control_plane_oncall_schedule(
             schedule_id=args.schedule_id,
             cancelled_by=args.by,
+        )
+    if args.command == "control-plane-schema":
+        return run_control_plane_schema()
+    if args.command == "migrate-control-plane-schema":
+        return run_migrate_control_plane_schema()
+    if args.command == "export-control-plane-backup":
+        return run_export_control_plane_backup(output_path=args.out)
+    if args.command == "import-control-plane-backup":
+        return run_import_control_plane_backup(
+            input_path=args.input_path,
+            replace_existing=args.replace_existing,
         )
     if args.command == "prune-history":
         return run_prune_history()

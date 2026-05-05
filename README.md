@@ -10,6 +10,7 @@ Living Systems Auditor is a Python-first scaffold for an intent-aware runtime au
 - expose the flow through a CLI and FastAPI surface
 - persist snapshots and audit runs so the system can be inspected over time
 - persist job execution state in a SQLite-backed control plane
+- support first-class database URL configuration and hardened SQLite runtime settings for split API/worker deployment
 
 ## What works today
 
@@ -58,6 +59,8 @@ source .venv/bin/activate
 pip install -e .
 
 export LSA_API_KEY=change-me-in-production
+export LSA_DATABASE_URL=sqlite:///$PWD/data/control_plane.db
+export LSA_SQLITE_BUSY_TIMEOUT_MS=5000
 # Optional for single-process dev mode only:
 export LSA_RUN_EMBEDDED_WORKER=1
 
@@ -75,6 +78,7 @@ lsa prune-history
 lsa list-worker-heartbeat-rollups <worker_id>
 lsa list-job-lease-event-rollups <job_id>
 lsa control-plane-analytics --days 30
+lsa control-plane-metrics --days 1
 lsa emit-control-plane-alerts --force
 lsa process-control-plane-alert-followups --force
 lsa list-control-plane-alerts --limit 50
@@ -88,6 +92,13 @@ lsa create-control-plane-oncall-schedule --by operator --creator-team platform -
 lsa list-control-plane-oncall-schedules --active-only
 lsa resolve-control-plane-oncall-route --at 2026-12-25T12:00:00+00:00
 lsa cancel-control-plane-oncall-schedule <schedule_id> --by operator
+lsa control-plane-schema
+lsa migrate-control-plane-schema
+lsa control-plane-maintenance-mode
+lsa enable-control-plane-maintenance-mode --by operator --reason "backup window"
+lsa disable-control-plane-maintenance-mode --by operator --reason "done"
+lsa export-control-plane-backup --out data/backups/control-plane.json
+lsa import-control-plane-backup data/backups/control-plane.json --replace-existing
 ```
 
 Example enriched trace line:
@@ -141,6 +152,7 @@ GET /workers/{worker_id}/heartbeat-rollups
 GET /jobs/{job_id}/lease-events
 GET /jobs/{job_id}/lease-event-rollups
 GET /analytics/control-plane
+GET /metrics
 GET /control-plane-alerts
 POST /control-plane-alerts/{alert_id}/acknowledge
 GET /control-plane-alert-silences
@@ -151,6 +163,13 @@ GET /control-plane-oncall-schedules/resolve
 POST /control-plane-oncall-schedules
 POST /control-plane-oncall-schedules/{schedule_id}/cancel
 POST /maintenance/prune-history
+GET /maintenance/mode
+POST /maintenance/mode/enable
+POST /maintenance/mode/disable
+GET /maintenance/control-plane-schema
+POST /maintenance/control-plane-schema/migrate
+POST /maintenance/export-control-plane-backup
+POST /maintenance/import-control-plane-backup
 POST /maintenance/emit-control-plane-alerts
 POST /maintenance/process-control-plane-alert-followups
 ```
@@ -160,9 +179,27 @@ They also return `trace_context_map_path` when collection generated or staged a 
 
 When `LSA_API_KEY` is set, every endpoint except `/health` requires either `X-API-Key: <token>` or `Authorization: Bearer <token>`.
 
+The control plane now treats the database as a first-class runtime contract instead of assuming one implicit local path. `LSA_DATABASE_URL` currently supports SQLite URLs, and `LSA_SQLITE_BUSY_TIMEOUT_MS` hardens lock wait behavior for split API/worker deployments sharing one SQLite file. The `/health` endpoint reports the resolved database backend, URL, path, readiness, writability, and schema version state in addition to worker state.
+
 The `/health` endpoint now reports whether auth is enabled, whether the local control-plane database is ready, whether the API is running in `embedded` or `external` worker mode, and how many workers are currently heartbeating. Long-running or collector-backed audits can also be submitted asynchronously through `/jobs/*`, which persist `queued`, `running`, `completed`, and `failed` states in `data/control_plane.db` along with their serialized result payloads.
 
+For continuous scraping, the control plane now also exposes Prometheus-style metrics through `GET /metrics` and `lsa control-plane-metrics`. That surface includes queue depth by status, worker activity, lease churn, on-call backlog, schema drift, evaluation state, and persisted alert counts. If `LSA_API_KEY` is set, the metrics endpoint is protected by the same API-key requirement as the rest of the service endpoints.
+
 Production shape now assumes a split deployment by default: the API accepts and persists jobs, while a separate `lsa worker` process drains the queue. If you explicitly set `LSA_RUN_EMBEDDED_WORKER=1`, the API will also start an embedded worker for single-process development. In both modes, startup recovery requeues stale `running` jobs before processing resumes. `/health` reports `worker_running`, `active_workers`, `queued_jobs`, and `running_jobs`, while job records now include `claimed_by_worker_id` and `lease_expires_at` so operators can see which worker owns a running lease. Workers also renew those leases while a job is still running, and a healthy worker can reclaim an expired lease from a stale owner without waiting for a process restart. Worker records are queryable through `/workers/*`.
+
+There is now a matching container deployment path under [docker/compose.control.yml](/Users/gani/Desktop/Intent-drive/living-systems-auditor/docker/compose.control.yml) and [docker/Dockerfile.control](/Users/gani/Desktop/Intent-drive/living-systems-auditor/docker/Dockerfile.control). The compose stack runs the API and `lsa worker` as separate services against a shared `lsa_data` volume, with environment defaults shown in [docker/control.env.example](/Users/gani/Desktop/Intent-drive/living-systems-auditor/docker/control.env.example).
+
+Example:
+
+```bash
+docker compose --env-file docker/control.env.example -f docker/compose.control.yml up --build
+```
+
+The control plane now also supports full-fidelity backup and restore. `lsa export-control-plane-backup` and `POST /maintenance/export-control-plane-backup` write a versioned JSON bundle that includes both database records and the critical snapshot/report artifacts those records depend on. Restore is intentionally strict: import only succeeds into an empty control plane unless you explicitly pass `--replace-existing` or `replace_existing=true`, and replace mode clears restorable snapshot/report artifacts before writing the recovered bundle.
+
+Database lifecycle is now visible too. `lsa control-plane-schema` and `GET /maintenance/control-plane-schema` report the current schema version, the expected schema version, readiness, pending migration count, and the applied migration records. `lsa migrate-control-plane-schema` and `POST /maintenance/control-plane-schema/migrate` then apply the idempotent schema repair path for this build and return the resulting version state. That gives deployments a stable way to distinguish “database file exists” from “database is on the schema this build expects,” and a direct repair command when metadata drifts or an older local DB needs to be reconciled.
+
+There is now also a first-class control-plane maintenance switch. `lsa control-plane-maintenance-mode` and `GET /maintenance/mode` show the current state, while the enable/disable commands and endpoints let operators pause mutating API flows and worker job execution during backups, schema work, or environment cutovers. Health and metrics surfaces both expose whether maintenance mode is active.
 
 The control plane now also keeps append-only history for worker heartbeats and job lease transitions. That means you can inspect not just the latest worker row or job row, but the timeline of `lease_claimed`, `lease_renewed`, `lease_expired_requeued`, `job_completed`, and `job_failed` events, plus the corresponding worker heartbeat trail through `/workers/{worker_id}/heartbeats` and `/jobs/{job_id}/lease-events`.
 
@@ -185,6 +222,7 @@ Current built-in findings cover:
 - elevated job failure rate once enough finished jobs exist in the window
 - queued work with zero active workers, which is treated as critical
 - ambiguous on-call route overlaps detected in upcoming schedule coverage
+- stale governed on-call change reviews that exceed the configured SLA
 
 Those findings can now flow into a durable control-plane alert pipeline. The worker evaluates the control plane on a schedule, deduplicates repeated alert signatures inside a configurable cooldown window, persists emitted alerts in SQLite, writes them to a JSONL sink, and can optionally POST the same payload to a webhook.
 
@@ -202,6 +240,9 @@ LSA_ANALYTICS_JOB_FAILURE_RATE_CRITICAL_THRESHOLD
 LSA_ANALYTICS_JOB_FAILURE_RATE_MIN_SAMPLES
 LSA_ANALYTICS_ONCALL_CONFLICT_WARNING_THRESHOLD
 LSA_ANALYTICS_ONCALL_CONFLICT_CRITICAL_THRESHOLD
+LSA_ANALYTICS_ONCALL_PENDING_REVIEW_WARNING_THRESHOLD
+LSA_ANALYTICS_ONCALL_PENDING_REVIEW_CRITICAL_THRESHOLD
+LSA_ANALYTICS_ONCALL_PENDING_REVIEW_SLA_HOURS
 ```
 
 Alert emission is controlled through:
@@ -238,6 +279,8 @@ When schedules overlap, the router prefers the highest priority active match, th
 Operators can now also preview the effective route before an incident fires. `lsa resolve-control-plane-oncall-route` and `GET /control-plane-oncall-schedules/resolve?at=...` return the selected route plus the ranked active candidates and the reasons each candidate was ordered where it was. The timestamp must use ISO 8601 format and include a timezone offset when provided explicitly.
 
 The control-plane analytics layer now also scans upcoming schedule coverage for ambiguous overlaps. If multiple active routes would tie on routing precedence and only fall back to record creation order, analytics emits an `oncall_route_conflicts` finding with sample conflicting schedule groups. That means bad overlap policy can alert before it misroutes a real incident.
+
+That same `oncall` analytics block now tracks governed review backlog for the active environment. Pending change requests older than the configured SLA contribute `pending_review_count`, `stale_pending_review_count`, `oldest_pending_review_age_hours`, and sample stale requests, and can emit an `oncall_pending_reviews_stale` finding when approvals are waiting too long.
 
 Those same ambiguous overlaps are now governed at write time. If a new schedule would introduce that kind of ambiguous overlap, creation is rejected unless the request includes `change_reason`, `approved_by`, and `approved_by_role`. This keeps risky routing changes auditable instead of letting them slip in as silent config drift.
 
@@ -295,7 +338,7 @@ If `LSA_ONCALL_POLICY_PATH` points at a JSON policy file, the service now resolv
 
 That policy layer now lets governance vary by environment, owning team, or rotation instead of relying on one global approval rule for every schedule change.
 
-Governed changes can now move through an explicit review workflow instead of relying only on inline approval fields. `lsa submit-control-plane-oncall-change-request` and `POST /control-plane-oncall-change-requests` persist a durable change request with `pending_review`, `rejected`, or `applied` status. Safe requests auto-apply immediately with an audit trail, while ambiguous overlap requests stay pending until `lsa review-control-plane-oncall-change-request` or `POST /control-plane-oncall-change-requests/{request_id}/review` approves or rejects them. Approved requests create the schedule and preserve reviewer identity, reviewer team, reviewer role, review note, and the applied schedule ID on the request record.
+Governed changes can now move through an explicit review workflow instead of relying only on inline approval fields. `lsa submit-control-plane-oncall-change-request` and `POST /control-plane-oncall-change-requests` persist a durable change request with `pending_review`, `rejected`, or `applied` status. Safe requests auto-apply immediately with an audit trail, while ambiguous overlap requests stay pending until `lsa review-control-plane-oncall-change-request` or `POST /control-plane-oncall-change-requests/{request_id}/review` approves or rejects them. Pending requests can now also be explicitly owned through `lsa assign-control-plane-oncall-change-request` or `POST /control-plane-oncall-change-requests/{request_id}/assign`, which records assignee, assignee team, assigner, assignment time, and an optional ownership note. Approved requests create the schedule and preserve reviewer identity, reviewer team, reviewer role, review note, and the applied schedule ID on the request record.
 
 Alert records can now also be acknowledged in place. Acknowledgement does not suppress future alerts by itself; it marks that a human has taken ownership of a specific emission and records who acknowledged it plus an optional note.
 

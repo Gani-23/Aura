@@ -3,6 +3,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from lsa.core.intent_graph import IntentGraph
 from lsa.ingest.graph_builder import GraphBuilder
@@ -21,6 +22,25 @@ from lsa.storage.models import AuditRecord
 
 
 class StorageTests(unittest.TestCase):
+    def test_resolve_workspace_settings_supports_database_url_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database_path = (Path(tmpdir) / "state" / "lsa.db").resolve()
+            database_url = f"sqlite:///{database_path.as_posix()}"
+            with patch.dict(
+                "os.environ",
+                {
+                    "LSA_DATABASE_URL": database_url,
+                    "LSA_SQLITE_BUSY_TIMEOUT_MS": "9000",
+                },
+                clear=False,
+            ):
+                settings = resolve_workspace_settings(tmpdir)
+
+            self.assertEqual(settings.database_backend, "sqlite")
+            self.assertEqual(settings.database_url, database_url)
+            self.assertEqual(settings.database_path, database_path)
+            self.assertEqual(settings.sqlite_busy_timeout_ms, 9000)
+
     def test_snapshot_repository_persists_and_lists_records(self) -> None:
         root = Path("tests/fixtures/sample_service").resolve()
         snapshot = GraphBuilder().build(root)
@@ -43,6 +63,53 @@ class StorageTests(unittest.TestCase):
             assert row is not None
             self.assertEqual(row[0], "snap-test")
             self.assertEqual(row[1], str(root))
+
+            with repo.database._connect() as connection:
+                foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+                journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+                busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+            self.assertEqual(foreign_keys, 1)
+            self.assertEqual(journal_mode.lower(), "wal")
+            self.assertEqual(busy_timeout, settings.sqlite_busy_timeout_ms)
+            schema_status = repo.database.status()
+            self.assertEqual(schema_status["schema_version"], 1)
+            self.assertEqual(schema_status["expected_schema_version"], 1)
+            self.assertTrue(schema_status["schema_ready"])
+            detailed_schema_status = repo.database.schema_status()
+            self.assertEqual(detailed_schema_status["schema_version"], 1)
+            self.assertEqual(len(detailed_schema_status["migrations"]), 1)
+            with repo.database._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE control_plane_schema_metadata
+                    SET metadata_value = '0'
+                    WHERE metadata_key = 'schema_version'
+                    """
+                )
+                connection.execute(
+                    """
+                    DELETE FROM control_plane_schema_migrations
+                    WHERE migration_id = ?
+                    """,
+                    ("2026-05-05-control-plane-schema-v1",),
+                )
+            degraded_status = repo.database.schema_status()
+            self.assertFalse(degraded_status["schema_ready"])
+            self.assertEqual(degraded_status["pending_migration_count"], 1)
+            migrated_status = repo.database.migrate_schema()
+            self.assertTrue(migrated_status["schema_ready"])
+            self.assertEqual(migrated_status["schema_version"], 1)
+            self.assertEqual(migrated_status["pending_migration_count"], 0)
+            maintenance_status = repo.database.maintenance_mode_status()
+            self.assertFalse(maintenance_status["active"])
+            enabled_maintenance = repo.database.set_maintenance_mode(
+                active=True,
+                changed_by="operator-a",
+                reason="backup window",
+            )
+            self.assertTrue(enabled_maintenance["active"])
+            self.assertEqual(enabled_maintenance["changed_by"], "operator-a")
+            self.assertEqual(enabled_maintenance["reason"], "backup window")
 
     def test_audit_repository_persists_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -366,6 +433,16 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(stored[0].status, "pending_review")
             self.assertEqual(stored[0].environment_name, "prod")
             self.assertEqual(stored[0].review_reasons, ["ambiguous_overlap"])
+            assigned = repo.assign_control_plane_oncall_change_request(
+                request_id="request-test",
+                assigned_to="reviewer-a",
+                assigned_to_team="platform",
+                assigned_at="2026-05-04T00:02:00+00:00",
+                assigned_by="lead-a",
+                assignment_note="Taking first review pass.",
+            )
+            self.assertEqual(assigned.assigned_to, "reviewer-a")
+            self.assertEqual(assigned.assignment_note, "Taking first review pass.")
             decided = repo.decide_control_plane_oncall_change_request(
                 request_id="request-test",
                 status="applied",

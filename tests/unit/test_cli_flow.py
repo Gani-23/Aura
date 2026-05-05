@@ -9,6 +9,7 @@ import unittest
 from lsa.cli import main as cli_main
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
+from lsa.services.metrics_service import ControlPlaneMetricsService
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.models import JobLeaseEventRecord, JobRecord, WorkerHeartbeatRecord, WorkerRecord
 
@@ -56,6 +57,19 @@ class CliFlowTests(unittest.TestCase):
                 dedup_window_seconds=cli_main.settings.control_plane_alert_dedup_window_seconds,
                 sink_path=str(cli_main.settings.control_plane_alert_sink_path),
                 webhook_url=cli_main.settings.control_plane_alert_webhook_url,
+            )
+            cli_main.control_plane_backup_service = cli_main.ControlPlaneBackupService(
+                settings=cli_main.settings,
+                snapshot_repository=cli_main.snapshot_repository,
+                audit_repository=cli_main.audit_repository,
+                job_repository=cli_main.job_repository,
+            )
+            cli_main.metrics_service = ControlPlaneMetricsService(
+                job_repository=cli_main.job_repository,
+                job_service=cli_main.job_service,
+                analytics_service=cli_main.analytics_service,
+                environment_name=cli_main.settings.environment_name,
+                worker_mode="standalone",
             )
             snapshot_path = Path(tmpdir) / "snapshot.json"
             report_dir = Path(tmpdir) / "reports"
@@ -193,6 +207,174 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(worker_records[0].status, "stopped")
             self.assertGreaterEqual(len(cli_main.job_repository.list_worker_heartbeats(worker_records[0].worker_id)), 1)
             self.assertGreaterEqual(len(cli_main.job_repository.list_job_lease_events("job-worker")), 1)
+
+    def test_export_and_import_control_plane_backup(self) -> None:
+        fixture_root = Path("tests/fixtures/sample_service").resolve()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.snapshot_repository = cli_main.SnapshotRepository(cli_main.settings, graph=cli_main.graph)
+            cli_main.audit_repository = cli_main.AuditRepository(cli_main.settings)
+            cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
+            cli_main.ingest_service = cli_main.IngestService(
+                graph=cli_main.graph,
+                snapshot_repository=cli_main.snapshot_repository,
+            )
+            cli_main.control_plane_backup_service = cli_main.ControlPlaneBackupService(
+                settings=cli_main.settings,
+                snapshot_repository=cli_main.snapshot_repository,
+                audit_repository=cli_main.audit_repository,
+                job_repository=cli_main.job_repository,
+            )
+
+            cli_main.ingest_service.ingest(str(fixture_root), persist=True, snapshot_id="snap-backup-cli")
+            backup_path = Path(tmpdir) / "control-plane-backup.json"
+
+            export_sink = StringIO()
+            with redirect_stdout(export_sink):
+                self.assertEqual(
+                    cli_main.run_export_control_plane_backup(output_path=str(backup_path)),
+                    0,
+                )
+            self.assertTrue(backup_path.exists())
+            export_payload = json.loads(export_sink.getvalue())
+            self.assertEqual(export_payload["counts"]["snapshots"], 1)
+            self.assertEqual(export_payload["artifact_counts"]["snapshots"], 1)
+
+            cli_main.job_repository.reset_control_plane()
+            import_sink = StringIO()
+            with redirect_stdout(import_sink):
+                self.assertEqual(
+                    cli_main.run_import_control_plane_backup(
+                        input_path=str(backup_path),
+                        replace_existing=False,
+                    ),
+                    0,
+                )
+            import_payload = json.loads(import_sink.getvalue())
+            self.assertFalse(import_payload["replace_existing"])
+            self.assertEqual(len(cli_main.snapshot_repository.list()), 1)
+
+    def test_control_plane_schema_reports_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
+
+            sink = StringIO()
+            with redirect_stdout(sink):
+                self.assertEqual(cli_main.run_control_plane_schema(), 0)
+            payload = json.loads(sink.getvalue())
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["expected_schema_version"], 1)
+            self.assertTrue(payload["schema_ready"])
+            self.assertEqual(payload["pending_migration_count"], 0)
+            self.assertEqual(len(payload["migrations"]), 1)
+
+            with cli_main.job_repository.database._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE control_plane_schema_metadata
+                    SET metadata_value = '0'
+                    WHERE metadata_key = 'schema_version'
+                    """
+                )
+                connection.execute(
+                    """
+                    DELETE FROM control_plane_schema_migrations
+                    WHERE migration_id = ?
+                    """,
+                    ("2026-05-05-control-plane-schema-v1",),
+                )
+
+            migrate_sink = StringIO()
+            with redirect_stdout(migrate_sink):
+                self.assertEqual(cli_main.run_migrate_control_plane_schema(), 0)
+            migrated_payload = json.loads(migrate_sink.getvalue())
+            self.assertEqual(migrated_payload["schema_version"], 1)
+            self.assertTrue(migrated_payload["schema_ready"])
+            self.assertEqual(migrated_payload["pending_migration_count"], 0)
+            self.assertEqual(len(migrated_payload["migrations"]), 1)
+
+    def test_control_plane_metrics_renders_prometheus_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
+            cli_main.analytics_service = AnalyticsService(
+                job_repository=cli_main.job_repository,
+                heartbeat_timeout_seconds=cli_main.settings.worker_heartbeat_timeout_seconds,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    queue_warning_threshold=cli_main.settings.analytics_queue_warning_threshold,
+                    queue_critical_threshold=cli_main.settings.analytics_queue_critical_threshold,
+                    stale_worker_warning_threshold=cli_main.settings.analytics_stale_worker_warning_threshold,
+                    stale_worker_critical_threshold=cli_main.settings.analytics_stale_worker_critical_threshold,
+                    expired_lease_warning_threshold=cli_main.settings.analytics_expired_lease_warning_threshold,
+                    expired_lease_critical_threshold=cli_main.settings.analytics_expired_lease_critical_threshold,
+                    job_failure_rate_warning_threshold=cli_main.settings.analytics_job_failure_rate_warning_threshold,
+                    job_failure_rate_critical_threshold=cli_main.settings.analytics_job_failure_rate_critical_threshold,
+                    job_failure_rate_min_samples=cli_main.settings.analytics_job_failure_rate_min_samples,
+                ),
+            )
+            cli_main.job_service = cli_main.JobService(
+                job_repository=cli_main.job_repository,
+                audit_service=cli_main.audit_service,
+                trace_collection_service=cli_main.trace_collection_service,
+                worker_mode="standalone",
+                heartbeat_timeout_seconds=cli_main.settings.worker_heartbeat_timeout_seconds,
+            )
+            cli_main.metrics_service = ControlPlaneMetricsService(
+                job_repository=cli_main.job_repository,
+                job_service=cli_main.job_service,
+                analytics_service=cli_main.analytics_service,
+                environment_name=cli_main.settings.environment_name,
+                worker_mode="standalone",
+            )
+
+            sink = StringIO()
+            with redirect_stdout(sink):
+                self.assertEqual(cli_main.run_control_plane_metrics(days=1), 0)
+            payload = sink.getvalue()
+            self.assertIn('lsa_control_plane_info{database_backend="sqlite",environment="default",worker_mode="standalone"} 1', payload)
+            self.assertIn("lsa_control_plane_database_schema_ready 1", payload)
+            self.assertIn("lsa_control_plane_maintenance_mode_active 0", payload)
+
+    def test_control_plane_maintenance_mode_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
+            cli_main.job_service = cli_main.JobService(
+                job_repository=cli_main.job_repository,
+                audit_service=cli_main.audit_service,
+                trace_collection_service=cli_main.trace_collection_service,
+                worker_mode="standalone",
+                heartbeat_timeout_seconds=cli_main.settings.worker_heartbeat_timeout_seconds,
+            )
+
+            status_sink = StringIO()
+            with redirect_stdout(status_sink):
+                self.assertEqual(cli_main.run_control_plane_maintenance_mode(), 0)
+            self.assertFalse(json.loads(status_sink.getvalue())["active"])
+
+            enable_sink = StringIO()
+            with redirect_stdout(enable_sink):
+                self.assertEqual(
+                    cli_main.run_enable_control_plane_maintenance_mode(
+                        changed_by="operator-a",
+                        reason="backup",
+                    ),
+                    0,
+                )
+            self.assertTrue(json.loads(enable_sink.getvalue())["active"])
+
+            disable_sink = StringIO()
+            with redirect_stdout(disable_sink):
+                self.assertEqual(
+                    cli_main.run_disable_control_plane_maintenance_mode(
+                        changed_by="operator-a",
+                        reason="done",
+                    ),
+                    0,
+                )
+            self.assertFalse(json.loads(disable_sink.getvalue())["active"])
 
     def test_prune_history_removes_old_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -576,6 +758,21 @@ class CliFlowTests(unittest.TestCase):
                 )
             listed_requests = json.loads(change_requests_sink.getvalue())
             self.assertGreaterEqual(len(listed_requests), 1)
+
+            assigned_request_sink = StringIO()
+            with redirect_stdout(assigned_request_sink):
+                self.assertEqual(
+                    cli_main.run_assign_control_plane_oncall_change_request(
+                        request_id=change_request["request_id"],
+                        assigned_to="reviewer-cli",
+                        assigned_to_team="platform",
+                        assigned_by="lead-cli",
+                        assignment_note="Own the holiday review.",
+                    ),
+                    0,
+                )
+            assigned_request = json.loads(assigned_request_sink.getvalue())
+            self.assertEqual(assigned_request["assigned_to"], "reviewer-cli")
 
             reviewed_request_sink = StringIO()
             with redirect_stdout(reviewed_request_sink):

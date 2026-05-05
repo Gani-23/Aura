@@ -53,6 +53,13 @@
 - Add a reusable team- and rotation-aware governance policy object so ownership boundaries and approver mapping can vary by schedule domain.
 - Persist governed on-call change requests with explicit pending-review, rejected, and applied states so risky routing edits are reviewed before they take effect.
 - Add environment-aware governance bundles so `prod`, `staging`, and other deployment tiers can enforce different approval and ownership rules.
+- Detect stale governed on-call review backlog in control-plane analytics so approval bottlenecks page operators before risky changes sit unowned.
+- Promote the control-plane database into a first-class deploy contract with explicit `LSA_DATABASE_URL` handling, hardened SQLite lock behavior, and split API/worker container assets.
+- Add versioned export and restore bundles for the control plane so jobs, alerts, on-call governance state, snapshots, and report artifacts can be migrated or recovered together.
+- Add explicit schema version tracking and migration visibility so deployments can gate on database readiness, not only file existence.
+- Add an idempotent schema migration/repair command so deployment tooling can reconcile older control-plane databases to the expected version automatically.
+- Expose Prometheus-style control-plane metrics so queue, worker, schema, and alert health can be scraped continuously instead of only inspected through health or analytics endpoints.
+- Add a first-class maintenance mode so operators can pause mutating API flows and worker execution safely during backup, schema, or cutover work.
 - Add drift thresholds for new hosts, latency shifts, and novel exception classes.
 - Capture repeatable demo traces for the first live proof point.
 

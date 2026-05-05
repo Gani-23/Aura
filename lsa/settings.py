@@ -4,12 +4,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from lsa.storage.database import resolve_database_config
+
 
 @dataclass(slots=True)
 class WorkspaceSettings:
     root_dir: Path
     data_dir: Path
     database_path: Path
+    database_url: str
+    database_backend: str
+    sqlite_busy_timeout_ms: int
     environment_name: str
     api_key: str | None
     run_embedded_worker: bool
@@ -28,6 +33,9 @@ class WorkspaceSettings:
     analytics_job_failure_rate_min_samples: int
     analytics_oncall_conflict_warning_threshold: int
     analytics_oncall_conflict_critical_threshold: int
+    analytics_oncall_pending_review_warning_threshold: int
+    analytics_oncall_pending_review_critical_threshold: int
+    analytics_oncall_pending_review_sla_hours: float
     oncall_policy_path: Path
     oncall_approval_required_roles: tuple[str, ...]
     oncall_allow_self_approval: bool
@@ -50,10 +58,18 @@ class WorkspaceSettings:
 def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceSettings:
     root = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
     data_dir = root / "data"
+    database_config = resolve_database_config(
+        root_dir=root,
+        default_path=data_dir / "control_plane.db",
+        raw_url=os.environ.get("LSA_DATABASE_URL"),
+    )
     return WorkspaceSettings(
         root_dir=root,
         data_dir=data_dir,
-        database_path=data_dir / "control_plane.db",
+        database_path=database_config.sqlite_path,
+        database_url=database_config.url,
+        database_backend=database_config.backend,
+        sqlite_busy_timeout_ms=_env_int("LSA_SQLITE_BUSY_TIMEOUT_MS", default=5000),
         environment_name=os.environ.get("LSA_ENVIRONMENT_NAME", "default").strip().lower() or "default",
         api_key=os.environ.get("LSA_API_KEY"),
         run_embedded_worker=_env_flag("LSA_RUN_EMBEDDED_WORKER", default=False),
@@ -83,6 +99,18 @@ def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceS
         analytics_oncall_conflict_critical_threshold=_env_int(
             "LSA_ANALYTICS_ONCALL_CONFLICT_CRITICAL_THRESHOLD",
             default=3,
+        ),
+        analytics_oncall_pending_review_warning_threshold=_env_int(
+            "LSA_ANALYTICS_ONCALL_PENDING_REVIEW_WARNING_THRESHOLD",
+            default=1,
+        ),
+        analytics_oncall_pending_review_critical_threshold=_env_int(
+            "LSA_ANALYTICS_ONCALL_PENDING_REVIEW_CRITICAL_THRESHOLD",
+            default=3,
+        ),
+        analytics_oncall_pending_review_sla_hours=_env_float(
+            "LSA_ANALYTICS_ONCALL_PENDING_REVIEW_SLA_HOURS",
+            default=24.0,
         ),
         oncall_policy_path=Path(
             os.environ.get("LSA_ONCALL_POLICY_PATH", str(data_dir / "oncall_policy.json"))

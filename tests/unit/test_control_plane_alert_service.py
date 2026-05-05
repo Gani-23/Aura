@@ -8,7 +8,13 @@ from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertTh
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import JobRepository
-from lsa.storage.models import ControlPlaneAlertRecord, JobLeaseEventRecord, JobRecord, WorkerRecord
+from lsa.storage.models import (
+    ControlPlaneAlertRecord,
+    ControlPlaneOnCallChangeRequestRecord,
+    JobLeaseEventRecord,
+    JobRecord,
+    WorkerRecord,
+)
 
 
 class ControlPlaneAlertServiceTests(unittest.TestCase):
@@ -332,6 +338,53 @@ class ControlPlaneAlertServiceTests(unittest.TestCase):
             self.assertEqual(emitted[0].status, "degraded")
             self.assertIn("oncall_route_conflicts", emitted[0].finding_codes)
 
+    def test_emit_alert_flags_stale_pending_oncall_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            analytics_service = AnalyticsService(
+                job_repository=repo,
+                default_environment_name="prod",
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    oncall_pending_review_warning_threshold=1,
+                    oncall_pending_review_critical_threshold=2,
+                    oncall_pending_review_sla_hours=1.0,
+                ),
+            )
+            service = ControlPlaneAlertService(
+                job_repository=repo,
+                analytics_service=analytics_service,
+                default_environment_name="prod",
+                window_days=7,
+                sink_path=str(Path(tmpdir) / "oncall-reviews.jsonl"),
+            )
+            repo.append_control_plane_oncall_change_request(
+                ControlPlaneOnCallChangeRequestRecord(
+                    request_id="request-prod-stale",
+                    created_at=(datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+                    created_by="operator-a",
+                    environment_name="prod",
+                    team_name="platform-a",
+                    timezone_name="UTC",
+                    status="pending_review",
+                    change_reason="Prod overlap waiting on approval.",
+                    review_required=True,
+                    review_reasons=["ambiguous_overlap"],
+                    weekdays=[0, 1, 2, 3, 4, 5, 6],
+                    start_time="00:00",
+                    end_time="23:59",
+                    priority=100,
+                    rotation_name="primary-a",
+                )
+            )
+
+            emitted = service.emit_alerts(force=True)
+
+            self.assertEqual(len(emitted), 1)
+            self.assertEqual(emitted[0].status, "degraded")
+            self.assertIn("oncall_pending_reviews_stale", emitted[0].finding_codes)
+
     def test_ambiguous_oncall_overlap_requires_approval_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = resolve_workspace_settings(tmpdir)
@@ -642,6 +695,15 @@ class ControlPlaneAlertServiceTests(unittest.TestCase):
             )
             self.assertEqual(request.status, "pending_review")
             self.assertTrue(request.review_required)
+            assigned = service.assign_oncall_change_request(
+                request_id=request.request_id,
+                assigned_to="reviewer-a",
+                assigned_to_team="platform",
+                assigned_by="lead-a",
+                assignment_note="Please handle migration review.",
+            )
+            self.assertEqual(assigned.assigned_to, "reviewer-a")
+            self.assertEqual(assigned.assignment_note, "Please handle migration review.")
 
             rejected = service.review_oncall_change_request(
                 request_id=request.request_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,9 +10,11 @@ from uuid import uuid4
 from lsa.core.intent_graph import IntentGraph
 from lsa.core.models import IntentGraphSnapshot
 from lsa.settings import WorkspaceSettings
+from lsa.storage.database import resolve_database_config
 from lsa.storage.models import (
     AuditRecord,
     ControlPlaneAlertRecord,
+    ControlPlaneMaintenanceEventRecord,
     ControlPlaneOnCallChangeRequestRecord,
     ControlPlaneOnCallScheduleRecord,
     ControlPlaneAlertSilenceRecord,
@@ -33,23 +36,141 @@ def _json_dumps(value: object) -> str:
     return json.dumps(value, sort_keys=True)
 
 
+CONTROL_PLANE_SCHEMA_VERSION = 1
+CONTROL_PLANE_SCHEMA_MIGRATION_ID = "2026-05-05-control-plane-schema-v1"
+CONTROL_PLANE_SCHEMA_MIGRATION_DESCRIPTION = "Bootstrap schema version tracking for the control-plane database."
+
+
 class _ControlPlaneDatabase:
     def __init__(self, settings: WorkspaceSettings) -> None:
         self.settings = settings
+        self.config = resolve_database_config(
+            root_dir=self.settings.root_dir,
+            default_path=self.settings.database_path,
+            raw_url=self.settings.database_url,
+        )
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
-        self.settings.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self._import_legacy_records()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.settings.database_path)
+        connection = sqlite3.connect(
+            self.config.sqlite_target,
+            timeout=self.settings.sqlite_busy_timeout_ms / 1000,
+            uri=self.config.sqlite_uri,
+        )
         connection.row_factory = sqlite3.Row
+        self._configure_connection(connection)
         return connection
+
+    def _configure_connection(self, connection: sqlite3.Connection) -> None:
+        connection.execute(f"PRAGMA busy_timeout = {int(self.settings.sqlite_busy_timeout_ms)}")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute("PRAGMA temp_store = MEMORY")
+
+    def status(self) -> dict[str, object]:
+        ready = False
+        writable = False
+        schema_version = 0
+        expected_schema_version = CONTROL_PLANE_SCHEMA_VERSION
+        schema_ready = False
+        try:
+            with self._connect() as connection:
+                ready = bool(connection.execute("SELECT 1").fetchone()[0])
+                query_only_row = connection.execute("PRAGMA query_only").fetchone()
+                writable = bool(query_only_row is not None and int(query_only_row[0]) == 0)
+                schema_version = self._read_schema_version(connection)
+                schema_ready = schema_version == expected_schema_version
+        except sqlite3.Error:
+            ready = False
+            writable = False
+            schema_version = 0
+            schema_ready = False
+
+        path_target = self.config.sqlite_path if self.config.sqlite_path.exists() else self.config.sqlite_path.parent
+        writable = writable and os.access(path_target, os.W_OK)
+        return {
+            "backend": self.config.backend,
+            "url": self.config.url,
+            "path": str(self.config.sqlite_path),
+            "ready": ready,
+            "writable": writable,
+            "schema_version": schema_version,
+            "expected_schema_version": expected_schema_version,
+            "schema_ready": schema_ready,
+            "pending_migration_count": max(0, expected_schema_version - schema_version),
+        }
+
+    def schema_status(self) -> dict[str, object]:
+        with self._connect() as connection:
+            version = self._read_schema_version(connection)
+            rows = connection.execute(
+                """
+                SELECT migration_id, schema_version, applied_at, description
+                FROM control_plane_schema_migrations
+                ORDER BY applied_at ASC, migration_id ASC
+                """
+            ).fetchall()
+        return {
+            "schema_version": version,
+            "expected_schema_version": CONTROL_PLANE_SCHEMA_VERSION,
+            "schema_ready": version == CONTROL_PLANE_SCHEMA_VERSION,
+            "pending_migration_count": max(0, CONTROL_PLANE_SCHEMA_VERSION - version),
+            "migrations": [
+                {
+                    "migration_id": row["migration_id"],
+                    "schema_version": row["schema_version"],
+                    "applied_at": row["applied_at"],
+                    "description": row["description"],
+                }
+                for row in rows
+            ],
+        }
+
+    def migrate_schema(self) -> dict[str, object]:
+        self._initialize()
+        return self.schema_status()
+
+    def maintenance_mode_status(self) -> dict[str, object]:
+        with self._connect() as connection:
+            active = self._read_metadata(connection, "maintenance_mode_active") == "1"
+            changed_at = self._read_metadata(connection, "maintenance_mode_changed_at")
+            changed_by = self._read_metadata(connection, "maintenance_mode_changed_by")
+            reason = self._read_metadata(connection, "maintenance_mode_reason")
+        return {
+            "active": active,
+            "changed_at": changed_at,
+            "changed_by": changed_by,
+            "reason": reason,
+        }
+
+    def set_maintenance_mode(self, *, active: bool, changed_by: str, reason: str | None) -> dict[str, object]:
+        with self._connect() as connection:
+            self._upsert_metadata(connection, "maintenance_mode_active", "1" if active else "0")
+            self._upsert_metadata(connection, "maintenance_mode_changed_at", _utc_now())
+            self._upsert_metadata(connection, "maintenance_mode_changed_by", changed_by)
+            self._upsert_metadata(connection, "maintenance_mode_reason", reason or "")
+        return self.maintenance_mode_status()
 
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS control_plane_schema_metadata (
+                    metadata_key TEXT PRIMARY KEY,
+                    metadata_value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS control_plane_schema_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS snapshots (
                     snapshot_id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
@@ -156,6 +277,18 @@ class _ControlPlaneDatabase:
                     PRIMARY KEY (day_bucket, job_id, worker_id, event_type)
                 );
 
+                CREATE TABLE IF NOT EXISTS control_plane_maintenance_events (
+                    event_id TEXT PRIMARY KEY,
+                    recorded_at TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    changed_by TEXT NOT NULL,
+                    reason TEXT,
+                    details_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_control_plane_maintenance_events_recorded_at
+                    ON control_plane_maintenance_events (recorded_at DESC);
+
                 CREATE TABLE IF NOT EXISTS control_plane_alerts (
                     alert_id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
@@ -244,6 +377,11 @@ class _ControlPlaneDatabase:
                     effective_end_date TEXT,
                     webhook_url TEXT,
                     escalation_webhook_url TEXT,
+                    assigned_to TEXT,
+                    assigned_to_team TEXT,
+                    assigned_at TEXT,
+                    assigned_by TEXT,
+                    assignment_note TEXT,
                     decision_at TEXT,
                     decided_by TEXT,
                     decided_by_team TEXT,
@@ -259,10 +397,86 @@ class _ControlPlaneDatabase:
                     ON control_plane_oncall_change_requests (status, created_at DESC);
                 """
             )
+            self._initialize_schema_metadata(connection)
         self._ensure_job_columns()
         self._ensure_control_plane_alert_columns()
         self._ensure_control_plane_oncall_schedule_columns()
         self._ensure_control_plane_oncall_change_request_columns()
+
+    def _initialize_schema_metadata(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            INSERT INTO control_plane_schema_metadata (metadata_key, metadata_value)
+            VALUES ('schema_version', ?)
+            ON CONFLICT(metadata_key) DO NOTHING
+            """,
+            (str(CONTROL_PLANE_SCHEMA_VERSION),),
+        )
+        connection.execute(
+            """
+            INSERT INTO control_plane_schema_migrations (
+                migration_id,
+                schema_version,
+                applied_at,
+                description
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(migration_id) DO NOTHING
+            """,
+            (
+                CONTROL_PLANE_SCHEMA_MIGRATION_ID,
+                CONTROL_PLANE_SCHEMA_VERSION,
+                _utc_now(),
+                CONTROL_PLANE_SCHEMA_MIGRATION_DESCRIPTION,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE control_plane_schema_metadata
+            SET metadata_value = ?
+            WHERE metadata_key = 'schema_version'
+              AND CAST(metadata_value AS INTEGER) < ?
+            """,
+            (str(CONTROL_PLANE_SCHEMA_VERSION), CONTROL_PLANE_SCHEMA_VERSION),
+        )
+
+    def _read_schema_version(self, connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            """
+            SELECT metadata_value
+            FROM control_plane_schema_metadata
+            WHERE metadata_key = 'schema_version'
+            """
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["metadata_value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def _read_metadata(self, connection: sqlite3.Connection, key: str) -> str | None:
+        row = connection.execute(
+            """
+            SELECT metadata_value
+            FROM control_plane_schema_metadata
+            WHERE metadata_key = ?
+            """,
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["metadata_value"])
+
+    def _upsert_metadata(self, connection: sqlite3.Connection, key: str, value: str) -> None:
+        connection.execute(
+            """
+            INSERT INTO control_plane_schema_metadata (metadata_key, metadata_value)
+            VALUES (?, ?)
+            ON CONFLICT(metadata_key)
+            DO UPDATE SET metadata_value = excluded.metadata_value
+            """,
+            (key, value),
+        )
 
     def _ensure_job_columns(self) -> None:
         existing_columns = self._table_columns("jobs")
@@ -323,6 +537,11 @@ class _ControlPlaneDatabase:
         existing_columns = self._table_columns("control_plane_oncall_change_requests")
         additions = {
             "environment_name": "TEXT NOT NULL DEFAULT 'default'",
+            "assigned_to": "TEXT",
+            "assigned_to_team": "TEXT",
+            "assigned_at": "TEXT",
+            "assigned_by": "TEXT",
+            "assignment_note": "TEXT",
         }
         with self._connect() as connection:
             for column_name, column_type in additions.items():
@@ -1265,6 +1484,29 @@ class _ControlPlaneDatabase:
             for row in rows
         ]
 
+    def upsert_worker_heartbeat_rollup(self, record: WorkerHeartbeatRollupRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO worker_heartbeat_rollups (
+                    day_bucket,
+                    worker_id,
+                    status,
+                    current_job_id,
+                    event_count
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day_bucket, worker_id, status, current_job_id)
+                DO UPDATE SET event_count = excluded.event_count
+                """,
+                (
+                    record.day_bucket,
+                    record.worker_id,
+                    record.status,
+                    record.current_job_id,
+                    record.event_count,
+                ),
+            )
+
     def list_job_lease_event_rollups(self, job_id: str | None = None) -> list[JobLeaseEventRollupRecord]:
         with self._connect() as connection:
             if job_id is None:
@@ -1292,6 +1534,86 @@ class _ControlPlaneDatabase:
                 worker_id=row["worker_id"],
                 event_type=row["event_type"],
                 event_count=row["event_count"],
+            )
+            for row in rows
+        ]
+
+    def upsert_job_lease_event_rollup(self, record: JobLeaseEventRollupRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO job_lease_event_rollups (
+                    day_bucket,
+                    job_id,
+                    worker_id,
+                    event_type,
+                    event_count
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day_bucket, job_id, worker_id, event_type)
+                DO UPDATE SET event_count = excluded.event_count
+                """,
+                (
+                    record.day_bucket,
+                    record.job_id,
+                    record.worker_id,
+                    record.event_type,
+                    record.event_count,
+                ),
+            )
+
+    def append_control_plane_maintenance_event(self, record: ControlPlaneMaintenanceEventRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_maintenance_events (
+                    event_id,
+                    recorded_at,
+                    event_type,
+                    changed_by,
+                    reason,
+                    details_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.event_id,
+                    record.recorded_at,
+                    record.event_type,
+                    record.changed_by,
+                    record.reason,
+                    _json_dumps(record.details),
+                ),
+            )
+
+    def list_control_plane_maintenance_events(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[ControlPlaneMaintenanceEventRecord]:
+        query = """
+            SELECT
+                event_id,
+                recorded_at,
+                event_type,
+                changed_by,
+                reason,
+                details_json
+            FROM control_plane_maintenance_events
+            ORDER BY recorded_at DESC
+        """
+        parameters: tuple[object, ...] = ()
+        if limit is not None:
+            query += "\nLIMIT ?"
+            parameters = (limit,)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            ControlPlaneMaintenanceEventRecord(
+                event_id=row["event_id"],
+                recorded_at=row["recorded_at"],
+                event_type=row["event_type"],
+                changed_by=row["changed_by"],
+                reason=row["reason"],
+                details=dict(json.loads(row["details_json"])),
             )
             for row in rows
         ]
@@ -1884,13 +2206,18 @@ class _ControlPlaneDatabase:
                     effective_end_date,
                     webhook_url,
                     escalation_webhook_url,
+                    assigned_to,
+                    assigned_to_team,
+                    assigned_at,
+                    assigned_by,
+                    assignment_note,
                     decision_at,
                     decided_by,
                     decided_by_team,
                     decided_by_role,
                     decision_note,
                     applied_schedule_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.request_id,
@@ -1914,6 +2241,11 @@ class _ControlPlaneDatabase:
                     record.effective_end_date,
                     record.webhook_url,
                     record.escalation_webhook_url,
+                    record.assigned_to,
+                    record.assigned_to_team,
+                    record.assigned_at,
+                    record.assigned_by,
+                    record.assignment_note,
                     record.decision_at,
                     record.decided_by,
                     record.decided_by_team,
@@ -1951,6 +2283,11 @@ class _ControlPlaneDatabase:
                 effective_end_date,
                 webhook_url,
                 escalation_webhook_url,
+                assigned_to,
+                assigned_to_team,
+                assigned_at,
+                assigned_by,
+                assignment_note,
                 decision_at,
                 decided_by,
                 decided_by_team,
@@ -1997,6 +2334,11 @@ class _ControlPlaneDatabase:
                     effective_end_date,
                     webhook_url,
                     escalation_webhook_url,
+                    assigned_to,
+                    assigned_to_team,
+                    assigned_at,
+                    assigned_by,
+                    assignment_note,
                     decision_at,
                     decided_by,
                     decided_by_team,
@@ -2029,6 +2371,11 @@ class _ControlPlaneDatabase:
                 """
                 UPDATE control_plane_oncall_change_requests
                 SET status = ?,
+                    assigned_to = NULL,
+                    assigned_to_team = NULL,
+                    assigned_at = NULL,
+                    assigned_by = NULL,
+                    assignment_note = NULL,
                     decision_at = ?,
                     decided_by = ?,
                     decided_by_team = ?,
@@ -2045,6 +2392,38 @@ class _ControlPlaneDatabase:
                     decided_by_role,
                     decision_note,
                     applied_schedule_id,
+                    request_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def update_control_plane_oncall_change_request_assignment(
+        self,
+        *,
+        request_id: str,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_at: str,
+        assigned_by: str,
+        assignment_note: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_oncall_change_requests
+                SET assigned_to = ?,
+                    assigned_to_team = ?,
+                    assigned_at = ?,
+                    assigned_by = ?,
+                    assignment_note = ?
+                WHERE request_id = ?
+                """,
+                (
+                    assigned_to,
+                    assigned_to_team,
+                    assigned_at,
+                    assigned_by,
+                    assignment_note,
                     request_id,
                 ),
             )
@@ -2076,6 +2455,11 @@ class _ControlPlaneDatabase:
             effective_end_date=row["effective_end_date"],
             webhook_url=row["webhook_url"],
             escalation_webhook_url=row["escalation_webhook_url"],
+            assigned_to=row["assigned_to"],
+            assigned_to_team=row["assigned_to_team"],
+            assigned_at=row["assigned_at"],
+            assigned_by=row["assigned_by"],
+            assignment_note=row["assignment_note"],
             decision_at=row["decision_at"],
             decided_by=row["decided_by"],
             decided_by_team=row["decided_by_team"],
@@ -2083,6 +2467,26 @@ class _ControlPlaneDatabase:
             decision_note=row["decision_note"],
             applied_schedule_id=row["applied_schedule_id"],
         )
+
+    def clear_all_records(self) -> None:
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                DELETE FROM control_plane_oncall_change_requests;
+                DELETE FROM control_plane_oncall_schedules;
+                DELETE FROM control_plane_alert_silences;
+                DELETE FROM control_plane_alerts;
+                DELETE FROM control_plane_maintenance_events;
+                DELETE FROM job_lease_event_rollups;
+                DELETE FROM job_lease_events;
+                DELETE FROM worker_heartbeat_rollups;
+                DELETE FROM worker_heartbeats;
+                DELETE FROM workers;
+                DELETE FROM jobs;
+                DELETE FROM audits;
+                DELETE FROM snapshots;
+                """
+            )
 
 
 class SnapshotRepository:
@@ -2202,6 +2606,21 @@ class JobRepository:
     def list(self) -> list[JobRecord]:
         return self.database.list_jobs()
 
+    def database_status(self) -> dict[str, object]:
+        return self.database.status()
+
+    def schema_status(self) -> dict[str, object]:
+        return self.database.schema_status()
+
+    def migrate_schema(self) -> dict[str, object]:
+        return self.database.migrate_schema()
+
+    def maintenance_mode_status(self) -> dict[str, object]:
+        return self.database.maintenance_mode_status()
+
+    def set_maintenance_mode(self, *, active: bool, changed_by: str, reason: str | None) -> dict[str, object]:
+        return self.database.set_maintenance_mode(active=active, changed_by=changed_by, reason=reason)
+
     def claim_next_queued(self, *, started_at: str, worker_id: str, lease_expires_at: str) -> JobRecord | None:
         return self.database.claim_next_queued_job(
             started_at=started_at,
@@ -2272,6 +2691,27 @@ class JobRepository:
 
     def list_job_lease_event_rollups(self, job_id: str | None = None) -> list[JobLeaseEventRollupRecord]:
         return self.database.list_job_lease_event_rollups(job_id)
+
+    def save_worker_heartbeat_rollup(self, record: WorkerHeartbeatRollupRecord) -> WorkerHeartbeatRollupRecord:
+        self.database.upsert_worker_heartbeat_rollup(record)
+        return record
+
+    def save_job_lease_event_rollup(self, record: JobLeaseEventRollupRecord) -> JobLeaseEventRollupRecord:
+        self.database.upsert_job_lease_event_rollup(record)
+        return record
+
+    def append_control_plane_maintenance_event(
+        self,
+        record: ControlPlaneMaintenanceEventRecord,
+    ) -> ControlPlaneMaintenanceEventRecord:
+        self.database.append_control_plane_maintenance_event(record)
+        return record
+
+    def list_control_plane_maintenance_events(
+        self,
+        limit: int | None = None,
+    ) -> list[ControlPlaneMaintenanceEventRecord]:
+        return self.database.list_control_plane_maintenance_events(limit=limit)
 
     def append_control_plane_alert(self, record: ControlPlaneAlertRecord) -> ControlPlaneAlertRecord:
         self.database.insert_control_plane_alert(record)
@@ -2388,6 +2828,9 @@ class JobRepository:
     ) -> list[ControlPlaneOnCallChangeRequestRecord]:
         return self.database.list_control_plane_oncall_change_requests(status=status)
 
+    def reset_control_plane(self) -> None:
+        self.database.clear_all_records()
+
     def get_control_plane_oncall_change_request(
         self,
         request_id: str,
@@ -2420,6 +2863,30 @@ class JobRepository:
             decided_by_role=decided_by_role,
             decision_note=decision_note,
             applied_schedule_id=applied_schedule_id,
+        )
+        if not updated:
+            raise FileNotFoundError(
+                f"Control-plane on-call change request '{request_id}' was not found."
+            )
+        return self.get_control_plane_oncall_change_request(request_id)
+
+    def assign_control_plane_oncall_change_request(
+        self,
+        *,
+        request_id: str,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_at: str,
+        assigned_by: str,
+        assignment_note: str | None,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        updated = self.database.update_control_plane_oncall_change_request_assignment(
+            request_id=request_id,
+            assigned_to=assigned_to,
+            assigned_to_team=assigned_to_team,
+            assigned_at=assigned_at,
+            assigned_by=assigned_by,
+            assignment_note=assignment_note,
         )
         if not updated:
             raise FileNotFoundError(

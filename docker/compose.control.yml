@@ -1,0 +1,43 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.control
+    command: ["uvicorn", "lsa.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      LSA_API_KEY: ${LSA_API_KEY:-change-me-in-production}
+      LSA_ENVIRONMENT_NAME: ${LSA_ENVIRONMENT_NAME:-prod}
+      LSA_RUN_EMBEDDED_WORKER: "0"
+      LSA_DATABASE_URL: ${LSA_DATABASE_URL:-sqlite:////app/data/control_plane.db}
+      LSA_SQLITE_BUSY_TIMEOUT_MS: ${LSA_SQLITE_BUSY_TIMEOUT_MS:-5000}
+      LSA_CONTROL_PLANE_ALERTS_ENABLED: ${LSA_CONTROL_PLANE_ALERTS_ENABLED:-1}
+    volumes:
+      - lsa_data:/app/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').getcode() == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.control
+    command: ["lsa", "worker", "--poll-interval", "0.25"]
+    environment:
+      LSA_API_KEY: ${LSA_API_KEY:-change-me-in-production}
+      LSA_ENVIRONMENT_NAME: ${LSA_ENVIRONMENT_NAME:-prod}
+      LSA_RUN_EMBEDDED_WORKER: "0"
+      LSA_DATABASE_URL: ${LSA_DATABASE_URL:-sqlite:////app/data/control_plane.db}
+      LSA_SQLITE_BUSY_TIMEOUT_MS: ${LSA_SQLITE_BUSY_TIMEOUT_MS:-5000}
+      LSA_CONTROL_PLANE_ALERTS_ENABLED: ${LSA_CONTROL_PLANE_ALERTS_ENABLED:-1}
+    volumes:
+      - lsa_data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  lsa_data:

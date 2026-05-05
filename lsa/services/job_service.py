@@ -13,7 +13,14 @@ from lsa.services.audit_service import AuditService
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
 from lsa.services.trace_collection_service import TraceCollectionRequest, TraceCollectionService
 from lsa.storage.files import JobRepository
-from lsa.storage.models import ControlPlaneAlertRecord, JobLeaseEventRecord, JobRecord, WorkerHeartbeatRecord, WorkerRecord
+from lsa.storage.models import (
+    ControlPlaneAlertRecord,
+    ControlPlaneMaintenanceEventRecord,
+    JobLeaseEventRecord,
+    JobRecord,
+    WorkerHeartbeatRecord,
+    WorkerRecord,
+)
 
 
 @dataclass(slots=True)
@@ -80,6 +87,32 @@ class JobService:
 
     def active_worker_count(self) -> int:
         return self.job_repository.count_workers_seen_since(self._heartbeat_threshold())
+
+    def maintenance_mode_status(self) -> dict[str, object]:
+        return self.job_repository.maintenance_mode_status()
+
+    def is_maintenance_mode_active(self) -> bool:
+        return bool(self.maintenance_mode_status()["active"])
+
+    def enable_maintenance_mode(self, *, changed_by: str, reason: str | None = None) -> dict[str, object]:
+        status = self.job_repository.set_maintenance_mode(active=True, changed_by=changed_by, reason=reason)
+        self._record_maintenance_event(
+            event_type="maintenance_mode_enabled",
+            changed_by=changed_by,
+            reason=reason,
+            details={},
+        )
+        return status
+
+    def disable_maintenance_mode(self, *, changed_by: str, reason: str | None = None) -> dict[str, object]:
+        status = self.job_repository.set_maintenance_mode(active=False, changed_by=changed_by, reason=reason)
+        self._record_maintenance_event(
+            event_type="maintenance_mode_disabled",
+            changed_by=changed_by,
+            reason=reason,
+            details={},
+        )
+        return status
 
     def emit_control_plane_alerts_if_due(self) -> list[ControlPlaneAlertRecord]:
         if not self.control_plane_alerts_enabled or self.control_plane_alert_service is None:
@@ -192,17 +225,28 @@ class JobService:
         worker_heartbeats_compacted = self.job_repository.compact_worker_heartbeats_before(worker_cutoff)
         job_lease_events_compacted = self.job_repository.compact_job_lease_events_before(lease_cutoff)
         self._last_prune_at = now
-        return {
+        result = {
             "worker_heartbeats_compacted": worker_heartbeats_compacted,
             "job_lease_events_compacted": job_lease_events_compacted,
             "worker_heartbeats_pruned": worker_heartbeats_compacted,
             "job_lease_events_pruned": job_lease_events_compacted,
         }
+        self._record_maintenance_event(
+            event_type="history_pruned",
+            changed_by="system",
+            reason=None,
+            details=result,
+        )
+        return result
 
     def submit_audit_trace(self, request_payload: dict) -> JobRecord:
+        if self.is_maintenance_mode_active():
+            raise RuntimeError("Control-plane maintenance mode is active.")
         return self.job_repository.create(job_type="audit-trace", request_payload=request_payload)
 
     def submit_collect_audit(self, request_payload: dict) -> JobRecord:
+        if self.is_maintenance_mode_active():
+            raise RuntimeError("Control-plane maintenance mode is active.")
         return self.job_repository.create(job_type="collect-audit", request_payload=request_payload)
 
     def list_jobs(self) -> list[JobRecord]:
@@ -225,6 +269,24 @@ class JobService:
 
     def count_jobs_by_status(self, status: str) -> int:
         return self.job_repository.count_by_status(status)
+
+    def list_control_plane_maintenance_events(self, limit: int | None = None) -> list[ControlPlaneMaintenanceEventRecord]:
+        return self.job_repository.list_control_plane_maintenance_events(limit=limit)
+
+    def record_maintenance_event(
+        self,
+        *,
+        event_type: str,
+        changed_by: str,
+        reason: str | None = None,
+        details: dict | None = None,
+    ) -> None:
+        self._record_maintenance_event(
+            event_type=event_type,
+            changed_by=changed_by,
+            reason=reason,
+            details=details or {},
+        )
 
     def wait_for_job(self, job_id: str, timeout_seconds: float = 5.0) -> JobRecord:
         deadline = monotonic() + timeout_seconds
@@ -253,6 +315,12 @@ class JobService:
                 self.emit_control_plane_alerts_if_due()
                 if max_jobs is not None and processed_jobs >= max_jobs:
                     break
+                if self.is_maintenance_mode_active():
+                    self._heartbeat(current_job_id=None)
+                    if idle_timeout_seconds is not None and monotonic() - idle_started_at >= idle_timeout_seconds:
+                        break
+                    sleep(self.poll_interval_seconds)
+                    continue
                 processed = self.process_next_job()
                 if processed:
                     processed_jobs += 1
@@ -301,6 +369,10 @@ class JobService:
         while not self._stop_event.is_set():
             self.prune_history_if_due()
             self.emit_control_plane_alerts_if_due()
+            if self.is_maintenance_mode_active():
+                self._heartbeat(current_job_id=None)
+                self._stop_event.wait(self.poll_interval_seconds)
+                continue
             processed = self.process_next_job()
             if not processed:
                 self._heartbeat(current_job_id=None)
@@ -509,6 +581,25 @@ class JobService:
                 worker_id=worker_id,
                 event_type=event_type,
                 recorded_at=_utc_now(),
+                details=details,
+            )
+        )
+
+    def _record_maintenance_event(
+        self,
+        *,
+        event_type: str,
+        changed_by: str,
+        reason: str | None,
+        details: dict,
+    ) -> None:
+        self.job_repository.append_control_plane_maintenance_event(
+            ControlPlaneMaintenanceEventRecord(
+                event_id=uuid4().hex[:16],
+                recorded_at=_utc_now(),
+                event_type=event_type,
+                changed_by=changed_by,
+                reason=reason,
                 details=details,
             )
         )

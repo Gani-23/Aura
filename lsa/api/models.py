@@ -34,8 +34,16 @@ class HealthResponse(BaseModel):
     environment_name: str
     auth_enabled: bool
     worker_mode: str
+    database_backend: str
+    database_url: str
     database_path: str
     database_ready: bool
+    database_writable: bool
+    database_schema_version: int
+    database_expected_schema_version: int
+    database_schema_ready: bool
+    database_pending_migration_count: int
+    maintenance_mode_active: bool
     worker_running: bool
     active_workers: int
     queued_jobs: int
@@ -235,6 +243,63 @@ class PruneHistoryResponse(BaseModel):
     job_lease_events_pruned: int
 
 
+class ExportControlPlaneBackupRequest(BaseModel):
+    output_path: str
+
+
+class ImportControlPlaneBackupRequest(BaseModel):
+    input_path: str
+    replace_existing: bool = False
+
+
+class ControlPlaneBackupResponse(BaseModel):
+    bundle_version: int
+    exported_at: str
+    environment_name: str
+    database_backend: str
+    database_url: str
+    counts: dict[str, int]
+    artifact_counts: dict[str, int]
+    path: str
+    replace_existing: bool | None = None
+
+
+class ControlPlaneSchemaMigrationPayload(BaseModel):
+    migration_id: str
+    schema_version: int
+    applied_at: str
+    description: str
+
+
+class ControlPlaneSchemaStatusResponse(BaseModel):
+    schema_version: int
+    expected_schema_version: int
+    schema_ready: bool
+    pending_migration_count: int
+    migrations: list[ControlPlaneSchemaMigrationPayload]
+
+
+class SetControlPlaneMaintenanceModeRequest(BaseModel):
+    changed_by: str
+    reason: str | None = None
+
+
+class ControlPlaneMaintenanceModeResponse(BaseModel):
+    active: bool
+    changed_at: str | None = None
+    changed_by: str | None = None
+    reason: str | None = None
+
+
+class ControlPlaneMaintenanceEventPayload(BaseModel):
+    event_id: str
+    recorded_at: str
+    event_type: str
+    changed_by: str
+    reason: str | None = None
+    details: dict[str, Any]
+
+
 class ControlPlaneAlertRecordPayload(BaseModel):
     alert_id: str
     created_at: str
@@ -369,6 +434,11 @@ class ControlPlaneOnCallChangeRequestPayload(BaseModel):
     effective_end_date: str | None = None
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    assigned_at: str | None = None
+    assigned_by: str | None = None
+    assignment_note: str | None = None
     decision_at: str | None = None
     decided_by: str | None = None
     decided_by_team: str | None = None
@@ -402,6 +472,13 @@ class ReviewControlPlaneOnCallChangeRequest(BaseModel):
     reviewed_by_team: str | None = None
     reviewed_by_role: str | None = None
     review_note: str | None = None
+
+
+class AssignControlPlaneOnCallChangeRequest(BaseModel):
+    assigned_to: str
+    assigned_to_team: str | None = None
+    assigned_by: str
+    assignment_note: str | None = None
 
 
 class ControlPlaneOnCallRouteCandidatePayload(BaseModel):
@@ -512,11 +589,26 @@ class OnCallConflictPayload(BaseModel):
     occurrence_count: int
 
 
+class OnCallPendingReviewSamplePayload(BaseModel):
+    request_id: str
+    created_at: str
+    team_name: str
+    rotation_name: str | None = None
+    age_hours: float
+    change_reason: str | None = None
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+
+
 class OnCallAnalyticsPayload(BaseModel):
     total_schedules: int
     active_schedules: int
     conflict_count: int
+    pending_review_count: int
+    stale_pending_review_count: int
+    oldest_pending_review_age_hours: float | None = None
     conflicts: list[OnCallConflictPayload]
+    pending_review_samples: list[OnCallPendingReviewSamplePayload]
 
 
 class ControlPlaneAlertThresholdsPayload(BaseModel):
@@ -531,6 +623,9 @@ class ControlPlaneAlertThresholdsPayload(BaseModel):
     job_failure_rate_min_samples: int
     oncall_conflict_warning_threshold: int
     oncall_conflict_critical_threshold: int
+    oncall_pending_review_warning_threshold: int
+    oncall_pending_review_critical_threshold: int
+    oncall_pending_review_sla_hours: float
 
 
 class ControlPlaneFindingPayload(BaseModel):

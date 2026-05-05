@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from lsa.api import main as api_main
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
+from lsa.services.metrics_service import ControlPlaneMetricsService
 from lsa.storage.models import JobLeaseEventRecord, WorkerHeartbeatRecord
 
 
@@ -67,6 +68,7 @@ class ApiTests(unittest.TestCase):
             api_main.trace_collection_service = api_main.TraceCollectionService(settings=api_main.settings)
             api_main.analytics_service = AnalyticsService(
                 job_repository=api_main.job_repository,
+                default_environment_name=api_main.settings.environment_name,
                 heartbeat_timeout_seconds=api_main.settings.worker_heartbeat_timeout_seconds,
                 default_thresholds=ControlPlaneAlertThresholds(
                     queue_warning_threshold=api_main.settings.analytics_queue_warning_threshold,
@@ -78,6 +80,11 @@ class ApiTests(unittest.TestCase):
                     job_failure_rate_warning_threshold=api_main.settings.analytics_job_failure_rate_warning_threshold,
                     job_failure_rate_critical_threshold=api_main.settings.analytics_job_failure_rate_critical_threshold,
                     job_failure_rate_min_samples=api_main.settings.analytics_job_failure_rate_min_samples,
+                    oncall_conflict_warning_threshold=api_main.settings.analytics_oncall_conflict_warning_threshold,
+                    oncall_conflict_critical_threshold=api_main.settings.analytics_oncall_conflict_critical_threshold,
+                    oncall_pending_review_warning_threshold=api_main.settings.analytics_oncall_pending_review_warning_threshold,
+                    oncall_pending_review_critical_threshold=api_main.settings.analytics_oncall_pending_review_critical_threshold,
+                    oncall_pending_review_sla_hours=api_main.settings.analytics_oncall_pending_review_sla_hours,
                 ),
             )
             api_main.control_plane_alert_service = ControlPlaneAlertService(
@@ -89,6 +96,12 @@ class ApiTests(unittest.TestCase):
                 policy_path=str(api_main.settings.oncall_policy_path),
                 sink_path=str(api_main.settings.control_plane_alert_sink_path),
                 webhook_url=api_main.settings.control_plane_alert_webhook_url,
+            )
+            api_main.control_plane_backup_service = api_main.ControlPlaneBackupService(
+                settings=api_main.settings,
+                snapshot_repository=api_main.snapshot_repository,
+                audit_repository=api_main.audit_repository,
+                job_repository=api_main.job_repository,
             )
             api_main.job_service = api_main.JobService(
                 job_repository=api_main.job_repository,
@@ -103,6 +116,13 @@ class ApiTests(unittest.TestCase):
                 control_plane_alert_interval_seconds=api_main.settings.control_plane_alert_interval_seconds,
                 control_plane_alerts_enabled=api_main.settings.control_plane_alerts_enabled,
             )
+            api_main.metrics_service = ControlPlaneMetricsService(
+                job_repository=api_main.job_repository,
+                job_service=api_main.job_service,
+                analytics_service=api_main.analytics_service,
+                environment_name=api_main.settings.environment_name,
+                worker_mode="embedded",
+            )
             auth_headers = {"X-API-Key": "test-key"}
             with TestClient(api_main.app) as client:
                 health_response = client.get("/health")
@@ -112,7 +132,14 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(health_payload["environment_name"], "prod")
                 self.assertTrue(health_payload["auth_enabled"])
                 self.assertEqual(health_payload["worker_mode"], "embedded")
+                self.assertEqual(health_payload["database_backend"], "sqlite")
+                self.assertEqual(health_payload["database_url"], api_main.settings.database_url)
                 self.assertTrue(health_payload["database_ready"])
+                self.assertTrue(health_payload["database_writable"])
+                self.assertEqual(health_payload["database_schema_version"], 1)
+                self.assertEqual(health_payload["database_expected_schema_version"], 1)
+                self.assertTrue(health_payload["database_schema_ready"])
+                self.assertEqual(health_payload["database_pending_migration_count"], 0)
                 self.assertTrue(health_payload["worker_running"])
                 self.assertEqual(health_payload["active_workers"], 1)
                 self.assertEqual(health_payload["queued_jobs"], 0)
@@ -124,6 +151,47 @@ class ApiTests(unittest.TestCase):
                     json={"repo_path": str(fixture_root), "persist": True, "snapshot_id": "snap-api"},
                 )
                 self.assertEqual(unauthorized_ingest.status_code, 401)
+
+                unauthorized_metrics = client.get("/metrics")
+                self.assertEqual(unauthorized_metrics.status_code, 401)
+
+                metrics_response = client.get("/metrics?days=1", headers=auth_headers)
+                self.assertEqual(metrics_response.status_code, 200)
+                self.assertIn("lsa_control_plane_database_ready 1", metrics_response.text)
+                self.assertIn('lsa_control_plane_info{database_backend="sqlite",environment="prod",worker_mode="embedded"} 1', metrics_response.text)
+                self.assertIn("lsa_control_plane_maintenance_mode_active 0", metrics_response.text)
+
+                maintenance_status_response = client.get("/maintenance/mode", headers=auth_headers)
+                self.assertEqual(maintenance_status_response.status_code, 200)
+                self.assertFalse(maintenance_status_response.json()["active"])
+
+                enable_maintenance_response = client.post(
+                    "/maintenance/mode/enable",
+                    json={"changed_by": "operator-a", "reason": "backup"},
+                    headers=auth_headers,
+                )
+                self.assertEqual(enable_maintenance_response.status_code, 200)
+                self.assertTrue(enable_maintenance_response.json()["active"])
+                self.assertEqual(enable_maintenance_response.json()["changed_by"], "operator-a")
+
+                maintenance_health_response = client.get("/health")
+                self.assertEqual(maintenance_health_response.status_code, 200)
+                self.assertTrue(maintenance_health_response.json()["maintenance_mode_active"])
+
+                blocked_ingest_response = client.post(
+                    "/ingest",
+                    json={"repo_path": str(fixture_root), "persist": True, "snapshot_id": "snap-api-blocked"},
+                    headers=auth_headers,
+                )
+                self.assertEqual(blocked_ingest_response.status_code, 503)
+
+                disable_maintenance_response = client.post(
+                    "/maintenance/mode/disable",
+                    json={"changed_by": "operator-a", "reason": "done"},
+                    headers=auth_headers,
+                )
+                self.assertEqual(disable_maintenance_response.status_code, 200)
+                self.assertFalse(disable_maintenance_response.json()["active"])
 
                 ingest_response = client.post(
                     "/ingest",
@@ -207,6 +275,66 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(collect_trace_payload["line_count"], 1)
                 self.assertIn("trace_symbol_map_path", collect_trace_payload)
                 self.assertIn("trace_context_map_path", collect_trace_payload)
+
+                backup_path = Path(tmpdir) / "control-plane-backup.json"
+                export_backup_response = client.post(
+                    "/maintenance/export-control-plane-backup",
+                    json={"output_path": str(backup_path)},
+                    headers=auth_headers,
+                )
+                self.assertEqual(export_backup_response.status_code, 200)
+                self.assertTrue(backup_path.exists())
+                self.assertGreaterEqual(export_backup_response.json()["counts"]["snapshots"], 1)
+                self.assertGreaterEqual(export_backup_response.json()["artifact_counts"]["snapshots"], 1)
+
+                api_main.job_repository.reset_control_plane()
+                import_backup_response = client.post(
+                    "/maintenance/import-control-plane-backup",
+                    json={"input_path": str(backup_path), "replace_existing": False},
+                    headers=auth_headers,
+                )
+                self.assertEqual(import_backup_response.status_code, 200)
+                restored_snapshots = client.get("/snapshots", headers=auth_headers)
+                self.assertEqual(restored_snapshots.status_code, 200)
+                self.assertGreaterEqual(len(restored_snapshots.json()), 1)
+
+                schema_response = client.get("/maintenance/control-plane-schema", headers=auth_headers)
+                self.assertEqual(schema_response.status_code, 200)
+                self.assertEqual(schema_response.json()["schema_version"], 1)
+                self.assertEqual(schema_response.json()["expected_schema_version"], 1)
+                self.assertTrue(schema_response.json()["schema_ready"])
+                self.assertEqual(schema_response.json()["pending_migration_count"], 0)
+                self.assertEqual(len(schema_response.json()["migrations"]), 1)
+
+                with api_main.job_repository.database._connect() as connection:
+                    connection.execute(
+                        """
+                        UPDATE control_plane_schema_metadata
+                        SET metadata_value = '0'
+                        WHERE metadata_key = 'schema_version'
+                        """
+                    )
+                    connection.execute(
+                        """
+                        DELETE FROM control_plane_schema_migrations
+                        WHERE migration_id = ?
+                        """,
+                        ("2026-05-05-control-plane-schema-v1",),
+                    )
+
+                degraded_health_response = client.get("/health")
+                self.assertEqual(degraded_health_response.status_code, 200)
+                self.assertFalse(degraded_health_response.json()["database_schema_ready"])
+                self.assertEqual(degraded_health_response.json()["database_pending_migration_count"], 1)
+
+                migrate_schema_response = client.post(
+                    "/maintenance/control-plane-schema/migrate",
+                    headers=auth_headers,
+                )
+                self.assertEqual(migrate_schema_response.status_code, 200)
+                self.assertTrue(migrate_schema_response.json()["schema_ready"])
+                self.assertEqual(migrate_schema_response.json()["schema_version"], 1)
+                self.assertEqual(migrate_schema_response.json()["pending_migration_count"], 0)
 
                 explicit_context_script = Path(tmpdir) / "emit_context_trace.sh"
                 explicit_context_script.write_text(
@@ -556,6 +684,18 @@ class ApiTests(unittest.TestCase):
                     headers=auth_headers,
                 )
                 self.assertEqual(fetched_request.status_code, 200)
+                assigned_request = client.post(
+                    f"/control-plane-oncall-change-requests/{request_id}/assign",
+                    json={
+                        "assigned_to": "reviewer-api",
+                        "assigned_to_team": "platform",
+                        "assigned_by": "lead-api",
+                        "assignment_note": "Handle this before the prod cutover.",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(assigned_request.status_code, 200)
+                self.assertEqual(assigned_request.json()["assigned_to"], "reviewer-api")
                 reviewed_request = client.post(
                     f"/control-plane-oncall-change-requests/{request_id}/review",
                     json={
