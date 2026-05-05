@@ -5,7 +5,13 @@ import unittest
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import JobRepository
-from lsa.storage.models import JobLeaseEventRecord, JobRecord, WorkerHeartbeatRecord, WorkerRecord
+from lsa.storage.models import (
+    ControlPlaneOnCallScheduleRecord,
+    JobLeaseEventRecord,
+    JobRecord,
+    WorkerHeartbeatRecord,
+    WorkerRecord,
+)
 
 
 class AnalyticsServiceTests(unittest.TestCase):
@@ -292,6 +298,55 @@ class AnalyticsServiceTests(unittest.TestCase):
             self.assertIn("expired_leases", finding_codes)
             self.assertIn("job_failure_rate", finding_codes)
             self.assertIn("queue_without_active_workers", finding_codes)
+
+    def test_control_plane_analytics_flags_ambiguous_oncall_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            service = AnalyticsService(
+                job_repository=repo,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    oncall_conflict_warning_threshold=1,
+                    oncall_conflict_critical_threshold=2,
+                ),
+            )
+
+            repo.append_control_plane_oncall_schedule(
+                ControlPlaneOnCallScheduleRecord(
+                    schedule_id="schedule-a",
+                    created_at="2026-05-05T00:00:00+00:00",
+                    created_by="operator-a",
+                    team_name="platform-a",
+                    timezone_name="UTC",
+                    weekdays=[0, 1, 2, 3, 4, 5, 6],
+                    start_time="00:00",
+                    end_time="23:59",
+                    priority=100,
+                    rotation_name="primary-a",
+                )
+            )
+            repo.append_control_plane_oncall_schedule(
+                ControlPlaneOnCallScheduleRecord(
+                    schedule_id="schedule-b",
+                    created_at="2026-05-06T00:00:00+00:00",
+                    created_by="operator-b",
+                    team_name="platform-b",
+                    timezone_name="UTC",
+                    weekdays=[0, 1, 2, 3, 4, 5, 6],
+                    start_time="00:00",
+                    end_time="23:59",
+                    priority=100,
+                    rotation_name="primary-b",
+                )
+            )
+
+            payload = service.build_control_plane_analytics(days=7).to_dict()
+            self.assertEqual(payload["evaluation"]["status"], "degraded")
+            self.assertEqual(payload["oncall"]["conflict_count"], 1)
+            self.assertGreaterEqual(payload["oncall"]["active_schedules"], 2)
+            finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
+            self.assertIn("oncall_route_conflicts", finding_codes)
 
 
 if __name__ == "__main__":

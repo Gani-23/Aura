@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -10,8 +10,14 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from lsa.services.analytics_service import AnalyticsService
+from lsa.services.oncall_policy import load_oncall_policy_bundle
 from lsa.storage.files import JobRepository
-from lsa.storage.models import ControlPlaneAlertRecord, ControlPlaneAlertSilenceRecord, ControlPlaneOnCallScheduleRecord
+from lsa.storage.models import (
+    ControlPlaneAlertRecord,
+    ControlPlaneAlertSilenceRecord,
+    ControlPlaneOnCallChangeRequestRecord,
+    ControlPlaneOnCallScheduleRecord,
+)
 
 
 def _utc_now() -> str:
@@ -22,10 +28,14 @@ def _utc_now() -> str:
 class ControlPlaneAlertService:
     job_repository: JobRepository
     analytics_service: AnalyticsService
+    default_environment_name: str = "default"
     window_days: int = 7
     dedup_window_seconds: float = 300.0
     reminder_interval_seconds: float = 900.0
     escalation_interval_seconds: float = 1800.0
+    policy_path: str | None = None
+    required_approver_roles: tuple[str, ...] = ("manager", "director", "admin")
+    allow_self_approval: bool = False
     sink_path: str | None = None
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
@@ -121,11 +131,23 @@ class ControlPlaneAlertService:
         self,
         *,
         created_by: str,
+        created_by_team: str | None = None,
+        created_by_role: str | None = None,
+        environment_name: str | None = None,
         team_name: str,
         timezone_name: str,
+        change_reason: str | None = None,
+        approved_by: str | None = None,
+        approved_by_team: str | None = None,
+        approved_by_role: str | None = None,
+        approval_note: str | None = None,
         weekdays: list[int],
         start_time: str,
         end_time: str,
+        priority: int = 100,
+        rotation_name: str | None = None,
+        effective_start_date: str | None = None,
+        effective_end_date: str | None = None,
         webhook_url: str | None = None,
         escalation_webhook_url: str | None = None,
     ) -> ControlPlaneOnCallScheduleRecord:
@@ -134,27 +156,56 @@ class ControlPlaneAlertService:
             weekdays=weekdays,
             start_time=start_time,
             end_time=end_time,
+            priority=priority,
+            effective_start_date=effective_start_date,
+            effective_end_date=effective_end_date,
         )
-        return self.job_repository.append_control_plane_oncall_schedule(
-            ControlPlaneOnCallScheduleRecord(
-                schedule_id=uuid4().hex[:16],
-                created_at=_utc_now(),
-                created_by=created_by,
-                team_name=team_name,
-                timezone_name=timezone_name,
-                weekdays=weekdays,
-                start_time=start_time,
-                end_time=end_time,
-                webhook_url=webhook_url,
-                escalation_webhook_url=escalation_webhook_url,
-            )
+        if approval_note is not None and approved_by is None:
+            raise ValueError("approval_note requires approved_by.")
+        if approved_by_role is not None and approved_by is None:
+            raise ValueError("approved_by_role requires approved_by.")
+        if approved_by_team is not None and approved_by is None:
+            raise ValueError("approved_by_team requires approved_by.")
+        proposed_record = self._build_oncall_schedule_record(
+            created_by=created_by,
+            created_by_team=created_by_team,
+            created_by_role=created_by_role,
+            environment_name=environment_name,
+            team_name=team_name,
+            timezone_name=timezone_name,
+            change_reason=change_reason,
+            approved_by=approved_by,
+            approved_by_team=approved_by_team,
+            approved_by_role=approved_by_role,
+            approval_note=approval_note,
+            weekdays=weekdays,
+            start_time=start_time,
+            end_time=end_time,
+            priority=priority,
+            rotation_name=rotation_name,
+            effective_start_date=effective_start_date,
+            effective_end_date=effective_end_date,
+            webhook_url=webhook_url,
+            escalation_webhook_url=escalation_webhook_url,
         )
+        effective_policy = self._effective_governance_policy(proposed_record)
+        self._validate_policy_boundaries(proposed_record, effective_policy)
+        self._validate_schedule_approval_requirements(
+            proposed_record=proposed_record,
+            effective_policy=effective_policy,
+        )
+        return self.job_repository.append_control_plane_oncall_schedule(proposed_record)
 
     def list_oncall_schedules(self, *, active_only: bool = False) -> list[ControlPlaneOnCallScheduleRecord]:
         records = self.job_repository.list_control_plane_oncall_schedules()
         if not active_only:
             return records
-        return [record for record in records if self._schedule_is_active_now(record)]
+        return [
+            record
+            for record in records
+            if record.environment_name == self.default_environment_name
+            and self._schedule_is_active_now(record)
+        ]
 
     def cancel_oncall_schedule(self, *, schedule_id: str, cancelled_by: str) -> ControlPlaneOnCallScheduleRecord:
         return self.job_repository.cancel_control_plane_oncall_schedule(
@@ -162,6 +213,242 @@ class ControlPlaneAlertService:
             cancelled_at=_utc_now(),
             cancelled_by=cancelled_by,
         )
+
+    def submit_oncall_change_request(
+        self,
+        *,
+        created_by: str,
+        created_by_team: str | None = None,
+        created_by_role: str | None = None,
+        environment_name: str | None = None,
+        team_name: str,
+        timezone_name: str,
+        change_reason: str | None,
+        weekdays: list[int],
+        start_time: str,
+        end_time: str,
+        priority: int = 100,
+        rotation_name: str | None = None,
+        effective_start_date: str | None = None,
+        effective_end_date: str | None = None,
+        webhook_url: str | None = None,
+        escalation_webhook_url: str | None = None,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        if change_reason is None or not change_reason.strip():
+            raise ValueError("change_reason is required for on-call change requests.")
+        proposed_record = self._build_oncall_schedule_record(
+            created_by=created_by,
+            created_by_team=created_by_team,
+            created_by_role=created_by_role,
+            environment_name=environment_name,
+            team_name=team_name,
+            timezone_name=timezone_name,
+            change_reason=change_reason,
+            approved_by=None,
+            approved_by_team=None,
+            approved_by_role=None,
+            approval_note=None,
+            weekdays=weekdays,
+            start_time=start_time,
+            end_time=end_time,
+            priority=priority,
+            rotation_name=rotation_name,
+            effective_start_date=effective_start_date,
+            effective_end_date=effective_end_date,
+            webhook_url=webhook_url,
+            escalation_webhook_url=escalation_webhook_url,
+        )
+        effective_policy = self._effective_governance_policy(proposed_record)
+        self._validate_policy_boundaries(proposed_record, effective_policy)
+        review_required = self._schedule_requires_approval(proposed_record)
+        review_reasons = ["ambiguous_overlap"] if review_required else []
+        if not review_required:
+            applied_schedule = self.create_oncall_schedule(
+                created_by=created_by,
+                created_by_team=created_by_team,
+                created_by_role=created_by_role,
+                environment_name=environment_name,
+                team_name=team_name,
+                timezone_name=timezone_name,
+                change_reason=change_reason,
+                weekdays=weekdays,
+                start_time=start_time,
+                end_time=end_time,
+                priority=priority,
+                rotation_name=rotation_name,
+                effective_start_date=effective_start_date,
+                effective_end_date=effective_end_date,
+                webhook_url=webhook_url,
+                escalation_webhook_url=escalation_webhook_url,
+            )
+            return self.job_repository.append_control_plane_oncall_change_request(
+                ControlPlaneOnCallChangeRequestRecord(
+                    request_id=uuid4().hex[:16],
+                    created_at=applied_schedule.created_at,
+                    created_by=created_by,
+                    created_by_team=proposed_record.created_by_team,
+                    created_by_role=proposed_record.created_by_role,
+                    change_reason=change_reason,
+                    status="applied",
+                    review_required=False,
+                    review_reasons=review_reasons,
+                    environment_name=proposed_record.environment_name,
+                    team_name=team_name,
+                    timezone_name=timezone_name,
+                    weekdays=list(weekdays),
+                    start_time=start_time,
+                    end_time=end_time,
+                    priority=priority,
+                    rotation_name=rotation_name,
+                    effective_start_date=effective_start_date,
+                    effective_end_date=effective_end_date,
+                    webhook_url=webhook_url,
+                    escalation_webhook_url=escalation_webhook_url,
+                    decision_at=applied_schedule.created_at,
+                    decided_by=created_by,
+                    decided_by_team=proposed_record.created_by_team,
+                    decided_by_role=proposed_record.created_by_role,
+                    decision_note="Auto-applied because no governed overlap was detected.",
+                    applied_schedule_id=applied_schedule.schedule_id,
+                )
+            )
+        return self.job_repository.append_control_plane_oncall_change_request(
+            ControlPlaneOnCallChangeRequestRecord(
+                request_id=uuid4().hex[:16],
+                created_at=proposed_record.created_at,
+                created_by=created_by,
+                created_by_team=proposed_record.created_by_team,
+                created_by_role=proposed_record.created_by_role,
+                change_reason=change_reason,
+                status="pending_review",
+                review_required=True,
+                review_reasons=review_reasons,
+                environment_name=proposed_record.environment_name,
+                team_name=team_name,
+                timezone_name=timezone_name,
+                weekdays=list(weekdays),
+                start_time=start_time,
+                end_time=end_time,
+                priority=priority,
+                rotation_name=rotation_name,
+                effective_start_date=effective_start_date,
+                effective_end_date=effective_end_date,
+                webhook_url=webhook_url,
+                escalation_webhook_url=escalation_webhook_url,
+            )
+        )
+
+    def list_oncall_change_requests(
+        self,
+        *,
+        status: str | None = None,
+    ) -> list[ControlPlaneOnCallChangeRequestRecord]:
+        return self.job_repository.list_control_plane_oncall_change_requests(status=status)
+
+    def get_oncall_change_request(self, request_id: str) -> ControlPlaneOnCallChangeRequestRecord:
+        return self.job_repository.get_control_plane_oncall_change_request(request_id)
+
+    def review_oncall_change_request(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        reviewed_by: str,
+        reviewed_by_team: str | None = None,
+        reviewed_by_role: str | None = None,
+        review_note: str | None = None,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        normalized_decision = decision.strip().lower()
+        if normalized_decision not in {"approve", "reject"}:
+            raise ValueError("decision must be either 'approve' or 'reject'.")
+        request = self.job_repository.get_control_plane_oncall_change_request(request_id)
+        if request.status != "pending_review":
+            raise ValueError(
+                f"On-call change request '{request_id}' is not pending review."
+            )
+        decision_at = _utc_now()
+        normalized_reviewer_team = self._normalize_team(reviewed_by_team)
+        normalized_reviewer_role = self._normalize_role(reviewed_by_role)
+        if normalized_decision == "reject":
+            if review_note is None or not review_note.strip():
+                raise ValueError("review_note is required when rejecting an on-call change request.")
+            return self.job_repository.decide_control_plane_oncall_change_request(
+                request_id=request_id,
+                status="rejected",
+                decision_at=decision_at,
+                decided_by=reviewed_by,
+                decided_by_team=normalized_reviewer_team,
+                decided_by_role=normalized_reviewer_role,
+                decision_note=review_note,
+                applied_schedule_id=None,
+            )
+        applied_schedule = self.create_oncall_schedule(
+            created_by=request.created_by,
+            created_by_team=request.created_by_team,
+            created_by_role=request.created_by_role,
+            environment_name=request.environment_name,
+            team_name=request.team_name,
+            timezone_name=request.timezone_name,
+            change_reason=request.change_reason,
+            approved_by=reviewed_by,
+            approved_by_team=normalized_reviewer_team,
+            approved_by_role=normalized_reviewer_role,
+            approval_note=review_note,
+            weekdays=list(request.weekdays),
+            start_time=request.start_time,
+            end_time=request.end_time,
+            priority=request.priority,
+            rotation_name=request.rotation_name,
+            effective_start_date=request.effective_start_date,
+            effective_end_date=request.effective_end_date,
+            webhook_url=request.webhook_url,
+            escalation_webhook_url=request.escalation_webhook_url,
+        )
+        return self.job_repository.decide_control_plane_oncall_change_request(
+            request_id=request_id,
+            status="applied",
+            decision_at=decision_at,
+            decided_by=reviewed_by,
+            decided_by_team=normalized_reviewer_team,
+            decided_by_role=normalized_reviewer_role,
+            decision_note=review_note,
+            applied_schedule_id=applied_schedule.schedule_id,
+        )
+
+    def resolve_active_oncall_route(
+        self,
+        *,
+        reference_timestamp: datetime | None = None,
+    ) -> ControlPlaneOnCallScheduleRecord | None:
+        candidates = self._active_route_candidates(reference_timestamp=reference_timestamp)
+        if not candidates:
+            return None
+        return candidates[0]
+
+    def preview_oncall_route(
+        self,
+        *,
+        reference_timestamp: datetime | None = None,
+    ) -> dict:
+        resolved_timestamp = reference_timestamp or datetime.now(UTC)
+        candidates = self._active_route_candidates(reference_timestamp=resolved_timestamp)
+        return {
+            "reference_timestamp": resolved_timestamp.isoformat(),
+            "resolved_route": candidates[0].to_dict() if candidates else None,
+            "active_candidate_count": len(candidates),
+            "active_candidates": [
+                {
+                    "rank": index + 1,
+                    "selected": index == 0,
+                    "priority": record.priority,
+                    "specificity": self._route_specificity(record)[0],
+                    "window_span_days": self._route_specificity(record)[1],
+                    "reasons": self._route_reasons(record),
+                    "route": record.to_dict(),
+                }
+                for index, record in enumerate(candidates)
+            ],
+        }
 
     def process_follow_ups(self, *, force: bool = False) -> list[ControlPlaneAlertRecord]:
         active_alert = self._active_incident_alert()
@@ -345,7 +632,7 @@ class ControlPlaneAlertService:
     ) -> ControlPlaneAlertRecord:
         payload = dict(record.payload)
         payload["silenced_by"] = [item.to_dict() for item in silences]
-        route = self._active_route()
+        route = self.resolve_active_oncall_route()
         if route is not None:
             payload["route"] = route.to_dict()
         return ControlPlaneAlertRecord(
@@ -367,15 +654,18 @@ class ControlPlaneAlertService:
         *,
         webhook_url_override: str | None = None,
     ) -> ControlPlaneAlertRecord:
-        route = self._active_route()
+        route = self.resolve_active_oncall_route()
         sink_error: str | None = None
         webhook_error: str | None = None
         destinations: list[dict] = []
-        webhook_url = webhook_url_override or (route.escalation_webhook_url if webhook_url_override else None) or route.webhook_url if route else None
         if webhook_url_override is None:
             webhook_url = route.webhook_url if route and route.webhook_url else self.webhook_url
         else:
-            webhook_url = webhook_url_override
+            webhook_url = (
+                route.escalation_webhook_url
+                if route and route.escalation_webhook_url
+                else webhook_url_override
+            )
 
         if webhook_url:
             payload_bytes = json.dumps(record.to_dict(), sort_keys=True).encode("utf-8")
@@ -454,35 +744,42 @@ class ControlPlaneAlertService:
                 delivered.delivery_state = "delivered"
         return delivered
 
-    def _active_route(self) -> ControlPlaneOnCallScheduleRecord | None:
-        for record in self.job_repository.list_control_plane_oncall_schedules():
-            if self._schedule_is_active_now(record):
-                return record
-        return None
-
-    def _schedule_is_active_now(self, record: ControlPlaneOnCallScheduleRecord) -> bool:
+    def _schedule_is_active_now(
+        self,
+        record: ControlPlaneOnCallScheduleRecord,
+        *,
+        reference_timestamp: datetime | None = None,
+    ) -> bool:
         if record.cancelled_at is not None:
             return False
         try:
             zone = ZoneInfo(record.timezone_name)
         except ZoneInfoNotFoundError:
             return False
-        local_now = datetime.now(UTC).astimezone(zone)
-        current_weekday = local_now.weekday()
-        if current_weekday not in record.weekdays:
-            overnight_previous = (current_weekday - 1) % 7
-            if not self._schedule_is_overnight(record):
-                return False
-            if overnight_previous not in record.weekdays:
-                return False
-            return local_now.time() < self._parse_clock(record.end_time)
-
+        local_now = (reference_timestamp or datetime.now(UTC)).astimezone(zone)
         start_clock = self._parse_clock(record.start_time)
         end_clock = self._parse_clock(record.end_time)
         current_clock = local_now.time().replace(second=0, microsecond=0)
+        current_weekday = local_now.weekday()
+        current_date = local_now.date()
         if not self._schedule_is_overnight(record):
+            if current_weekday not in record.weekdays:
+                return False
+            if not self._schedule_covers_date(record, current_date):
+                return False
             return start_clock <= current_clock <= end_clock
-        return current_clock >= start_clock or current_clock < end_clock
+
+        if current_weekday in record.weekdays and self._schedule_covers_date(record, current_date):
+            if current_clock >= start_clock:
+                return True
+
+        previous_date = current_date - timedelta(days=1)
+        previous_weekday = previous_date.weekday()
+        if previous_weekday not in record.weekdays:
+            return False
+        if not self._schedule_covers_date(record, previous_date):
+            return False
+        return current_clock < end_clock
 
     def _schedule_is_overnight(self, record: ControlPlaneOnCallScheduleRecord) -> bool:
         return self._parse_clock(record.end_time) <= self._parse_clock(record.start_time)
@@ -494,6 +791,9 @@ class ControlPlaneAlertService:
         weekdays: list[int],
         start_time: str,
         end_time: str,
+        priority: int,
+        effective_start_date: str | None,
+        effective_end_date: str | None,
     ) -> None:
         try:
             ZoneInfo(timezone_name)
@@ -504,6 +804,12 @@ class ControlPlaneAlertService:
         for weekday in weekdays:
             if weekday < 0 or weekday > 6:
                 raise ValueError("weekdays must contain values from 0 to 6.")
+        if priority < 0:
+            raise ValueError("priority must be greater than or equal to 0.")
+        start_date = self._parse_local_date(effective_start_date) if effective_start_date is not None else None
+        end_date = self._parse_local_date(effective_end_date) if effective_end_date is not None else None
+        if start_date is not None and end_date is not None and end_date < start_date:
+            raise ValueError("effective_end_date must be greater than or equal to effective_start_date.")
         self._parse_clock(start_time)
         self._parse_clock(end_time)
 
@@ -513,3 +819,267 @@ class ControlPlaneAlertService:
         except ValueError as exc:
             raise ValueError("time values must use HH:MM 24-hour format.") from exc
         return parsed.time()
+
+    def _parse_local_date(self, raw_value: str) -> date:
+        try:
+            return date.fromisoformat(raw_value)
+        except ValueError as exc:
+            raise ValueError("date values must use YYYY-MM-DD format.") from exc
+
+    def _schedule_covers_date(self, record: ControlPlaneOnCallScheduleRecord, local_date: date) -> bool:
+        if record.effective_start_date is not None:
+            if local_date < self._parse_local_date(record.effective_start_date):
+                return False
+        if record.effective_end_date is not None:
+            if local_date > self._parse_local_date(record.effective_end_date):
+                return False
+        return True
+
+    def _active_route_candidates(
+        self,
+        *,
+        reference_timestamp: datetime | None = None,
+        environment_name: str | None = None,
+    ) -> list[ControlPlaneOnCallScheduleRecord]:
+        candidates = self._active_route_candidates_for_records(
+            self.job_repository.list_control_plane_oncall_schedules(),
+            reference_timestamp=reference_timestamp,
+            environment_name=environment_name,
+        )
+        return candidates
+
+    def _active_route_candidates_for_records(
+        self,
+        records: list[ControlPlaneOnCallScheduleRecord],
+        *,
+        reference_timestamp: datetime | None = None,
+        environment_name: str | None = None,
+    ) -> list[ControlPlaneOnCallScheduleRecord]:
+        active_environment_name = self._normalize_environment(environment_name)
+        candidates = [
+            record
+            for record in records
+            if record.environment_name == active_environment_name
+            and self._schedule_is_active_now(record, reference_timestamp=reference_timestamp)
+        ]
+        candidates.sort(key=self._route_sort_key)
+        return candidates
+
+    def _route_sort_key(self, record: ControlPlaneOnCallScheduleRecord) -> tuple[float, float, float, float]:
+        specificity_level, window_span_days = self._route_specificity(record)
+        created_at = datetime.fromisoformat(record.created_at).timestamp()
+        return (-float(record.priority), -float(specificity_level), float(window_span_days), -created_at)
+
+    def _route_specificity(self, record: ControlPlaneOnCallScheduleRecord) -> tuple[int, int]:
+        if record.effective_start_date is None and record.effective_end_date is None:
+            return (0, 999_999)
+        if record.effective_start_date is None or record.effective_end_date is None:
+            return (1, 999_998)
+        start_date = self._parse_local_date(record.effective_start_date)
+        end_date = self._parse_local_date(record.effective_end_date)
+        return (2, (end_date - start_date).days)
+
+    def _route_reasons(self, record: ControlPlaneOnCallScheduleRecord) -> list[str]:
+        reasons = [f"priority={record.priority}"]
+        reasons.append(f"environment={record.environment_name}")
+        if record.rotation_name:
+            reasons.append(f"rotation={record.rotation_name}")
+        if record.created_by_team:
+            reasons.append(f"created_by_team={record.created_by_team}")
+        if record.approved_by:
+            reasons.append(f"approved_by={record.approved_by}")
+        if record.approved_by_team:
+            reasons.append(f"approved_by_team={record.approved_by_team}")
+        if record.approved_by_role:
+            reasons.append(f"approved_by_role={record.approved_by_role}")
+        if record.effective_start_date or record.effective_end_date:
+            reasons.append(
+                f"date_window={record.effective_start_date or '*'}..{record.effective_end_date or '*'}"
+            )
+        else:
+            reasons.append("date_window=unbounded")
+        reasons.append(f"clock_window={record.start_time}-{record.end_time}")
+        reasons.append(f"timezone={record.timezone_name}")
+        return reasons
+
+    def _schedule_requires_approval(self, proposed_record: ControlPlaneOnCallScheduleRecord) -> bool:
+        schedules = [
+            record
+            for record in self.job_repository.list_control_plane_oncall_schedules()
+            if record.cancelled_at is None and record.environment_name == proposed_record.environment_name
+        ]
+        schedules.append(proposed_record)
+        lookahead_end = datetime.now(UTC) + timedelta(days=14)
+        cursor = datetime.now(UTC).replace(second=0, microsecond=0)
+        step = timedelta(minutes=15)
+        while cursor <= lookahead_end:
+            active_records = self._active_route_candidates_for_records(
+                schedules,
+                reference_timestamp=cursor,
+                environment_name=proposed_record.environment_name,
+            )
+            proposed_group = [
+                record
+                for record in active_records
+                if self._ambiguity_key(record) == self._ambiguity_key(proposed_record)
+            ]
+            if len(proposed_group) >= 2 and any(record.schedule_id == proposed_record.schedule_id for record in proposed_group):
+                return True
+            cursor += step
+        return False
+
+    def _ambiguity_key(self, record: ControlPlaneOnCallScheduleRecord) -> tuple[int, int, int]:
+        specificity, window_span_days = self._route_specificity(record)
+        return (record.priority, specificity, window_span_days)
+
+    def _build_oncall_schedule_record(
+        self,
+        *,
+        created_by: str,
+        created_by_team: str | None,
+        created_by_role: str | None,
+        environment_name: str | None,
+        team_name: str,
+        timezone_name: str,
+        change_reason: str | None,
+        approved_by: str | None,
+        approved_by_team: str | None,
+        approved_by_role: str | None,
+        approval_note: str | None,
+        weekdays: list[int],
+        start_time: str,
+        end_time: str,
+        priority: int,
+        rotation_name: str | None,
+        effective_start_date: str | None,
+        effective_end_date: str | None,
+        webhook_url: str | None,
+        escalation_webhook_url: str | None,
+    ) -> ControlPlaneOnCallScheduleRecord:
+        self._validate_schedule_inputs(
+            timezone_name=timezone_name,
+            weekdays=weekdays,
+            start_time=start_time,
+            end_time=end_time,
+            priority=priority,
+            effective_start_date=effective_start_date,
+            effective_end_date=effective_end_date,
+        )
+        if approval_note is not None and approved_by is None:
+            raise ValueError("approval_note requires approved_by.")
+        if approved_by_role is not None and approved_by is None:
+            raise ValueError("approved_by_role requires approved_by.")
+        if approved_by_team is not None and approved_by is None:
+            raise ValueError("approved_by_team requires approved_by.")
+        return ControlPlaneOnCallScheduleRecord(
+            schedule_id=uuid4().hex[:16],
+            created_at=_utc_now(),
+            created_by=created_by,
+            environment_name=self._normalize_environment(environment_name),
+            created_by_team=self._normalize_team(created_by_team),
+            created_by_role=created_by_role,
+            change_reason=change_reason,
+            approved_by=approved_by,
+            approved_by_team=self._normalize_team(approved_by_team),
+            approved_by_role=self._normalize_role(approved_by_role),
+            approved_at=_utc_now() if approved_by is not None else None,
+            approval_note=approval_note,
+            team_name=team_name,
+            timezone_name=timezone_name,
+            weekdays=weekdays,
+            start_time=start_time,
+            end_time=end_time,
+            priority=priority,
+            rotation_name=rotation_name,
+            effective_start_date=effective_start_date,
+            effective_end_date=effective_end_date,
+            webhook_url=webhook_url,
+            escalation_webhook_url=escalation_webhook_url,
+        )
+
+    def _validate_schedule_approval_requirements(
+        self,
+        *,
+        proposed_record: ControlPlaneOnCallScheduleRecord,
+        effective_policy,
+    ) -> None:
+        if not self._schedule_requires_approval(proposed_record):
+            return
+        if (
+            proposed_record.approved_by is None
+            or proposed_record.change_reason is None
+            or proposed_record.approved_by_role is None
+        ):
+            raise ValueError(
+                "Ambiguous on-call overlaps require change_reason, approved_by, and approved_by_role."
+            )
+        required_roles = effective_policy.required_approver_roles or self.required_approver_roles
+        if proposed_record.approved_by_role not in required_roles:
+            raise ValueError(
+                f"approved_by_role must be one of: {', '.join(required_roles)}."
+            )
+        if (
+            effective_policy.allowed_approver_ids
+            and proposed_record.approved_by not in effective_policy.allowed_approver_ids
+        ):
+            raise ValueError(
+                f"approved_by must be one of: {', '.join(effective_policy.allowed_approver_ids)}."
+            )
+        allow_self_approval = (
+            self.allow_self_approval
+            if effective_policy.allow_self_approval is None
+            else effective_policy.allow_self_approval
+        )
+        if not allow_self_approval and proposed_record.approved_by == proposed_record.created_by:
+            raise ValueError("Self-approval is not allowed for ambiguous on-call overlaps.")
+
+    def _normalize_role(self, raw_value: str | None) -> str | None:
+        if raw_value is None:
+            return None
+        normalized = raw_value.strip().lower()
+        return normalized or None
+
+    def _normalize_team(self, raw_value: str | None) -> str | None:
+        if raw_value is None:
+            return None
+        normalized = raw_value.strip().lower()
+        return normalized or None
+
+    def _normalize_environment(self, raw_value: str | None) -> str:
+        if raw_value is None:
+            return self.default_environment_name
+        normalized = raw_value.strip().lower()
+        return normalized or self.default_environment_name
+
+    def _effective_governance_policy(self, record: ControlPlaneOnCallScheduleRecord):
+        bundle = load_oncall_policy_bundle(self.policy_path)
+        return bundle.resolve(
+            environment_name=record.environment_name,
+            team_name=record.team_name,
+            rotation_name=record.rotation_name,
+        )
+
+    def _validate_policy_boundaries(self, record: ControlPlaneOnCallScheduleRecord, effective_policy) -> None:
+        if effective_policy.owner_team and record.created_by_team is None:
+            raise ValueError("created_by_team is required by the on-call governance policy.")
+        if effective_policy.allowed_requester_teams:
+            if record.created_by_team not in effective_policy.allowed_requester_teams:
+                raise ValueError(
+                    "created_by_team is not allowed by the on-call governance policy."
+                )
+        elif effective_policy.owner_team and record.created_by_team is not None:
+            if record.created_by_team != effective_policy.owner_team:
+                raise ValueError(
+                    "created_by_team does not match the owner_team required by the on-call governance policy."
+                )
+        if record.approved_by is not None:
+            if effective_policy.allowed_approver_teams:
+                if record.approved_by_team not in effective_policy.allowed_approver_teams:
+                    raise ValueError(
+                        "approved_by_team is not allowed by the on-call governance policy."
+                    )
+            elif effective_policy.owner_team and record.approved_by_team is not None:
+                if record.approved_by_team != effective_policy.owner_team:
+                    raise ValueError(
+                        "approved_by_team does not match the owner_team required by the on-call governance policy."
+                    )

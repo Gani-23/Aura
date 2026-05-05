@@ -10,6 +10,7 @@ class WorkspaceSettings:
     root_dir: Path
     data_dir: Path
     database_path: Path
+    environment_name: str
     api_key: str | None
     run_embedded_worker: bool
     worker_heartbeat_timeout_seconds: float
@@ -25,6 +26,11 @@ class WorkspaceSettings:
     analytics_job_failure_rate_warning_threshold: float
     analytics_job_failure_rate_critical_threshold: float
     analytics_job_failure_rate_min_samples: int
+    analytics_oncall_conflict_warning_threshold: int
+    analytics_oncall_conflict_critical_threshold: int
+    oncall_policy_path: Path
+    oncall_approval_required_roles: tuple[str, ...]
+    oncall_allow_self_approval: bool
     control_plane_alerts_enabled: bool
     control_plane_alert_window_days: int
     control_plane_alert_interval_seconds: float
@@ -48,6 +54,7 @@ def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceS
         root_dir=root,
         data_dir=data_dir,
         database_path=data_dir / "control_plane.db",
+        environment_name=os.environ.get("LSA_ENVIRONMENT_NAME", "default").strip().lower() or "default",
         api_key=os.environ.get("LSA_API_KEY"),
         run_embedded_worker=_env_flag("LSA_RUN_EMBEDDED_WORKER", default=False),
         worker_heartbeat_timeout_seconds=_env_float("LSA_WORKER_HEARTBEAT_TIMEOUT_SECONDS", default=5.0),
@@ -69,6 +76,22 @@ def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceS
             default=0.25,
         ),
         analytics_job_failure_rate_min_samples=_env_int("LSA_ANALYTICS_JOB_FAILURE_RATE_MIN_SAMPLES", default=3),
+        analytics_oncall_conflict_warning_threshold=_env_int(
+            "LSA_ANALYTICS_ONCALL_CONFLICT_WARNING_THRESHOLD",
+            default=1,
+        ),
+        analytics_oncall_conflict_critical_threshold=_env_int(
+            "LSA_ANALYTICS_ONCALL_CONFLICT_CRITICAL_THRESHOLD",
+            default=3,
+        ),
+        oncall_policy_path=Path(
+            os.environ.get("LSA_ONCALL_POLICY_PATH", str(data_dir / "oncall_policy.json"))
+        ),
+        oncall_approval_required_roles=_env_csv(
+            "LSA_ONCALL_APPROVAL_REQUIRED_ROLES",
+            default=("manager", "director", "admin"),
+        ),
+        oncall_allow_self_approval=_env_flag("LSA_ONCALL_ALLOW_SELF_APPROVAL", default=False),
         control_plane_alerts_enabled=_env_flag("LSA_CONTROL_PLANE_ALERTS_ENABLED", default=True),
         control_plane_alert_window_days=_env_int("LSA_CONTROL_PLANE_ALERT_WINDOW_DAYS", default=7),
         control_plane_alert_interval_seconds=_env_float("LSA_CONTROL_PLANE_ALERT_INTERVAL_SECONDS", default=60.0),
@@ -120,3 +143,11 @@ def _env_int(name: str, *, default: int) -> int:
         return int(raw_value)
     except ValueError:
         return default
+
+
+def _env_csv(name: str, *, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    values = tuple(item.strip().lower() for item in raw_value.split(",") if item.strip())
+    return values or default

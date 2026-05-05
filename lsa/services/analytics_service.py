@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from lsa.storage.files import JobRepository
+from lsa.storage.models import ControlPlaneOnCallScheduleRecord
 
 
 def _utc_now() -> datetime:
@@ -158,6 +160,46 @@ class JobAnalyticsSummary:
 
 
 @dataclass(slots=True)
+class OnCallConflictSummary:
+    schedule_ids: list[str]
+    team_names: list[str]
+    rotation_names: list[str]
+    sample_timestamp: str
+    priority: int
+    specificity: int
+    window_span_days: int
+    occurrence_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "schedule_ids": list(self.schedule_ids),
+            "team_names": list(self.team_names),
+            "rotation_names": list(self.rotation_names),
+            "sample_timestamp": self.sample_timestamp,
+            "priority": self.priority,
+            "specificity": self.specificity,
+            "window_span_days": self.window_span_days,
+            "occurrence_count": self.occurrence_count,
+        }
+
+
+@dataclass(slots=True)
+class OnCallAnalyticsSummary:
+    total_schedules: int
+    active_schedules: int
+    conflict_count: int
+    conflicts: list[OnCallConflictSummary] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "total_schedules": self.total_schedules,
+            "active_schedules": self.active_schedules,
+            "conflict_count": self.conflict_count,
+            "conflicts": [item.to_dict() for item in self.conflicts],
+        }
+
+
+@dataclass(slots=True)
 class ControlPlaneAlertThresholds:
     queue_warning_threshold: int = 5
     queue_critical_threshold: int = 20
@@ -168,6 +210,8 @@ class ControlPlaneAlertThresholds:
     job_failure_rate_warning_threshold: float = 0.1
     job_failure_rate_critical_threshold: float = 0.25
     job_failure_rate_min_samples: int = 3
+    oncall_conflict_warning_threshold: int = 1
+    oncall_conflict_critical_threshold: int = 3
 
     def to_dict(self) -> dict:
         return {
@@ -180,6 +224,8 @@ class ControlPlaneAlertThresholds:
             "job_failure_rate_warning_threshold": self.job_failure_rate_warning_threshold,
             "job_failure_rate_critical_threshold": self.job_failure_rate_critical_threshold,
             "job_failure_rate_min_samples": self.job_failure_rate_min_samples,
+            "oncall_conflict_warning_threshold": self.oncall_conflict_warning_threshold,
+            "oncall_conflict_critical_threshold": self.oncall_conflict_critical_threshold,
         }
 
 
@@ -229,6 +275,7 @@ class ControlPlaneAnalyticsReport:
     workers: WorkerAnalyticsSummary
     leases: LeaseAnalyticsSummary
     jobs: JobAnalyticsSummary
+    oncall: OnCallAnalyticsSummary
     evaluation: ControlPlaneEvaluation
 
     def to_dict(self) -> dict:
@@ -241,6 +288,7 @@ class ControlPlaneAnalyticsReport:
             "workers": self.workers.to_dict(),
             "leases": self.leases.to_dict(),
             "jobs": self.jobs.to_dict(),
+            "oncall": self.oncall.to_dict(),
             "evaluation": self.evaluation.to_dict(),
         }
 
@@ -293,12 +341,14 @@ class AnalyticsService:
             day_buckets=day_buckets,
             day_bucket_set=day_bucket_set,
         )
+        oncall_summary = self._build_oncall_summary(now=now)
         effective_thresholds = thresholds or self.default_thresholds
         evaluation = self._build_evaluation(
             queue=queue,
             workers=worker_summary,
             leases=lease_summary,
             jobs=job_summary,
+            oncall=oncall_summary,
             thresholds=effective_thresholds,
         )
 
@@ -311,6 +361,7 @@ class AnalyticsService:
             workers=worker_summary,
             leases=lease_summary,
             jobs=job_summary,
+            oncall=oncall_summary,
             evaluation=evaluation,
         )
 
@@ -546,6 +597,64 @@ class AnalyticsService:
             days=days,
         )
 
+    def _build_oncall_summary(self, *, now: datetime) -> OnCallAnalyticsSummary:
+        schedules = [
+            record
+            for record in self.job_repository.list_control_plane_oncall_schedules()
+            if record.cancelled_at is None
+        ]
+        active_schedules = [
+            record
+            for record in schedules
+            if self._schedule_is_active_at(record, now)
+        ]
+
+        lookahead_end = now + timedelta(days=14)
+        step = timedelta(minutes=15)
+        conflicts_by_group: dict[tuple[str, ...], OnCallConflictSummary] = {}
+        cursor = now.replace(second=0, microsecond=0)
+        while cursor <= lookahead_end:
+            active_at_cursor = [
+                record
+                for record in schedules
+                if self._schedule_is_active_at(record, cursor)
+            ]
+            ambiguous_groups: dict[tuple[int, int, int], list[ControlPlaneOnCallScheduleRecord]] = defaultdict(list)
+            for record in active_at_cursor:
+                ambiguous_groups[self._ambiguity_key(record)].append(record)
+            for group in ambiguous_groups.values():
+                if len(group) < 2:
+                    continue
+                schedule_ids = tuple(sorted(record.schedule_id for record in group))
+                if schedule_ids not in conflicts_by_group:
+                    ordered_group = sorted(group, key=lambda item: item.created_at, reverse=True)
+                    representative = ordered_group[0]
+                    specificity, window_span_days = self._route_specificity(representative)
+                    conflicts_by_group[schedule_ids] = OnCallConflictSummary(
+                        schedule_ids=list(schedule_ids),
+                        team_names=[record.team_name for record in ordered_group],
+                        rotation_names=[record.rotation_name for record in ordered_group if record.rotation_name],
+                        sample_timestamp=cursor.isoformat(),
+                        priority=representative.priority,
+                        specificity=specificity,
+                        window_span_days=window_span_days,
+                        occurrence_count=0,
+                    )
+                conflicts_by_group[schedule_ids].occurrence_count += 1
+            cursor += step
+
+        conflicts = sorted(
+            conflicts_by_group.values(),
+            key=lambda item: (-item.priority, -item.specificity, item.window_span_days, item.sample_timestamp),
+        )
+
+        return OnCallAnalyticsSummary(
+            total_schedules=len(schedules),
+            active_schedules=len(active_schedules),
+            conflict_count=len(conflicts),
+            conflicts=conflicts,
+        )
+
     def _build_evaluation(
         self,
         *,
@@ -553,6 +662,7 @@ class AnalyticsService:
         workers: WorkerAnalyticsSummary,
         leases: LeaseAnalyticsSummary,
         jobs: JobAnalyticsSummary,
+        oncall: OnCallAnalyticsSummary,
         thresholds: ControlPlaneAlertThresholds,
     ) -> ControlPlaneEvaluation:
         findings: list[ControlPlaneFinding] = []
@@ -620,6 +730,21 @@ class AnalyticsService:
                 )
             )
 
+        if oncall.conflict_count > 0:
+            sample_conflicts = [item.to_dict() for item in oncall.conflicts[:3]]
+            findings.extend(
+                self._threshold_findings(
+                    observed_value=oncall.conflict_count,
+                    warning_threshold=thresholds.oncall_conflict_warning_threshold,
+                    critical_threshold=thresholds.oncall_conflict_critical_threshold,
+                    code="oncall_route_conflicts",
+                    metric="oncall.conflict_count",
+                    warning_summary="Ambiguous on-call route overlaps were detected in upcoming schedule coverage.",
+                    critical_summary="Too many ambiguous on-call route overlaps were detected in upcoming schedule coverage.",
+                    context={"sample_conflicts": sample_conflicts},
+                )
+            )
+
         status = "healthy"
         if any(item.severity == "critical" for item in findings):
             status = "critical"
@@ -660,3 +785,64 @@ class AnalyticsService:
                 context={} if context is None else dict(context),
             )
         ]
+
+    def _schedule_is_active_at(self, record: ControlPlaneOnCallScheduleRecord, reference_timestamp: datetime) -> bool:
+        try:
+            zone = ZoneInfo(record.timezone_name)
+        except ZoneInfoNotFoundError:
+            return False
+        local_now = reference_timestamp.astimezone(zone)
+        start_clock = self._parse_clock(record.start_time)
+        end_clock = self._parse_clock(record.end_time)
+        current_clock = local_now.time().replace(second=0, microsecond=0)
+        current_weekday = local_now.weekday()
+        current_date = local_now.date()
+        if not self._schedule_is_overnight(record):
+            if current_weekday not in record.weekdays:
+                return False
+            if not self._schedule_covers_date(record, current_date):
+                return False
+            return start_clock <= current_clock <= end_clock
+
+        if current_weekday in record.weekdays and self._schedule_covers_date(record, current_date):
+            if current_clock >= start_clock:
+                return True
+
+        previous_date = current_date - timedelta(days=1)
+        previous_weekday = previous_date.weekday()
+        if previous_weekday not in record.weekdays:
+            return False
+        if not self._schedule_covers_date(record, previous_date):
+            return False
+        return current_clock < end_clock
+
+    def _schedule_is_overnight(self, record: ControlPlaneOnCallScheduleRecord) -> bool:
+        return self._parse_clock(record.end_time) <= self._parse_clock(record.start_time)
+
+    def _parse_clock(self, raw_value: str) -> time:
+        return datetime.strptime(raw_value, "%H:%M").time()
+
+    def _parse_local_date(self, raw_value: str) -> date:
+        return date.fromisoformat(raw_value)
+
+    def _schedule_covers_date(self, record: ControlPlaneOnCallScheduleRecord, local_date: date) -> bool:
+        if record.effective_start_date is not None:
+            if local_date < self._parse_local_date(record.effective_start_date):
+                return False
+        if record.effective_end_date is not None:
+            if local_date > self._parse_local_date(record.effective_end_date):
+                return False
+        return True
+
+    def _route_specificity(self, record: ControlPlaneOnCallScheduleRecord) -> tuple[int, int]:
+        if record.effective_start_date is None and record.effective_end_date is None:
+            return (0, 999_999)
+        if record.effective_start_date is None or record.effective_end_date is None:
+            return (1, 999_998)
+        start_date = self._parse_local_date(record.effective_start_date)
+        end_date = self._parse_local_date(record.effective_end_date)
+        return (2, (end_date - start_date).days)
+
+    def _ambiguity_key(self, record: ControlPlaneOnCallScheduleRecord) -> tuple[int, int, int]:
+        specificity, window_span_days = self._route_specificity(record)
+        return (record.priority, specificity, window_span_days)

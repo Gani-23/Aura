@@ -270,6 +270,7 @@ class CliFlowTests(unittest.TestCase):
     def test_control_plane_analytics_reports_queue_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.settings.environment_name = "prod"
             cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
             cli_main.analytics_service = AnalyticsService(
                 job_repository=cli_main.job_repository,
@@ -363,6 +364,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["queue"]["running_jobs"], 1)
             self.assertEqual(payload["workers"]["active_workers"], 1)
             self.assertGreaterEqual(payload["leases"]["claimed_count"], 1)
+            self.assertIn("oncall", payload)
             self.assertEqual(len(payload["workers"]["days"]), 7)
             self.assertEqual(payload["evaluation"]["status"], "healthy")
             self.assertEqual(payload["evaluation"]["findings"], [])
@@ -370,6 +372,7 @@ class CliFlowTests(unittest.TestCase):
     def test_emit_control_plane_alerts_persists_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.settings.environment_name = "prod"
             cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
             cli_main.analytics_service = AnalyticsService(
                 job_repository=cli_main.job_repository,
@@ -389,6 +392,7 @@ class CliFlowTests(unittest.TestCase):
             cli_main.control_plane_alert_service = ControlPlaneAlertService(
                 job_repository=cli_main.job_repository,
                 analytics_service=cli_main.analytics_service,
+                default_environment_name=cli_main.settings.environment_name,
                 window_days=7,
                 dedup_window_seconds=3600,
                 sink_path=str(cli_main.settings.control_plane_alert_sink_path),
@@ -486,15 +490,28 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(cancelled["cancelled_by"], "operator-cli")
 
             schedule_sink = StringIO()
+            today = datetime.now(UTC).date().isoformat()
             with redirect_stdout(schedule_sink):
                 self.assertEqual(
                     cli_main.run_create_control_plane_oncall_schedule(
                         created_by="operator-cli",
+                        environment_name="prod",
+                        created_by_team=None,
+                        created_by_role=None,
+                        change_reason=None,
+                        approved_by=None,
+                        approved_by_team=None,
+                        approved_by_role=None,
+                        approval_note=None,
                         team_name="platform-cli",
                         timezone_name="UTC",
                         weekdays=[0, 1, 2, 3, 4, 5, 6],
                         start_time="00:00",
                         end_time="23:59",
+                        priority=200,
+                        rotation_name="holiday",
+                        effective_start_date=today,
+                        effective_end_date=today,
                         webhook_url=None,
                         escalation_webhook_url=None,
                     ),
@@ -502,12 +519,80 @@ class CliFlowTests(unittest.TestCase):
                 )
             schedule = json.loads(schedule_sink.getvalue())
             self.assertEqual(schedule["team_name"], "platform-cli")
+            self.assertEqual(schedule["environment_name"], "prod")
+            self.assertEqual(schedule["priority"], 200)
 
             schedules_sink = StringIO()
             with redirect_stdout(schedules_sink):
                 self.assertEqual(cli_main.run_list_control_plane_oncall_schedules(active_only=True), 0)
             schedules = json.loads(schedules_sink.getvalue())
             self.assertGreaterEqual(len(schedules), 1)
+
+            preview_sink = StringIO()
+            with redirect_stdout(preview_sink):
+                self.assertEqual(
+                    cli_main.run_resolve_control_plane_oncall_route(
+                        at=f"{today}T12:00:00+00:00",
+                    ),
+                    0,
+                )
+            preview = json.loads(preview_sink.getvalue())
+            self.assertEqual(preview["resolved_route"]["team_name"], "platform-cli")
+            self.assertGreaterEqual(preview["active_candidate_count"], 1)
+
+            change_request_sink = StringIO()
+            with redirect_stdout(change_request_sink):
+                self.assertEqual(
+                    cli_main.run_submit_control_plane_oncall_change_request(
+                        created_by="operator-cli-2",
+                        environment_name="prod",
+                        created_by_team=None,
+                        created_by_role="engineer",
+                        change_reason="Need overlapping holiday backup coverage.",
+                        team_name="platform-cli-review",
+                        timezone_name="UTC",
+                        weekdays=[0, 1, 2, 3, 4, 5, 6],
+                        start_time="00:00",
+                        end_time="23:59",
+                        priority=200,
+                        rotation_name="holiday-review",
+                        effective_start_date=today,
+                        effective_end_date=today,
+                        webhook_url=None,
+                        escalation_webhook_url=None,
+                    ),
+                    0,
+                )
+            change_request = json.loads(change_request_sink.getvalue())
+            self.assertEqual(change_request["environment_name"], "prod")
+            self.assertEqual(change_request["status"], "pending_review")
+            self.assertTrue(change_request["review_required"])
+
+            change_requests_sink = StringIO()
+            with redirect_stdout(change_requests_sink):
+                self.assertEqual(
+                    cli_main.run_list_control_plane_oncall_change_requests(status="pending_review"),
+                    0,
+                )
+            listed_requests = json.loads(change_requests_sink.getvalue())
+            self.assertGreaterEqual(len(listed_requests), 1)
+
+            reviewed_request_sink = StringIO()
+            with redirect_stdout(reviewed_request_sink):
+                self.assertEqual(
+                    cli_main.run_review_control_plane_oncall_change_request(
+                        request_id=change_request["request_id"],
+                        decision="approve",
+                        reviewed_by="director-cli",
+                        reviewed_by_team=None,
+                        reviewed_by_role="director",
+                        review_note="Approved in CLI workflow.",
+                    ),
+                    0,
+                )
+            reviewed_request = json.loads(reviewed_request_sink.getvalue())
+            self.assertEqual(reviewed_request["status"], "applied")
+            self.assertIsNotNone(reviewed_request["applied_schedule_id"])
 
             cancel_schedule_sink = StringIO()
             with redirect_stdout(cancel_schedule_sink):

@@ -31,6 +31,7 @@ class SnapshotRecordPayload(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    environment_name: str
     auth_enabled: bool
     worker_mode: str
     database_path: str
@@ -295,11 +296,24 @@ class ControlPlaneOnCallSchedulePayload(BaseModel):
     schedule_id: str
     created_at: str
     created_by: str
+    environment_name: str = "default"
+    created_by_team: str | None = None
+    created_by_role: str | None = None
+    change_reason: str | None = None
+    approved_by: str | None = None
+    approved_by_team: str | None = None
+    approved_by_role: str | None = None
+    approved_at: str | None = None
+    approval_note: str | None = None
     team_name: str
     timezone_name: str
     weekdays: list[int]
     start_time: str
     end_time: str
+    priority: int = 100
+    rotation_name: str | None = None
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
     cancelled_at: str | None = None
@@ -308,17 +322,103 @@ class ControlPlaneOnCallSchedulePayload(BaseModel):
 
 class CreateControlPlaneOnCallScheduleRequest(BaseModel):
     created_by: str
+    environment_name: str | None = None
+    created_by_team: str | None = None
+    created_by_role: str | None = None
+    change_reason: str | None = None
+    approved_by: str | None = None
+    approved_by_team: str | None = None
+    approved_by_role: str | None = None
+    approval_note: str | None = None
     team_name: str
     timezone_name: str
     weekdays: list[int]
     start_time: str
     end_time: str
+    priority: int = Field(default=100, ge=0)
+    rotation_name: str | None = None
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
 
 
 class CancelControlPlaneOnCallScheduleRequest(BaseModel):
     cancelled_by: str
+
+
+class ControlPlaneOnCallChangeRequestPayload(BaseModel):
+    request_id: str
+    created_at: str
+    created_by: str
+    environment_name: str = "default"
+    created_by_team: str | None = None
+    created_by_role: str | None = None
+    change_reason: str | None = None
+    status: str
+    review_required: bool
+    review_reasons: list[str]
+    team_name: str
+    timezone_name: str
+    weekdays: list[int]
+    start_time: str
+    end_time: str
+    priority: int = 100
+    rotation_name: str | None = None
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
+    webhook_url: str | None = None
+    escalation_webhook_url: str | None = None
+    decision_at: str | None = None
+    decided_by: str | None = None
+    decided_by_team: str | None = None
+    decided_by_role: str | None = None
+    decision_note: str | None = None
+    applied_schedule_id: str | None = None
+
+
+class CreateControlPlaneOnCallChangeRequest(BaseModel):
+    created_by: str
+    environment_name: str | None = None
+    created_by_team: str | None = None
+    created_by_role: str | None = None
+    change_reason: str
+    team_name: str
+    timezone_name: str
+    weekdays: list[int]
+    start_time: str
+    end_time: str
+    priority: int = Field(default=100, ge=0)
+    rotation_name: str | None = None
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
+    webhook_url: str | None = None
+    escalation_webhook_url: str | None = None
+
+
+class ReviewControlPlaneOnCallChangeRequest(BaseModel):
+    decision: str
+    reviewed_by: str
+    reviewed_by_team: str | None = None
+    reviewed_by_role: str | None = None
+    review_note: str | None = None
+
+
+class ControlPlaneOnCallRouteCandidatePayload(BaseModel):
+    rank: int
+    selected: bool
+    priority: int
+    specificity: int
+    window_span_days: int
+    reasons: list[str]
+    route: ControlPlaneOnCallSchedulePayload
+
+
+class ControlPlaneOnCallRouteResolutionPayload(BaseModel):
+    reference_timestamp: str
+    resolved_route: ControlPlaneOnCallSchedulePayload | None = None
+    active_candidate_count: int
+    active_candidates: list[ControlPlaneOnCallRouteCandidatePayload]
 
 
 class WorkerHeartbeatRollupPayload(BaseModel):
@@ -401,6 +501,24 @@ class JobAnalyticsPayload(BaseModel):
     days: list[JobDailyAnalyticsPayload]
 
 
+class OnCallConflictPayload(BaseModel):
+    schedule_ids: list[str]
+    team_names: list[str]
+    rotation_names: list[str]
+    sample_timestamp: str
+    priority: int
+    specificity: int
+    window_span_days: int
+    occurrence_count: int
+
+
+class OnCallAnalyticsPayload(BaseModel):
+    total_schedules: int
+    active_schedules: int
+    conflict_count: int
+    conflicts: list[OnCallConflictPayload]
+
+
 class ControlPlaneAlertThresholdsPayload(BaseModel):
     queue_warning_threshold: int
     queue_critical_threshold: int
@@ -411,6 +529,8 @@ class ControlPlaneAlertThresholdsPayload(BaseModel):
     job_failure_rate_warning_threshold: float
     job_failure_rate_critical_threshold: float
     job_failure_rate_min_samples: int
+    oncall_conflict_warning_threshold: int
+    oncall_conflict_critical_threshold: int
 
 
 class ControlPlaneFindingPayload(BaseModel):
@@ -438,4 +558,5 @@ class ControlPlaneAnalyticsResponse(BaseModel):
     workers: WorkerAnalyticsPayload
     leases: LeaseAnalyticsPayload
     jobs: JobAnalyticsPayload
+    oncall: OnCallAnalyticsPayload
     evaluation: ControlPlaneEvaluationPayload

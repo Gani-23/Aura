@@ -357,9 +357,22 @@ class ControlPlaneOnCallScheduleRecord:
     created_by: str
     team_name: str
     timezone_name: str
+    environment_name: str = "default"
+    created_by_team: str | None = None
+    created_by_role: str | None = None
+    change_reason: str | None = None
+    approved_by: str | None = None
+    approved_by_team: str | None = None
+    approved_by_role: str | None = None
+    approved_at: str | None = None
+    approval_note: str | None = None
     weekdays: list[int] = field(default_factory=list)
     start_time: str = "00:00"
     end_time: str = "23:59"
+    priority: int = 100
+    rotation_name: str | None = None
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
     cancelled_at: str | None = None
@@ -370,11 +383,24 @@ class ControlPlaneOnCallScheduleRecord:
             "schedule_id": self.schedule_id,
             "created_at": self.created_at,
             "created_by": self.created_by,
+            "created_by_team": self.created_by_team,
+            "created_by_role": self.created_by_role,
+            "change_reason": self.change_reason,
+            "approved_by": self.approved_by,
+            "approved_by_team": self.approved_by_team,
+            "approved_by_role": self.approved_by_role,
+            "approved_at": self.approved_at,
+            "approval_note": self.approval_note,
             "team_name": self.team_name,
             "timezone_name": self.timezone_name,
+            "environment_name": self.environment_name,
             "weekdays": list(self.weekdays),
             "start_time": self.start_time,
             "end_time": self.end_time,
+            "priority": self.priority,
+            "rotation_name": self.rotation_name,
+            "effective_start_date": self.effective_start_date,
+            "effective_end_date": self.effective_end_date,
             "webhook_url": self.webhook_url,
             "escalation_webhook_url": self.escalation_webhook_url,
             "cancelled_at": self.cancelled_at,
@@ -387,13 +413,120 @@ class ControlPlaneOnCallScheduleRecord:
             schedule_id=payload["schedule_id"],
             created_at=payload["created_at"],
             created_by=payload["created_by"],
+            created_by_team=payload.get("created_by_team"),
+            created_by_role=payload.get("created_by_role"),
+            change_reason=payload.get("change_reason"),
+            approved_by=payload.get("approved_by"),
+            approved_by_team=payload.get("approved_by_team"),
+            approved_by_role=payload.get("approved_by_role"),
+            approved_at=payload.get("approved_at"),
+            approval_note=payload.get("approval_note"),
             team_name=payload["team_name"],
             timezone_name=payload["timezone_name"],
+            environment_name=payload.get("environment_name", "default"),
             weekdays=list(payload.get("weekdays", [])),
             start_time=payload.get("start_time", "00:00"),
             end_time=payload.get("end_time", "23:59"),
+            priority=int(payload.get("priority", 100)),
+            rotation_name=payload.get("rotation_name"),
+            effective_start_date=payload.get("effective_start_date"),
+            effective_end_date=payload.get("effective_end_date"),
             webhook_url=payload.get("webhook_url"),
             escalation_webhook_url=payload.get("escalation_webhook_url"),
             cancelled_at=payload.get("cancelled_at"),
             cancelled_by=payload.get("cancelled_by"),
+        )
+
+
+@dataclass(slots=True)
+class ControlPlaneOnCallChangeRequestRecord:
+    request_id: str
+    created_at: str
+    created_by: str
+    team_name: str
+    timezone_name: str
+    status: str
+    environment_name: str = "default"
+    created_by_team: str | None = None
+    created_by_role: str | None = None
+    change_reason: str | None = None
+    review_required: bool = False
+    review_reasons: list[str] = field(default_factory=list)
+    weekdays: list[int] = field(default_factory=list)
+    start_time: str = "00:00"
+    end_time: str = "23:59"
+    priority: int = 100
+    rotation_name: str | None = None
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
+    webhook_url: str | None = None
+    escalation_webhook_url: str | None = None
+    decision_at: str | None = None
+    decided_by: str | None = None
+    decided_by_team: str | None = None
+    decided_by_role: str | None = None
+    decision_note: str | None = None
+    applied_schedule_id: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "created_at": self.created_at,
+            "created_by": self.created_by,
+            "created_by_team": self.created_by_team,
+            "created_by_role": self.created_by_role,
+            "change_reason": self.change_reason,
+            "status": self.status,
+            "review_required": self.review_required,
+            "review_reasons": list(self.review_reasons),
+            "team_name": self.team_name,
+            "timezone_name": self.timezone_name,
+            "environment_name": self.environment_name,
+            "weekdays": list(self.weekdays),
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "priority": self.priority,
+            "rotation_name": self.rotation_name,
+            "effective_start_date": self.effective_start_date,
+            "effective_end_date": self.effective_end_date,
+            "webhook_url": self.webhook_url,
+            "escalation_webhook_url": self.escalation_webhook_url,
+            "decision_at": self.decision_at,
+            "decided_by": self.decided_by,
+            "decided_by_team": self.decided_by_team,
+            "decided_by_role": self.decided_by_role,
+            "decision_note": self.decision_note,
+            "applied_schedule_id": self.applied_schedule_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ControlPlaneOnCallChangeRequestRecord":
+        return cls(
+            request_id=payload["request_id"],
+            created_at=payload["created_at"],
+            created_by=payload["created_by"],
+            created_by_team=payload.get("created_by_team"),
+            created_by_role=payload.get("created_by_role"),
+            change_reason=payload.get("change_reason"),
+            status=payload["status"],
+            review_required=bool(payload.get("review_required", False)),
+            review_reasons=list(payload.get("review_reasons", [])),
+            team_name=payload["team_name"],
+            timezone_name=payload["timezone_name"],
+            environment_name=payload.get("environment_name", "default"),
+            weekdays=list(payload.get("weekdays", [])),
+            start_time=payload.get("start_time", "00:00"),
+            end_time=payload.get("end_time", "23:59"),
+            priority=int(payload.get("priority", 100)),
+            rotation_name=payload.get("rotation_name"),
+            effective_start_date=payload.get("effective_start_date"),
+            effective_end_date=payload.get("effective_end_date"),
+            webhook_url=payload.get("webhook_url"),
+            escalation_webhook_url=payload.get("escalation_webhook_url"),
+            decision_at=payload.get("decision_at"),
+            decided_by=payload.get("decided_by"),
+            decided_by_team=payload.get("decided_by_team"),
+            decided_by_role=payload.get("decided_by_role"),
+            decision_note=payload.get("decision_note"),
+            applied_schedule_id=payload.get("applied_schedule_id"),
         )

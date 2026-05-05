@@ -10,8 +10,9 @@ from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import AuditRepository, JobRepository, SnapshotRepository
 from lsa.storage.models import (
     ControlPlaneAlertRecord,
-    ControlPlaneOnCallScheduleRecord,
     ControlPlaneAlertSilenceRecord,
+    ControlPlaneOnCallChangeRequestRecord,
+    ControlPlaneOnCallScheduleRecord,
     JobLeaseEventRecord,
     WorkerHeartbeatRecord,
     WorkerRecord,
@@ -294,22 +295,89 @@ class StorageTests(unittest.TestCase):
                 schedule_id="schedule-test",
                 created_at="2026-05-04T00:00:00+00:00",
                 created_by="operator-a",
+                environment_name="prod",
+                created_by_team="platform",
+                created_by_role="engineer",
+                change_reason="Primary daytime rotation",
+                approved_by="director-a",
+                approved_by_team="platform",
+                approved_by_role="director",
+                approved_at="2026-05-03T12:00:00+00:00",
+                approval_note="Approved during weekly ops review",
                 team_name="platform",
                 timezone_name="UTC",
                 weekdays=[0, 1, 2],
                 start_time="09:00",
                 end_time="17:00",
+                priority=150,
+                rotation_name="primary",
+                effective_start_date="2026-05-01",
+                effective_end_date="2026-05-31",
                 webhook_url="https://example.com/team",
                 escalation_webhook_url="https://example.com/escalate",
             )
             repo.append_control_plane_oncall_schedule(schedule)
-            self.assertEqual(len(repo.list_control_plane_oncall_schedules()), 1)
+            stored = repo.list_control_plane_oncall_schedules()
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].priority, 150)
+            self.assertEqual(stored[0].rotation_name, "primary")
+            self.assertEqual(stored[0].effective_start_date, "2026-05-01")
+            self.assertEqual(stored[0].approved_by, "director-a")
+            self.assertEqual(stored[0].environment_name, "prod")
+            self.assertEqual(stored[0].created_by_team, "platform")
+            self.assertEqual(stored[0].approved_by_role, "director")
             cancelled = repo.cancel_control_plane_oncall_schedule(
                 schedule_id="schedule-test",
                 cancelled_at="2026-05-04T12:00:00+00:00",
                 cancelled_by="operator-a",
             )
             self.assertEqual(cancelled.cancelled_by, "operator-a")
+
+    def test_job_repository_persists_control_plane_oncall_change_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            request = ControlPlaneOnCallChangeRequestRecord(
+                request_id="request-test",
+                created_at="2026-05-04T00:00:00+00:00",
+                created_by="operator-a",
+                environment_name="prod",
+                created_by_team="platform",
+                created_by_role="engineer",
+                change_reason="Temporary dual coverage during cutover.",
+                status="pending_review",
+                review_required=True,
+                review_reasons=["ambiguous_overlap"],
+                team_name="platform",
+                timezone_name="UTC",
+                weekdays=[0, 1, 2, 3, 4],
+                start_time="09:00",
+                end_time="17:00",
+                priority=200,
+                rotation_name="holiday",
+                effective_start_date="2026-05-04",
+                effective_end_date="2026-05-04",
+                webhook_url="https://example.com/team",
+                escalation_webhook_url="https://example.com/escalate",
+            )
+            repo.append_control_plane_oncall_change_request(request)
+            stored = repo.list_control_plane_oncall_change_requests()
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].status, "pending_review")
+            self.assertEqual(stored[0].environment_name, "prod")
+            self.assertEqual(stored[0].review_reasons, ["ambiguous_overlap"])
+            decided = repo.decide_control_plane_oncall_change_request(
+                request_id="request-test",
+                status="applied",
+                decision_at="2026-05-04T00:05:00+00:00",
+                decided_by="director-a",
+                decided_by_team="platform",
+                decided_by_role="director",
+                decision_note="Approved for cutover.",
+                applied_schedule_id="schedule-test",
+            )
+            self.assertEqual(decided.decided_by, "director-a")
+            self.assertEqual(decided.applied_schedule_id, "schedule-test")
 
     def test_snapshot_repository_imports_legacy_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

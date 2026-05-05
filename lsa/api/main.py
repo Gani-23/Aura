@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi import Query
@@ -20,8 +21,11 @@ from lsa.api.models import (
     ControlPlaneAnalyticsResponse,
     ControlPlaneAlertRecordPayload,
     ControlPlaneAlertSilencePayload,
+    ControlPlaneOnCallChangeRequestPayload,
+    ControlPlaneOnCallRouteResolutionPayload,
     ControlPlaneOnCallSchedulePayload,
     CreateControlPlaneAlertSilenceRequest,
+    CreateControlPlaneOnCallChangeRequest,
     CreateControlPlaneOnCallScheduleRequest,
     EmitControlPlaneAlertsResponse,
     HealthResponse,
@@ -31,6 +35,7 @@ from lsa.api.models import (
     JobLeaseEventRollupPayload,
     JobRecordPayload,
     PruneHistoryResponse,
+    ReviewControlPlaneOnCallChangeRequest,
     SnapshotRecordPayload,
     WorkerHeartbeatPayload,
     WorkerHeartbeatRollupPayload,
@@ -79,15 +84,21 @@ analytics_service = AnalyticsService(
         job_failure_rate_warning_threshold=settings.analytics_job_failure_rate_warning_threshold,
         job_failure_rate_critical_threshold=settings.analytics_job_failure_rate_critical_threshold,
         job_failure_rate_min_samples=settings.analytics_job_failure_rate_min_samples,
+        oncall_conflict_warning_threshold=settings.analytics_oncall_conflict_warning_threshold,
+        oncall_conflict_critical_threshold=settings.analytics_oncall_conflict_critical_threshold,
     ),
 )
 control_plane_alert_service = ControlPlaneAlertService(
     job_repository=job_repository,
     analytics_service=analytics_service,
+    default_environment_name=settings.environment_name,
     window_days=settings.control_plane_alert_window_days,
     dedup_window_seconds=settings.control_plane_alert_dedup_window_seconds,
     reminder_interval_seconds=settings.control_plane_alert_reminder_interval_seconds,
     escalation_interval_seconds=settings.control_plane_alert_escalation_interval_seconds,
+    policy_path=str(settings.oncall_policy_path),
+    required_approver_roles=settings.oncall_approval_required_roles,
+    allow_self_approval=settings.oncall_allow_self_approval,
     sink_path=str(settings.control_plane_alert_sink_path),
     webhook_url=settings.control_plane_alert_webhook_url,
     escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
@@ -121,11 +132,24 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Living Systems Auditor API", version="0.1.0", lifespan=lifespan)
 
 
+def _parse_timestamp_query(raw_value: str | None) -> datetime | None:
+    if raw_value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Timestamp must use ISO 8601 format.") from exc
+    if parsed.tzinfo is None:
+        raise HTTPException(status_code=400, detail="Timestamp must include a timezone offset.")
+    return parsed
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     active_workers = job_service.active_worker_count()
     return HealthResponse(
         status="ok",
+        environment_name=settings.environment_name,
         auth_enabled=settings.api_key is not None,
         worker_mode="embedded" if settings.run_embedded_worker else "external",
         database_path=str(settings.database_path),
@@ -370,6 +394,98 @@ async def cancel_control_plane_alert_silence(
 
 
 @app.get(
+    "/control-plane-oncall-change-requests",
+    response_model=list[ControlPlaneOnCallChangeRequestPayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_control_plane_oncall_change_requests(
+    status: str | None = Query(default=None),
+) -> list[ControlPlaneOnCallChangeRequestPayload]:
+    return [
+        ControlPlaneOnCallChangeRequestPayload(**record.to_dict())
+        for record in control_plane_alert_service.list_oncall_change_requests(status=status)
+    ]
+
+
+@app.get(
+    "/control-plane-oncall-change-requests/{request_id}",
+    response_model=ControlPlaneOnCallChangeRequestPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_control_plane_oncall_change_request(
+    request_id: str,
+) -> ControlPlaneOnCallChangeRequestPayload:
+    try:
+        record = control_plane_alert_service.get_oncall_change_request(request_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Control-plane on-call change request '{request_id}' was not found.",
+        ) from exc
+    return ControlPlaneOnCallChangeRequestPayload(**record.to_dict())
+
+
+@app.post(
+    "/control-plane-oncall-change-requests",
+    response_model=ControlPlaneOnCallChangeRequestPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def create_control_plane_oncall_change_request(
+    request: CreateControlPlaneOnCallChangeRequest,
+) -> ControlPlaneOnCallChangeRequestPayload:
+    try:
+        record = control_plane_alert_service.submit_oncall_change_request(
+            created_by=request.created_by,
+            environment_name=request.environment_name,
+            created_by_team=request.created_by_team,
+            created_by_role=request.created_by_role,
+            change_reason=request.change_reason,
+            team_name=request.team_name,
+            timezone_name=request.timezone_name,
+            weekdays=request.weekdays,
+            start_time=request.start_time,
+            end_time=request.end_time,
+            priority=request.priority,
+            rotation_name=request.rotation_name,
+            effective_start_date=request.effective_start_date,
+            effective_end_date=request.effective_end_date,
+            webhook_url=request.webhook_url,
+            escalation_webhook_url=request.escalation_webhook_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneOnCallChangeRequestPayload(**record.to_dict())
+
+
+@app.post(
+    "/control-plane-oncall-change-requests/{request_id}/review",
+    response_model=ControlPlaneOnCallChangeRequestPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def review_control_plane_oncall_change_request(
+    request_id: str,
+    request: ReviewControlPlaneOnCallChangeRequest,
+) -> ControlPlaneOnCallChangeRequestPayload:
+    try:
+        record = control_plane_alert_service.review_oncall_change_request(
+            request_id=request_id,
+            decision=request.decision,
+            reviewed_by=request.reviewed_by,
+            reviewed_by_team=request.reviewed_by_team,
+            reviewed_by_role=request.reviewed_by_role,
+            review_note=request.review_note,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Control-plane on-call change request '{request_id}' was not found.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneOnCallChangeRequestPayload(**record.to_dict())
+
+
+@app.get(
     "/control-plane-oncall-schedules",
     response_model=list[ControlPlaneOnCallSchedulePayload],
     dependencies=[Depends(require_api_key)],
@@ -383,6 +499,20 @@ async def list_control_plane_oncall_schedules(
     ]
 
 
+@app.get(
+    "/control-plane-oncall-schedules/resolve",
+    response_model=ControlPlaneOnCallRouteResolutionPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def resolve_control_plane_oncall_schedule(
+    at: str | None = Query(default=None),
+) -> ControlPlaneOnCallRouteResolutionPayload:
+    preview = control_plane_alert_service.preview_oncall_route(
+        reference_timestamp=_parse_timestamp_query(at),
+    )
+    return ControlPlaneOnCallRouteResolutionPayload(**preview)
+
+
 @app.post(
     "/control-plane-oncall-schedules",
     response_model=ControlPlaneOnCallSchedulePayload,
@@ -394,11 +524,23 @@ async def create_control_plane_oncall_schedule(
     try:
         record = control_plane_alert_service.create_oncall_schedule(
             created_by=request.created_by,
+            environment_name=request.environment_name,
+            created_by_team=request.created_by_team,
+            created_by_role=request.created_by_role,
+            change_reason=request.change_reason,
+            approved_by=request.approved_by,
+            approved_by_team=request.approved_by_team,
+            approved_by_role=request.approved_by_role,
+            approval_note=request.approval_note,
             team_name=request.team_name,
             timezone_name=request.timezone_name,
             weekdays=request.weekdays,
             start_time=request.start_time,
             end_time=request.end_time,
+            priority=request.priority,
+            rotation_name=request.rotation_name,
+            effective_start_date=request.effective_start_date,
+            effective_end_date=request.effective_end_date,
             webhook_url=request.webhook_url,
             escalation_webhook_url=request.escalation_webhook_url,
         )

@@ -45,6 +45,14 @@
 - Add acknowledgement and bounded silencing so operators can own or temporarily mute specific control-plane alert classes without losing analytics visibility.
 - Add reminder timers and escalation routing so unacknowledged incidents can follow an explicit follow-up path.
 - Add calendar-aware on-call schedules so alert routing can follow team coverage windows instead of one global destination.
+- Add rotation-aware handoffs and holiday override windows so schedule routing can model temporary coverage changes without mutating the baseline rota.
+- Expose route-resolution preview so operators can inspect which overlapping schedule would win before an incident is emitted.
+- Detect ambiguous route overlaps proactively in control-plane analytics so schedule conflicts can page operators before incident misrouting.
+- Require explicit approval metadata for risky overlap changes so schedule governance is enforced at write time, not only detected later.
+- Enforce approver-role policy and self-approval restrictions on risky overlap changes so governance is machine-checkable instead of convention-only.
+- Add a reusable team- and rotation-aware governance policy object so ownership boundaries and approver mapping can vary by schedule domain.
+- Persist governed on-call change requests with explicit pending-review, rejected, and applied states so risky routing edits are reviewed before they take effect.
+- Add environment-aware governance bundles so `prod`, `staging`, and other deployment tiers can enforce different approval and ownership rules.
 - Add drift thresholds for new hosts, latency shifts, and novel exception classes.
 - Capture repeatable demo traces for the first live proof point.
 
@@ -64,7 +72,7 @@
 - Add acknowledgement, silencing, and escalation policy on top of control-plane alert history.
 - Add escalation routing, reminder timers, and on-call policy on top of acknowledgements and silences.
 - Add calendar-aware on-call schedules and team routing on top of the current reminder/escalation primitives.
-- Add rotation-aware handoffs and holiday overrides on top of the current schedule-based routing.
+- Extend schedule governance into external calendar sync, richer ownership policy, and review workflows that can route through real change-management systems.
 
 ## Flashpoint note
 

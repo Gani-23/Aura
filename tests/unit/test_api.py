@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 import json
 import tempfile
@@ -21,6 +22,7 @@ class ApiTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             api_main.settings = api_main.resolve_workspace_settings(tmpdir)
+            api_main.settings.environment_name = "prod"
             api_main.settings.api_key = "test-key"
             api_main.settings.run_embedded_worker = True
             api_main.settings.worker_history_retention_days = 1
@@ -28,6 +30,23 @@ class ApiTests(unittest.TestCase):
             api_main.settings.data_dir.mkdir(parents=True, exist_ok=True)
             api_main.settings.destination_aliases_path.write_text(
                 json.dumps({"93.184.216.34": "api.stripe.com"}),
+                encoding="utf-8",
+            )
+            api_main.settings.oncall_policy_path.write_text(
+                json.dumps(
+                    {
+                        "default": {
+                            "required_approver_roles": ["director", "admin"],
+                            "allow_self_approval": False,
+                        },
+                        "rotations": {
+                            "holiday": {
+                                "allowed_requester_teams": ["platform"],
+                                "allowed_approver_teams": ["platform"],
+                            }
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
             api_main.snapshot_repository = api_main.SnapshotRepository(api_main.settings, graph=api_main.graph)
@@ -64,8 +83,10 @@ class ApiTests(unittest.TestCase):
             api_main.control_plane_alert_service = ControlPlaneAlertService(
                 job_repository=api_main.job_repository,
                 analytics_service=api_main.analytics_service,
+                default_environment_name=api_main.settings.environment_name,
                 window_days=api_main.settings.control_plane_alert_window_days,
                 dedup_window_seconds=api_main.settings.control_plane_alert_dedup_window_seconds,
+                policy_path=str(api_main.settings.oncall_policy_path),
                 sink_path=str(api_main.settings.control_plane_alert_sink_path),
                 webhook_url=api_main.settings.control_plane_alert_webhook_url,
             )
@@ -88,6 +109,7 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(health_response.status_code, 200)
                 health_payload = health_response.json()
                 self.assertEqual(health_payload["status"], "ok")
+                self.assertEqual(health_payload["environment_name"], "prod")
                 self.assertTrue(health_payload["auth_enabled"])
                 self.assertEqual(health_payload["worker_mode"], "embedded")
                 self.assertTrue(health_payload["database_ready"])
@@ -364,6 +386,7 @@ class ApiTests(unittest.TestCase):
                 self.assertGreaterEqual(analytics_payload["workers"]["total_workers_seen"], 1)
                 self.assertGreaterEqual(analytics_payload["leases"]["total_events"], 1)
                 self.assertEqual(len(analytics_payload["jobs"]["days"]), 30)
+                self.assertIn("oncall", analytics_payload)
                 self.assertIn("evaluation", analytics_payload)
                 self.assertIn("status", analytics_payload["evaluation"])
                 self.assertIn("thresholds", analytics_payload["evaluation"])
@@ -408,23 +431,189 @@ class ApiTests(unittest.TestCase):
                 )
                 self.assertEqual(cancel_silence.status_code, 200)
                 self.assertEqual(cancel_silence.json()["cancelled_by"], "operator-api")
+                today = datetime.now(UTC).date().isoformat()
                 schedule_response = client.post(
                     "/control-plane-oncall-schedules",
                     json={
                         "created_by": "operator-api",
+                        "created_by_team": "platform",
                         "team_name": "platform-api",
                         "timezone_name": "UTC",
                         "weekdays": [0, 1, 2, 3, 4, 5, 6],
                         "start_time": "00:00",
                         "end_time": "23:59",
+                        "priority": 200,
+                        "rotation_name": "holiday",
+                        "effective_start_date": today,
+                        "effective_end_date": today,
                     },
                     headers=auth_headers,
                 )
                 self.assertEqual(schedule_response.status_code, 200)
+                self.assertEqual(schedule_response.json()["priority"], 200)
+                self.assertEqual(schedule_response.json()["environment_name"], "prod")
                 schedule_id = schedule_response.json()["schedule_id"]
+                conflicting_schedule = client.post(
+                    "/control-plane-oncall-schedules",
+                    json={
+                        "created_by": "operator-api-2",
+                        "created_by_team": "platform",
+                        "team_name": "platform-api-2",
+                        "timezone_name": "UTC",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "start_time": "00:00",
+                        "end_time": "23:59",
+                        "priority": 200,
+                        "rotation_name": "holiday-backup",
+                        "effective_start_date": today,
+                        "effective_end_date": today,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(conflicting_schedule.status_code, 400)
+                approved_conflicting_schedule = client.post(
+                    "/control-plane-oncall-schedules",
+                    json={
+                        "created_by": "operator-api-2",
+                        "created_by_role": "engineer",
+                        "created_by_team": "platform",
+                        "change_reason": "Dual coverage during cutover rehearsal.",
+                        "approved_by": "director-api",
+                        "approved_by_team": "platform",
+                        "approved_by_role": "director",
+                        "approval_note": "Accepted for one-day overlap.",
+                        "team_name": "platform-api-2",
+                        "timezone_name": "UTC",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "start_time": "00:00",
+                        "end_time": "23:59",
+                        "priority": 200,
+                        "rotation_name": "holiday-backup",
+                        "effective_start_date": today,
+                        "effective_end_date": today,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(approved_conflicting_schedule.status_code, 200)
+                self.assertEqual(approved_conflicting_schedule.json()["approved_by"], "director-api")
+                self.assertEqual(approved_conflicting_schedule.json()["approved_by_role"], "director")
+                invalid_role_schedule = client.post(
+                    "/control-plane-oncall-schedules",
+                    json={
+                        "created_by": "operator-api-3",
+                        "created_by_role": "engineer",
+                        "created_by_team": "platform",
+                        "change_reason": "Bad approval role test.",
+                        "approved_by": "lead-api",
+                        "approved_by_team": "platform",
+                        "approved_by_role": "engineer",
+                        "team_name": "platform-api-3",
+                        "timezone_name": "UTC",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "start_time": "00:00",
+                        "end_time": "23:59",
+                        "priority": 200,
+                        "rotation_name": "holiday-third",
+                        "effective_start_date": today,
+                        "effective_end_date": today,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(invalid_role_schedule.status_code, 400)
+                change_request = client.post(
+                    "/control-plane-oncall-change-requests",
+                    json={
+                        "created_by": "operator-api-4",
+                        "created_by_team": "platform",
+                        "created_by_role": "engineer",
+                        "change_reason": "Need staged overlap with formal review.",
+                        "team_name": "platform-api-review",
+                        "timezone_name": "UTC",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "start_time": "00:00",
+                        "end_time": "23:59",
+                        "priority": 200,
+                        "rotation_name": "holiday-review",
+                        "effective_start_date": today,
+                        "effective_end_date": today,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(change_request.status_code, 200)
+                change_request_payload = change_request.json()
+                self.assertEqual(change_request_payload["environment_name"], "prod")
+                self.assertEqual(change_request_payload["status"], "pending_review")
+                self.assertTrue(change_request_payload["review_required"])
+                request_id = change_request_payload["request_id"]
+                listed_requests = client.get(
+                    "/control-plane-oncall-change-requests?status=pending_review",
+                    headers=auth_headers,
+                )
+                self.assertEqual(listed_requests.status_code, 200)
+                self.assertGreaterEqual(len(listed_requests.json()), 1)
+                fetched_request = client.get(
+                    f"/control-plane-oncall-change-requests/{request_id}",
+                    headers=auth_headers,
+                )
+                self.assertEqual(fetched_request.status_code, 200)
+                reviewed_request = client.post(
+                    f"/control-plane-oncall-change-requests/{request_id}/review",
+                    json={
+                        "decision": "approve",
+                        "reviewed_by": "director-api",
+                        "reviewed_by_team": "platform",
+                        "reviewed_by_role": "director",
+                        "review_note": "Approved through review workflow.",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(reviewed_request.status_code, 200)
+                self.assertEqual(reviewed_request.json()["status"], "applied")
+                self.assertIsNotNone(reviewed_request.json()["applied_schedule_id"])
+                rejected_request = client.post(
+                    "/control-plane-oncall-change-requests",
+                    json={
+                        "created_by": "operator-api-5",
+                        "created_by_team": "platform",
+                        "created_by_role": "engineer",
+                        "change_reason": "Trying another overlap.",
+                        "team_name": "platform-api-review-2",
+                        "timezone_name": "UTC",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "start_time": "00:00",
+                        "end_time": "23:59",
+                        "priority": 200,
+                        "rotation_name": "holiday-review-2",
+                        "effective_start_date": today,
+                        "effective_end_date": today,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(rejected_request.status_code, 200)
+                rejected_request_id = rejected_request.json()["request_id"]
+                rejected_review = client.post(
+                    f"/control-plane-oncall-change-requests/{rejected_request_id}/review",
+                    json={
+                        "decision": "reject",
+                        "reviewed_by": "director-api",
+                        "reviewed_by_team": "platform",
+                        "reviewed_by_role": "director",
+                        "review_note": "Rejecting until coverage plan is tightened.",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(rejected_review.status_code, 200)
+                self.assertEqual(rejected_review.json()["status"], "rejected")
                 schedule_list = client.get("/control-plane-oncall-schedules?active_only=true", headers=auth_headers)
                 self.assertEqual(schedule_list.status_code, 200)
                 self.assertGreaterEqual(len(schedule_list.json()), 1)
+                schedule_preview = client.get(
+                    f"/control-plane-oncall-schedules/resolve?at={today}T12:00:00Z",
+                    headers=auth_headers,
+                )
+                self.assertEqual(schedule_preview.status_code, 200)
+                self.assertEqual(schedule_preview.json()["resolved_route"]["team_name"], "platform-api-review")
+                self.assertGreaterEqual(schedule_preview.json()["active_candidate_count"], 1)
                 schedule_cancel = client.post(
                     f"/control-plane-oncall-schedules/{schedule_id}/cancel",
                     json={"cancelled_by": "operator-api"},

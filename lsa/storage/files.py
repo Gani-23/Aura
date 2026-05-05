@@ -12,6 +12,7 @@ from lsa.settings import WorkspaceSettings
 from lsa.storage.models import (
     AuditRecord,
     ControlPlaneAlertRecord,
+    ControlPlaneOnCallChangeRequestRecord,
     ControlPlaneOnCallScheduleRecord,
     ControlPlaneAlertSilenceRecord,
     JobLeaseEventRecord,
@@ -194,11 +195,24 @@ class _ControlPlaneDatabase:
                     schedule_id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
                     created_by TEXT NOT NULL,
+                    environment_name TEXT NOT NULL DEFAULT 'default',
+                    created_by_team TEXT,
+                    created_by_role TEXT,
+                    change_reason TEXT,
+                    approved_by TEXT,
+                    approved_by_team TEXT,
+                    approved_by_role TEXT,
+                    approved_at TEXT,
+                    approval_note TEXT,
                     team_name TEXT NOT NULL,
                     timezone_name TEXT NOT NULL,
                     weekdays_json TEXT NOT NULL,
                     start_time TEXT NOT NULL,
                     end_time TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    rotation_name TEXT,
+                    effective_start_date TEXT,
+                    effective_end_date TEXT,
                     webhook_url TEXT,
                     escalation_webhook_url TEXT,
                     cancelled_at TEXT,
@@ -207,10 +221,48 @@ class _ControlPlaneDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_control_plane_oncall_schedules_created_at
                     ON control_plane_oncall_schedules (created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS control_plane_oncall_change_requests (
+                    request_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    environment_name TEXT NOT NULL DEFAULT 'default',
+                    created_by_team TEXT,
+                    created_by_role TEXT,
+                    change_reason TEXT,
+                    status TEXT NOT NULL,
+                    review_required INTEGER NOT NULL,
+                    review_reasons_json TEXT NOT NULL,
+                    team_name TEXT NOT NULL,
+                    timezone_name TEXT NOT NULL,
+                    weekdays_json TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    rotation_name TEXT,
+                    effective_start_date TEXT,
+                    effective_end_date TEXT,
+                    webhook_url TEXT,
+                    escalation_webhook_url TEXT,
+                    decision_at TEXT,
+                    decided_by TEXT,
+                    decided_by_team TEXT,
+                    decided_by_role TEXT,
+                    decision_note TEXT,
+                    applied_schedule_id TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_control_plane_oncall_change_requests_created_at
+                    ON control_plane_oncall_change_requests (created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_control_plane_oncall_change_requests_status
+                    ON control_plane_oncall_change_requests (status, created_at DESC);
                 """
             )
         self._ensure_job_columns()
         self._ensure_control_plane_alert_columns()
+        self._ensure_control_plane_oncall_schedule_columns()
+        self._ensure_control_plane_oncall_change_request_columns()
 
     def _ensure_job_columns(self) -> None:
         existing_columns = self._table_columns("jobs")
@@ -241,6 +293,44 @@ class _ControlPlaneDatabase:
                 if column_name in existing_columns:
                     continue
                 connection.execute(f"ALTER TABLE control_plane_alerts ADD COLUMN {column_name} {column_type}")
+
+    def _ensure_control_plane_oncall_schedule_columns(self) -> None:
+        existing_columns = self._table_columns("control_plane_oncall_schedules")
+        additions = {
+            "environment_name": "TEXT NOT NULL DEFAULT 'default'",
+            "priority": "INTEGER NOT NULL DEFAULT 100",
+            "rotation_name": "TEXT",
+            "effective_start_date": "TEXT",
+            "effective_end_date": "TEXT",
+            "created_by_team": "TEXT",
+            "created_by_role": "TEXT",
+            "change_reason": "TEXT",
+            "approved_by": "TEXT",
+            "approved_by_team": "TEXT",
+            "approved_by_role": "TEXT",
+            "approved_at": "TEXT",
+            "approval_note": "TEXT",
+        }
+        with self._connect() as connection:
+            for column_name, column_type in additions.items():
+                if column_name in existing_columns:
+                    continue
+                connection.execute(
+                    f"ALTER TABLE control_plane_oncall_schedules ADD COLUMN {column_name} {column_type}"
+                )
+
+    def _ensure_control_plane_oncall_change_request_columns(self) -> None:
+        existing_columns = self._table_columns("control_plane_oncall_change_requests")
+        additions = {
+            "environment_name": "TEXT NOT NULL DEFAULT 'default'",
+        }
+        with self._connect() as connection:
+            for column_name, column_type in additions.items():
+                if column_name in existing_columns:
+                    continue
+                connection.execute(
+                    f"ALTER TABLE control_plane_oncall_change_requests ADD COLUMN {column_name} {column_type}"
+                )
 
     def _import_legacy_records(self) -> None:
         self._import_legacy_snapshots()
@@ -1562,26 +1652,52 @@ class _ControlPlaneDatabase:
                     schedule_id,
                     created_at,
                     created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    approved_by,
+                    approved_by_team,
+                    approved_by_role,
+                    approved_at,
+                    approval_note,
                     team_name,
                     timezone_name,
                     weekdays_json,
                     start_time,
                     end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
                     webhook_url,
                     escalation_webhook_url,
                     cancelled_at,
                     cancelled_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.schedule_id,
                     record.created_at,
                     record.created_by,
+                    record.environment_name,
+                    record.created_by_team,
+                    record.created_by_role,
+                    record.change_reason,
+                    record.approved_by,
+                    record.approved_by_team,
+                    record.approved_by_role,
+                    record.approved_at,
+                    record.approval_note,
                     record.team_name,
                     record.timezone_name,
                     _json_dumps(record.weekdays),
                     record.start_time,
                     record.end_time,
+                    record.priority,
+                    record.rotation_name,
+                    record.effective_start_date,
+                    record.effective_end_date,
                     record.webhook_url,
                     record.escalation_webhook_url,
                     record.cancelled_at,
@@ -1597,17 +1713,30 @@ class _ControlPlaneDatabase:
                     schedule_id,
                     created_at,
                     created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    approved_by,
+                    approved_by_team,
+                    approved_by_role,
+                    approved_at,
+                    approval_note,
                     team_name,
                     timezone_name,
                     weekdays_json,
                     start_time,
                     end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
                     webhook_url,
                     escalation_webhook_url,
                     cancelled_at,
                     cancelled_by
                 FROM control_plane_oncall_schedules
-                ORDER BY created_at DESC
+                ORDER BY priority DESC, created_at DESC
                 """
             ).fetchall()
         return [
@@ -1615,11 +1744,24 @@ class _ControlPlaneDatabase:
                 schedule_id=row["schedule_id"],
                 created_at=row["created_at"],
                 created_by=row["created_by"],
+                environment_name=row["environment_name"],
+                created_by_team=row["created_by_team"],
+                created_by_role=row["created_by_role"],
+                change_reason=row["change_reason"],
+                approved_by=row["approved_by"],
+                approved_by_team=row["approved_by_team"],
+                approved_by_role=row["approved_by_role"],
+                approved_at=row["approved_at"],
+                approval_note=row["approval_note"],
                 team_name=row["team_name"],
                 timezone_name=row["timezone_name"],
                 weekdays=list(json.loads(row["weekdays_json"])),
                 start_time=row["start_time"],
                 end_time=row["end_time"],
+                priority=row["priority"],
+                rotation_name=row["rotation_name"],
+                effective_start_date=row["effective_start_date"],
+                effective_end_date=row["effective_end_date"],
                 webhook_url=row["webhook_url"],
                 escalation_webhook_url=row["escalation_webhook_url"],
                 cancelled_at=row["cancelled_at"],
@@ -1636,11 +1778,24 @@ class _ControlPlaneDatabase:
                     schedule_id,
                     created_at,
                     created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    approved_by,
+                    approved_by_team,
+                    approved_by_role,
+                    approved_at,
+                    approval_note,
                     team_name,
                     timezone_name,
                     weekdays_json,
                     start_time,
                     end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
                     webhook_url,
                     escalation_webhook_url,
                     cancelled_at,
@@ -1656,11 +1811,24 @@ class _ControlPlaneDatabase:
             schedule_id=row["schedule_id"],
             created_at=row["created_at"],
             created_by=row["created_by"],
+            environment_name=row["environment_name"],
+            created_by_team=row["created_by_team"],
+            created_by_role=row["created_by_role"],
+            change_reason=row["change_reason"],
+            approved_by=row["approved_by"],
+            approved_by_team=row["approved_by_team"],
+            approved_by_role=row["approved_by_role"],
+            approved_at=row["approved_at"],
+            approval_note=row["approval_note"],
             team_name=row["team_name"],
             timezone_name=row["timezone_name"],
             weekdays=list(json.loads(row["weekdays_json"])),
             start_time=row["start_time"],
             end_time=row["end_time"],
+            priority=row["priority"],
+            rotation_name=row["rotation_name"],
+            effective_start_date=row["effective_start_date"],
+            effective_end_date=row["effective_end_date"],
             webhook_url=row["webhook_url"],
             escalation_webhook_url=row["escalation_webhook_url"],
             cancelled_at=row["cancelled_at"],
@@ -1686,6 +1854,235 @@ class _ControlPlaneDatabase:
                 (cancelled_at, cancelled_by, schedule_id),
             )
         return cursor.rowcount > 0
+
+    def insert_control_plane_oncall_change_request(
+        self,
+        record: ControlPlaneOnCallChangeRequestRecord,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_oncall_change_requests (
+                    request_id,
+                    created_at,
+                    created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    status,
+                    review_required,
+                    review_reasons_json,
+                    team_name,
+                    timezone_name,
+                    weekdays_json,
+                    start_time,
+                    end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
+                    webhook_url,
+                    escalation_webhook_url,
+                    decision_at,
+                    decided_by,
+                    decided_by_team,
+                    decided_by_role,
+                    decision_note,
+                    applied_schedule_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.request_id,
+                    record.created_at,
+                    record.created_by,
+                    record.environment_name,
+                    record.created_by_team,
+                    record.created_by_role,
+                    record.change_reason,
+                    record.status,
+                    1 if record.review_required else 0,
+                    _json_dumps(record.review_reasons),
+                    record.team_name,
+                    record.timezone_name,
+                    _json_dumps(record.weekdays),
+                    record.start_time,
+                    record.end_time,
+                    record.priority,
+                    record.rotation_name,
+                    record.effective_start_date,
+                    record.effective_end_date,
+                    record.webhook_url,
+                    record.escalation_webhook_url,
+                    record.decision_at,
+                    record.decided_by,
+                    record.decided_by_team,
+                    record.decided_by_role,
+                    record.decision_note,
+                    record.applied_schedule_id,
+                ),
+            )
+
+    def list_control_plane_oncall_change_requests(
+        self,
+        *,
+        status: str | None = None,
+    ) -> list[ControlPlaneOnCallChangeRequestRecord]:
+        query = """
+            SELECT
+                request_id,
+                created_at,
+                created_by,
+                environment_name,
+                created_by_team,
+                created_by_role,
+                change_reason,
+                status,
+                review_required,
+                review_reasons_json,
+                team_name,
+                timezone_name,
+                weekdays_json,
+                start_time,
+                end_time,
+                priority,
+                rotation_name,
+                effective_start_date,
+                effective_end_date,
+                webhook_url,
+                escalation_webhook_url,
+                decision_at,
+                decided_by,
+                decided_by_team,
+                decided_by_role,
+                decision_note,
+                applied_schedule_id
+            FROM control_plane_oncall_change_requests
+        """
+        params: tuple[object, ...] = ()
+        if status is not None:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY created_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._row_to_control_plane_oncall_change_request(row) for row in rows]
+
+    def fetch_control_plane_oncall_change_request(
+        self,
+        request_id: str,
+    ) -> ControlPlaneOnCallChangeRequestRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    request_id,
+                    created_at,
+                    created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    status,
+                    review_required,
+                    review_reasons_json,
+                    team_name,
+                    timezone_name,
+                    weekdays_json,
+                    start_time,
+                    end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
+                    webhook_url,
+                    escalation_webhook_url,
+                    decision_at,
+                    decided_by,
+                    decided_by_team,
+                    decided_by_role,
+                    decision_note,
+                    applied_schedule_id
+                FROM control_plane_oncall_change_requests
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_control_plane_oncall_change_request(row)
+
+    def update_control_plane_oncall_change_request_decision(
+        self,
+        *,
+        request_id: str,
+        status: str,
+        decision_at: str,
+        decided_by: str,
+        decided_by_team: str | None,
+        decided_by_role: str | None,
+        decision_note: str | None,
+        applied_schedule_id: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_oncall_change_requests
+                SET status = ?,
+                    decision_at = ?,
+                    decided_by = ?,
+                    decided_by_team = ?,
+                    decided_by_role = ?,
+                    decision_note = ?,
+                    applied_schedule_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    status,
+                    decision_at,
+                    decided_by,
+                    decided_by_team,
+                    decided_by_role,
+                    decision_note,
+                    applied_schedule_id,
+                    request_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def _row_to_control_plane_oncall_change_request(
+        self,
+        row: sqlite3.Row,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        return ControlPlaneOnCallChangeRequestRecord(
+            request_id=row["request_id"],
+            created_at=row["created_at"],
+            created_by=row["created_by"],
+            environment_name=row["environment_name"],
+            created_by_team=row["created_by_team"],
+            created_by_role=row["created_by_role"],
+            change_reason=row["change_reason"],
+            status=row["status"],
+            review_required=bool(row["review_required"]),
+            review_reasons=list(json.loads(row["review_reasons_json"])),
+            team_name=row["team_name"],
+            timezone_name=row["timezone_name"],
+            weekdays=list(json.loads(row["weekdays_json"])),
+            start_time=row["start_time"],
+            end_time=row["end_time"],
+            priority=row["priority"],
+            rotation_name=row["rotation_name"],
+            effective_start_date=row["effective_start_date"],
+            effective_end_date=row["effective_end_date"],
+            webhook_url=row["webhook_url"],
+            escalation_webhook_url=row["escalation_webhook_url"],
+            decision_at=row["decision_at"],
+            decided_by=row["decided_by"],
+            decided_by_team=row["decided_by_team"],
+            decided_by_role=row["decided_by_role"],
+            decision_note=row["decision_note"],
+            applied_schedule_id=row["applied_schedule_id"],
+        )
 
 
 class SnapshotRepository:
@@ -1976,3 +2373,56 @@ class JobRepository:
         if not updated:
             raise FileNotFoundError(f"Control-plane on-call schedule '{schedule_id}' was not found.")
         return self.get_control_plane_oncall_schedule(schedule_id)
+
+    def append_control_plane_oncall_change_request(
+        self,
+        record: ControlPlaneOnCallChangeRequestRecord,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        self.database.insert_control_plane_oncall_change_request(record)
+        return record
+
+    def list_control_plane_oncall_change_requests(
+        self,
+        *,
+        status: str | None = None,
+    ) -> list[ControlPlaneOnCallChangeRequestRecord]:
+        return self.database.list_control_plane_oncall_change_requests(status=status)
+
+    def get_control_plane_oncall_change_request(
+        self,
+        request_id: str,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        record = self.database.fetch_control_plane_oncall_change_request(request_id)
+        if record is None:
+            raise FileNotFoundError(
+                f"Control-plane on-call change request '{request_id}' was not found."
+            )
+        return record
+
+    def decide_control_plane_oncall_change_request(
+        self,
+        *,
+        request_id: str,
+        status: str,
+        decision_at: str,
+        decided_by: str,
+        decided_by_team: str | None,
+        decided_by_role: str | None,
+        decision_note: str | None,
+        applied_schedule_id: str | None,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        updated = self.database.update_control_plane_oncall_change_request_decision(
+            request_id=request_id,
+            status=status,
+            decision_at=decision_at,
+            decided_by=decided_by,
+            decided_by_team=decided_by_team,
+            decided_by_role=decided_by_role,
+            decision_note=decision_note,
+            applied_schedule_id=applied_schedule_id,
+        )
+        if not updated:
+            raise FileNotFoundError(
+                f"Control-plane on-call change request '{request_id}' was not found."
+            )
+        return self.get_control_plane_oncall_change_request(request_id)

@@ -82,8 +82,11 @@ lsa acknowledge-control-plane-alert <alert_id> --by operator --note "Investigati
 lsa create-control-plane-alert-silence --by operator --reason "maintenance" --duration-minutes 30 --finding-code queue_without_active_workers
 lsa list-control-plane-alert-silences --active-only
 lsa cancel-control-plane-alert-silence <silence_id> --by operator
-lsa create-control-plane-oncall-schedule --by operator --team platform --timezone UTC --weekdays 0 1 2 3 4 5 6 --start-time 00:00 --end-time 23:59
+lsa create-control-plane-oncall-schedule --by operator --creator-team platform --creator-role engineer --team platform --timezone UTC --weekdays 0 1 2 3 4 5 6 --start-time 00:00 --end-time 23:59 --priority 100 --rotation primary
+lsa create-control-plane-oncall-schedule --by operator --team platform-holiday --timezone UTC --weekdays 0 1 2 3 4 5 6 --start-time 00:00 --end-time 23:59 --priority 250 --rotation holiday --effective-start-date 2026-12-25 --effective-end-date 2026-12-26
+lsa create-control-plane-oncall-schedule --by operator --creator-team platform --creator-role engineer --change-reason "Dual coverage during cutover" --approved-by director --approver-team platform --approver-role director --approval-note "Accepted one-day overlap" --team platform-shadow --timezone UTC --weekdays 0 1 2 3 4 5 6 --start-time 00:00 --end-time 23:59 --priority 250 --rotation holiday-shadow --effective-start-date 2026-12-25 --effective-end-date 2026-12-25
 lsa list-control-plane-oncall-schedules --active-only
+lsa resolve-control-plane-oncall-route --at 2026-12-25T12:00:00+00:00
 lsa cancel-control-plane-oncall-schedule <schedule_id> --by operator
 ```
 
@@ -144,6 +147,7 @@ GET /control-plane-alert-silences
 POST /control-plane-alert-silences
 POST /control-plane-alert-silences/{silence_id}/cancel
 GET /control-plane-oncall-schedules
+GET /control-plane-oncall-schedules/resolve
 POST /control-plane-oncall-schedules
 POST /control-plane-oncall-schedules/{schedule_id}/cancel
 POST /maintenance/prune-history
@@ -180,6 +184,7 @@ Current built-in findings cover:
 - expired lease requeue churn above warning or critical thresholds
 - elevated job failure rate once enough finished jobs exist in the window
 - queued work with zero active workers, which is treated as critical
+- ambiguous on-call route overlaps detected in upcoming schedule coverage
 
 Those findings can now flow into a durable control-plane alert pipeline. The worker evaluates the control plane on a schedule, deduplicates repeated alert signatures inside a configurable cooldown window, persists emitted alerts in SQLite, writes them to a JSONL sink, and can optionally POST the same payload to a webhook.
 
@@ -195,6 +200,8 @@ LSA_ANALYTICS_EXPIRED_LEASE_CRITICAL_THRESHOLD
 LSA_ANALYTICS_JOB_FAILURE_RATE_WARNING_THRESHOLD
 LSA_ANALYTICS_JOB_FAILURE_RATE_CRITICAL_THRESHOLD
 LSA_ANALYTICS_JOB_FAILURE_RATE_MIN_SAMPLES
+LSA_ANALYTICS_ONCALL_CONFLICT_WARNING_THRESHOLD
+LSA_ANALYTICS_ONCALL_CONFLICT_CRITICAL_THRESHOLD
 ```
 
 Alert emission is controlled through:
@@ -217,11 +224,78 @@ Timed follow-ups are now part of the same lifecycle. If a degraded or critical i
 Alert delivery can now also follow persisted on-call schedules. A schedule defines:
 - team name
 - IANA timezone like `UTC` or `Asia/Kolkata`
+- schedule owner/requester via `created_by`
+- optional `created_by_team`, `created_by_role`, `change_reason`, `approved_by`, `approved_by_team`, `approved_by_role`, and `approval_note` metadata for governed changes
 - weekdays as `0-6` for Monday-Sunday
 - a local start and end time
+- rotation name for primary, secondary, holiday, or temporary handoff coverage
+- numeric priority so the strongest active route wins during overlap
+- optional local-date bounds for holiday overrides or temporary coverage swaps
 - optional route-specific webhook and escalation webhook overrides
 
-When a schedule is active, emitted incidents, reminders, and escalations include the selected route in their payload and prefer the route-specific webhooks over the global defaults.
+When schedules overlap, the router prefers the highest priority active match, then the most date-specific window, then the newest record. That lets you layer holiday overrides and handoff windows on top of a stable baseline rotation. Emitted incidents, reminders, escalations, and suppressed alerts include the selected route in their payload and prefer the route-specific webhooks over the global defaults.
+
+Operators can now also preview the effective route before an incident fires. `lsa resolve-control-plane-oncall-route` and `GET /control-plane-oncall-schedules/resolve?at=...` return the selected route plus the ranked active candidates and the reasons each candidate was ordered where it was. The timestamp must use ISO 8601 format and include a timezone offset when provided explicitly.
+
+The control-plane analytics layer now also scans upcoming schedule coverage for ambiguous overlaps. If multiple active routes would tie on routing precedence and only fall back to record creation order, analytics emits an `oncall_route_conflicts` finding with sample conflicting schedule groups. That means bad overlap policy can alert before it misroutes a real incident.
+
+Those same ambiguous overlaps are now governed at write time. If a new schedule would introduce that kind of ambiguous overlap, creation is rejected unless the request includes `change_reason`, `approved_by`, and `approved_by_role`. This keeps risky routing changes auditable instead of letting them slip in as silent config drift.
+
+That approval path is now policy-aware too. By default, ambiguous overlaps require:
+- `approved_by_role` to be one of `manager`, `director`, or `admin`
+- no self-approval by the same `created_by` identity
+
+These policy defaults are configurable through:
+
+```text
+LSA_ENVIRONMENT_NAME
+LSA_ONCALL_POLICY_PATH
+LSA_ONCALL_APPROVAL_REQUIRED_ROLES
+LSA_ONCALL_ALLOW_SELF_APPROVAL
+```
+
+Each schedule and governed change request now also carries an `environment_name`. When omitted, the service uses `LSA_ENVIRONMENT_NAME`, which defaults to `default`. Active route resolution and risky-overlap review checks are scoped to the current environment, so a `prod` overlap does not force approval in `staging`.
+
+If `LSA_ONCALL_POLICY_PATH` points at a JSON policy file, the service now resolves governance rules by environment, then team and rotation, before falling back to the global defaults. A minimal example looks like:
+
+```json
+{
+  "default": {
+    "required_approver_roles": ["director", "admin"],
+    "allow_self_approval": false
+  },
+  "teams": {
+    "platform": {
+      "owner_team": "platform",
+      "allowed_requester_teams": ["platform"],
+      "allowed_approver_teams": ["platform"],
+      "allowed_approver_ids": ["director-platform"]
+    }
+  },
+  "rotations": {
+    "holiday": {
+      "required_approver_roles": ["admin"]
+    }
+  },
+  "environments": {
+    "prod": {
+      "default": {
+        "required_approver_roles": ["admin"]
+      },
+      "teams": {
+        "payments": {
+          "allowed_requester_teams": ["platform"],
+          "allowed_approver_teams": ["platform"]
+        }
+      }
+    }
+  }
+}
+```
+
+That policy layer now lets governance vary by environment, owning team, or rotation instead of relying on one global approval rule for every schedule change.
+
+Governed changes can now move through an explicit review workflow instead of relying only on inline approval fields. `lsa submit-control-plane-oncall-change-request` and `POST /control-plane-oncall-change-requests` persist a durable change request with `pending_review`, `rejected`, or `applied` status. Safe requests auto-apply immediately with an audit trail, while ambiguous overlap requests stay pending until `lsa review-control-plane-oncall-change-request` or `POST /control-plane-oncall-change-requests/{request_id}/review` approves or rejects them. Approved requests create the schedule and preserve reviewer identity, reviewer team, reviewer role, review note, and the applied schedule ID on the request record.
 
 Alert records can now also be acknowledged in place. Acknowledgement does not suppress future alerts by itself; it marks that a human has taken ownership of a specific emission and records who acknowledged it plus an optional note.
 

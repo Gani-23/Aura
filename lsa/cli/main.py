@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -49,15 +50,21 @@ analytics_service = AnalyticsService(
         job_failure_rate_warning_threshold=settings.analytics_job_failure_rate_warning_threshold,
         job_failure_rate_critical_threshold=settings.analytics_job_failure_rate_critical_threshold,
         job_failure_rate_min_samples=settings.analytics_job_failure_rate_min_samples,
+        oncall_conflict_warning_threshold=settings.analytics_oncall_conflict_warning_threshold,
+        oncall_conflict_critical_threshold=settings.analytics_oncall_conflict_critical_threshold,
     ),
 )
 control_plane_alert_service = ControlPlaneAlertService(
     job_repository=job_repository,
     analytics_service=analytics_service,
+    default_environment_name=settings.environment_name,
     window_days=settings.control_plane_alert_window_days,
     dedup_window_seconds=settings.control_plane_alert_dedup_window_seconds,
     reminder_interval_seconds=settings.control_plane_alert_reminder_interval_seconds,
     escalation_interval_seconds=settings.control_plane_alert_escalation_interval_seconds,
+    policy_path=str(settings.oncall_policy_path),
+    required_approver_roles=settings.oncall_approval_required_roles,
+    allow_self_approval=settings.oncall_allow_self_approval,
     sink_path=str(settings.control_plane_alert_sink_path),
     webhook_url=settings.control_plane_alert_webhook_url,
     escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
@@ -209,18 +216,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create a timezone-aware on-call route for control-plane alerts.",
     )
     create_control_plane_oncall_schedule.add_argument("--by", required=True)
+    create_control_plane_oncall_schedule.add_argument("--environment", default=None)
+    create_control_plane_oncall_schedule.add_argument("--creator-team", default=None)
+    create_control_plane_oncall_schedule.add_argument("--creator-role", default=None)
+    create_control_plane_oncall_schedule.add_argument("--change-reason", default=None)
+    create_control_plane_oncall_schedule.add_argument("--approved-by", default=None)
+    create_control_plane_oncall_schedule.add_argument("--approver-team", default=None)
+    create_control_plane_oncall_schedule.add_argument("--approver-role", default=None)
+    create_control_plane_oncall_schedule.add_argument("--approval-note", default=None)
     create_control_plane_oncall_schedule.add_argument("--team", required=True)
     create_control_plane_oncall_schedule.add_argument("--timezone", required=True)
     create_control_plane_oncall_schedule.add_argument("--weekdays", nargs="+", type=int, required=True)
     create_control_plane_oncall_schedule.add_argument("--start-time", required=True)
     create_control_plane_oncall_schedule.add_argument("--end-time", required=True)
+    create_control_plane_oncall_schedule.add_argument("--priority", type=int, default=100)
+    create_control_plane_oncall_schedule.add_argument("--rotation", default=None)
+    create_control_plane_oncall_schedule.add_argument("--effective-start-date", default=None)
+    create_control_plane_oncall_schedule.add_argument("--effective-end-date", default=None)
     create_control_plane_oncall_schedule.add_argument("--webhook-url", default=None)
     create_control_plane_oncall_schedule.add_argument("--escalation-webhook-url", default=None)
+    submit_control_plane_oncall_change_request = subparsers.add_parser(
+        "submit-control-plane-oncall-change-request",
+        help="Submit a governed control-plane on-call change request.",
+    )
+    submit_control_plane_oncall_change_request.add_argument("--by", required=True)
+    submit_control_plane_oncall_change_request.add_argument("--environment", default=None)
+    submit_control_plane_oncall_change_request.add_argument("--creator-team", default=None)
+    submit_control_plane_oncall_change_request.add_argument("--creator-role", default=None)
+    submit_control_plane_oncall_change_request.add_argument("--change-reason", required=True)
+    submit_control_plane_oncall_change_request.add_argument("--team", required=True)
+    submit_control_plane_oncall_change_request.add_argument("--timezone", required=True)
+    submit_control_plane_oncall_change_request.add_argument("--weekdays", nargs="+", type=int, required=True)
+    submit_control_plane_oncall_change_request.add_argument("--start-time", required=True)
+    submit_control_plane_oncall_change_request.add_argument("--end-time", required=True)
+    submit_control_plane_oncall_change_request.add_argument("--priority", type=int, default=100)
+    submit_control_plane_oncall_change_request.add_argument("--rotation", default=None)
+    submit_control_plane_oncall_change_request.add_argument("--effective-start-date", default=None)
+    submit_control_plane_oncall_change_request.add_argument("--effective-end-date", default=None)
+    submit_control_plane_oncall_change_request.add_argument("--webhook-url", default=None)
+    submit_control_plane_oncall_change_request.add_argument("--escalation-webhook-url", default=None)
+    list_control_plane_oncall_change_requests = subparsers.add_parser(
+        "list-control-plane-oncall-change-requests",
+        help="List control-plane on-call change requests.",
+    )
+    list_control_plane_oncall_change_requests.add_argument("--status", default=None)
+    review_control_plane_oncall_change_request = subparsers.add_parser(
+        "review-control-plane-oncall-change-request",
+        help="Approve or reject a pending control-plane on-call change request.",
+    )
+    review_control_plane_oncall_change_request.add_argument("request_id")
+    review_control_plane_oncall_change_request.add_argument("--decision", required=True)
+    review_control_plane_oncall_change_request.add_argument("--by", required=True)
+    review_control_plane_oncall_change_request.add_argument("--reviewer-team", default=None)
+    review_control_plane_oncall_change_request.add_argument("--reviewer-role", default=None)
+    review_control_plane_oncall_change_request.add_argument("--note", default=None)
     list_control_plane_oncall_schedules = subparsers.add_parser(
         "list-control-plane-oncall-schedules",
         help="List control-plane on-call schedules.",
     )
     list_control_plane_oncall_schedules.add_argument("--active-only", action="store_true")
+    resolve_control_plane_oncall_route = subparsers.add_parser(
+        "resolve-control-plane-oncall-route",
+        help="Preview the effective on-call route and ranked active candidates.",
+    )
+    resolve_control_plane_oncall_route.add_argument("--at", default=None)
     cancel_control_plane_oncall_schedule = subparsers.add_parser(
         "cancel-control-plane-oncall-schedule",
         help="Cancel a control-plane on-call schedule.",
@@ -519,23 +578,119 @@ def run_cancel_control_plane_alert_silence(*, silence_id: str, cancelled_by: str
 def run_create_control_plane_oncall_schedule(
     *,
     created_by: str,
+    environment_name: str | None,
+    created_by_team: str | None,
+    created_by_role: str | None,
+    change_reason: str | None,
+    approved_by: str | None,
+    approved_by_team: str | None,
+    approved_by_role: str | None,
+    approval_note: str | None,
     team_name: str,
     timezone_name: str,
     weekdays: list[int],
     start_time: str,
     end_time: str,
+    priority: int,
+    rotation_name: str | None,
+    effective_start_date: str | None,
+    effective_end_date: str | None,
     webhook_url: str | None,
     escalation_webhook_url: str | None,
 ) -> int:
     record = control_plane_alert_service.create_oncall_schedule(
         created_by=created_by,
+        environment_name=environment_name,
+        created_by_team=created_by_team,
+        created_by_role=created_by_role,
+        change_reason=change_reason,
+        approved_by=approved_by,
+        approved_by_team=approved_by_team,
+        approved_by_role=approved_by_role,
+        approval_note=approval_note,
         team_name=team_name,
         timezone_name=timezone_name,
         weekdays=weekdays,
         start_time=start_time,
         end_time=end_time,
+        priority=priority,
+        rotation_name=rotation_name,
+        effective_start_date=effective_start_date,
+        effective_end_date=effective_end_date,
         webhook_url=webhook_url,
         escalation_webhook_url=escalation_webhook_url,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_submit_control_plane_oncall_change_request(
+    *,
+    created_by: str,
+    environment_name: str | None,
+    created_by_team: str | None,
+    created_by_role: str | None,
+    change_reason: str,
+    team_name: str,
+    timezone_name: str,
+    weekdays: list[int],
+    start_time: str,
+    end_time: str,
+    priority: int,
+    rotation_name: str | None,
+    effective_start_date: str | None,
+    effective_end_date: str | None,
+    webhook_url: str | None,
+    escalation_webhook_url: str | None,
+) -> int:
+    record = control_plane_alert_service.submit_oncall_change_request(
+        created_by=created_by,
+        environment_name=environment_name,
+        created_by_team=created_by_team,
+        created_by_role=created_by_role,
+        change_reason=change_reason,
+        team_name=team_name,
+        timezone_name=timezone_name,
+        weekdays=weekdays,
+        start_time=start_time,
+        end_time=end_time,
+        priority=priority,
+        rotation_name=rotation_name,
+        effective_start_date=effective_start_date,
+        effective_end_date=effective_end_date,
+        webhook_url=webhook_url,
+        escalation_webhook_url=escalation_webhook_url,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_list_control_plane_oncall_change_requests(*, status: str | None) -> int:
+    print(
+        json.dumps(
+            [record.to_dict() for record in control_plane_alert_service.list_oncall_change_requests(status=status)],
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_review_control_plane_oncall_change_request(
+    *,
+    request_id: str,
+    decision: str,
+    reviewed_by: str,
+    reviewed_by_team: str | None,
+    reviewed_by_role: str | None,
+    review_note: str | None,
+) -> int:
+    record = control_plane_alert_service.review_oncall_change_request(
+        request_id=request_id,
+        decision=decision,
+        reviewed_by=reviewed_by,
+        reviewed_by_team=reviewed_by_team,
+        reviewed_by_role=reviewed_by_role,
+        review_note=review_note,
     )
     print(json.dumps(record.to_dict(), indent=2))
     return 0
@@ -548,6 +703,14 @@ def run_list_control_plane_oncall_schedules(*, active_only: bool) -> int:
             indent=2,
         )
     )
+    return 0
+
+
+def run_resolve_control_plane_oncall_route(*, at: str | None) -> int:
+    preview = control_plane_alert_service.preview_oncall_route(
+        reference_timestamp=_parse_timestamp_argument(at),
+    )
+    print(json.dumps(preview, indent=2))
     return 0
 
 
@@ -601,6 +764,15 @@ def _build_trace_collection_request(
         command=["/bin/sh", str(program_path)],
         symbol_map_path=symbol_map_path,
     )
+
+
+def _parse_timestamp_argument(raw_value: str | None) -> datetime | None:
+    if raw_value is None:
+        return None
+    parsed = datetime.fromisoformat(raw_value)
+    if parsed.tzinfo is None:
+        raise ValueError("Timestamp must include a timezone offset.")
+    return parsed
 
 
 def main() -> int:
@@ -725,16 +897,60 @@ def main() -> int:
     if args.command == "create-control-plane-oncall-schedule":
         return run_create_control_plane_oncall_schedule(
             created_by=args.by,
+            environment_name=args.environment,
+            created_by_team=args.creator_team,
+            created_by_role=args.creator_role,
+            change_reason=args.change_reason,
+            approved_by=args.approved_by,
+            approved_by_team=args.approver_team,
+            approved_by_role=args.approver_role,
+            approval_note=args.approval_note,
             team_name=args.team,
             timezone_name=args.timezone,
             weekdays=args.weekdays,
             start_time=args.start_time,
             end_time=args.end_time,
+            priority=args.priority,
+            rotation_name=args.rotation,
+            effective_start_date=args.effective_start_date,
+            effective_end_date=args.effective_end_date,
             webhook_url=args.webhook_url,
             escalation_webhook_url=args.escalation_webhook_url,
         )
+    if args.command == "submit-control-plane-oncall-change-request":
+        return run_submit_control_plane_oncall_change_request(
+            created_by=args.by,
+            environment_name=args.environment,
+            created_by_team=args.creator_team,
+            created_by_role=args.creator_role,
+            change_reason=args.change_reason,
+            team_name=args.team,
+            timezone_name=args.timezone,
+            weekdays=args.weekdays,
+            start_time=args.start_time,
+            end_time=args.end_time,
+            priority=args.priority,
+            rotation_name=args.rotation,
+            effective_start_date=args.effective_start_date,
+            effective_end_date=args.effective_end_date,
+            webhook_url=args.webhook_url,
+            escalation_webhook_url=args.escalation_webhook_url,
+        )
+    if args.command == "list-control-plane-oncall-change-requests":
+        return run_list_control_plane_oncall_change_requests(status=args.status)
+    if args.command == "review-control-plane-oncall-change-request":
+        return run_review_control_plane_oncall_change_request(
+            request_id=args.request_id,
+            decision=args.decision,
+            reviewed_by=args.by,
+            reviewed_by_team=args.reviewer_team,
+            reviewed_by_role=args.reviewer_role,
+            review_note=args.note,
+        )
     if args.command == "list-control-plane-oncall-schedules":
         return run_list_control_plane_oncall_schedules(active_only=args.active_only)
+    if args.command == "resolve-control-plane-oncall-route":
+        return run_resolve_control_plane_oncall_route(at=args.at)
     if args.command == "cancel-control-plane-oncall-schedule":
         return run_cancel_control_plane_oncall_schedule(
             schedule_id=args.schedule_id,
