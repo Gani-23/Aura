@@ -1,6 +1,6 @@
-# Living Systems Auditor
+# TeNet
 
-Living Systems Auditor is a Python-first scaffold for an intent-aware runtime auditor. This repo starts with a minimal vertical slice:
+TeNet is Living Systems Auditor, a Python-first scaffold for an intent-aware runtime auditor. This repo starts with a minimal vertical slice:
 
 - ingest a Python codebase and build an intent graph snapshot
 - normalize observed runtime events
