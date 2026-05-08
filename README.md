@@ -136,7 +136,7 @@ event=network process=python comm=python conn_id=conn-1 target=https://api.strip
 
 During collection, LSA strips those `event=context` lines out of the stored trace body, materializes a `.contexts.json` sidecar, and joins that context back onto matching runtime events before correlation runs.
 
-The FastAPI surface now mirrors the live collection workflow with:
+The FastAPI surface now mirrors the live collection workflow with following:
 
 ```text
 POST /collect-trace
