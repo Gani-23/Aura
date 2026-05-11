@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import csv
 from contextlib import asynccontextmanager
 from datetime import datetime
+from io import StringIO
 import json
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi import Query
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from lsa.api.models import (
     AcknowledgeControlPlaneAlertRequest,
+    AssignRuntimeValidationChangeControlRequest,
     AssignRuntimeValidationReviewRequest,
     AssignControlPlaneOnCallChangeRequest,
     AuditRecordPayload,
@@ -29,6 +34,7 @@ from lsa.api.models import (
     ControlPlaneCutoverPreflightResponse,
     ControlPlaneCutoverPromotionResponse,
     ControlPlaneCutoverReadinessResponse,
+    ControlPlaneDeploymentReadinessResponse,
     ControlPlaneMaintenanceEventPayload,
     ControlPlaneMaintenancePreflightResponse,
     ControlPlaneRuntimeRehearsalResponse,
@@ -42,6 +48,16 @@ from lsa.api.models import (
     ControlPlaneRuntimeSmokeResponse,
     ControlPlaneRuntimeValidationResponse,
     ControlPlaneRuntimeValidationReviewPayload,
+    ControlPlaneRuntimeValidationReviewQueuePayload,
+    ControlPlaneRuntimeValidationReviewBulkActionPayload,
+    ControlPlaneRuntimeValidationGovernancePayload,
+    ControlPlaneRuntimeValidationChangeControlPayload,
+    ControlPlaneRuntimeValidationChangeControlQueuePayload,
+    ControlPlaneRuntimeValidationChangeControlBulkActionPayload,
+    BulkAssignRuntimeValidationReviewsRequest,
+    BulkResolveRuntimeValidationReviewsRequest,
+    BulkAssignRuntimeValidationChangeControlRequest,
+    BulkReviewRuntimeValidationChangeControlRequest,
     CreateControlPlaneAlertSilenceRequest,
     CreateControlPlaneOnCallChangeRequest,
     CreateControlPlaneOnCallScheduleRequest,
@@ -67,11 +83,14 @@ from lsa.api.models import (
     PostgresCutoverRehearsalResponse,
     PostgresRuntimeShadowSyncResponse,
     PostgresTargetInspectionResponse,
+    ProcessRuntimeValidationChangeControlRequest,
+    ProcessRuntimeValidationGovernanceRequest,
     ProcessRuntimeValidationReviewsRequest,
     PruneHistoryResponse,
     PrepareControlPlaneCutoverBundleRequest,
     PrepareControlPlaneCutoverBundleResponse,
     ReviewControlPlaneOnCallChangeRequest,
+    ReviewRuntimeValidationChangeControlRequest,
     ResolveRuntimeValidationReviewRequest,
     RunPostgresCutoverRehearsalRequest,
     RunControlPlaneMaintenanceWorkflowRequest,
@@ -99,6 +118,7 @@ from lsa.services.control_plane_backup_service import ControlPlaneBackupService
 from lsa.services.control_plane_cutover_promotion_service import ControlPlaneCutoverPromotionService
 from lsa.services.control_plane_cutover_service import ControlPlaneCutoverService
 from lsa.services.control_plane_cutover_readiness_service import ControlPlaneCutoverReadinessService
+from lsa.services.control_plane_deployment_readiness_service import ControlPlaneDeploymentReadinessService
 from lsa.services.control_plane_maintenance_service import ControlPlaneMaintenanceService
 from lsa.services.control_plane_runtime_rehearsal_service import ControlPlaneRuntimeRehearsalService
 from lsa.services.control_plane_runtime_smoke_service import ControlPlaneRuntimeSmokeService
@@ -178,6 +198,7 @@ control_plane_alert_service = ControlPlaneAlertService(
     sink_path=str(settings.control_plane_alert_sink_path),
     webhook_url=settings.control_plane_alert_webhook_url,
     escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
+    deployment_rejected_change_control_critical_age_hours=settings.analytics_deployment_rejected_change_control_critical_age_hours,
 )
 control_plane_backup_service = ControlPlaneBackupService(
     settings=settings,
@@ -197,6 +218,7 @@ job_service = JobService(
     control_plane_alert_service=control_plane_alert_service,
     control_plane_alert_interval_seconds=settings.control_plane_alert_interval_seconds,
     control_plane_alerts_enabled=settings.control_plane_alerts_enabled,
+    deployment_readiness_required_for_job_submission=settings.job_submission_deployment_readiness_required,
 )
 runtime_validation_review_service = ControlPlaneRuntimeValidationReviewService(
     settings=settings,
@@ -205,6 +227,14 @@ runtime_validation_review_service = ControlPlaneRuntimeValidationReviewService(
 )
 job_service.runtime_validation_review_service = runtime_validation_review_service
 control_plane_alert_service.runtime_validation_review_service = runtime_validation_review_service
+deployment_readiness_service = ControlPlaneDeploymentReadinessService(
+    settings=settings,
+    job_repository=job_repository,
+    job_service=job_service,
+)
+analytics_service.deployment_readiness_service = deployment_readiness_service
+job_service.deployment_readiness_service = deployment_readiness_service
+control_plane_alert_service.deployment_readiness_service = deployment_readiness_service
 metrics_service = ControlPlaneMetricsService(
     job_repository=job_repository,
     job_service=job_service,
@@ -303,6 +333,10 @@ def _control_plane_runtime_validation_service() -> ControlPlaneRuntimeValidation
     )
 
 
+def _control_plane_deployment_readiness_service() -> ControlPlaneDeploymentReadinessService:
+    return deployment_readiness_service
+
+
 def _postgres_runtime_shadow_service() -> PostgresRuntimeShadowService:
     return PostgresRuntimeShadowService(
         settings=settings,
@@ -322,6 +356,17 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Living Systems Auditor API", version="0.1.0", lifespan=lifespan)
+
+
+
+OPS_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend" / "ops"
+
+
+def _ops_frontend_html(filename: str) -> str:
+    return (OPS_FRONTEND_DIR / filename).read_text()
+
+
+app.mount("/ops-assets", StaticFiles(directory=OPS_FRONTEND_DIR / "assets"), name="ops-assets")
 
 
 def _parse_timestamp_query(raw_value: str | None) -> datetime | None:
@@ -408,9 +453,163 @@ def require_control_plane_mutation_allowed() -> None:
         raise HTTPException(status_code=503, detail="Control-plane maintenance mode is active.")
 
 
+def _render_runtime_validation_review_queue_csv(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> str:
+    summary = job_service.runtime_validation_review_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise HTTPException(status_code=500, detail="Runtime-validation review service is not configured.")
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "review_id",
+            "environment_name",
+            "status",
+            "owner_team",
+            "assigned_to",
+            "assigned_to_team",
+            "opened_at",
+            "opened_by",
+            "due_in_hours",
+            "next_due_at",
+            "policy_source",
+            "summary",
+        ]
+    )
+    for review in summary.reviews:
+        writer.writerow(
+            [
+                review.review_id,
+                review.environment_name,
+                review.status,
+                review.owner_team or "",
+                review.assigned_to or "",
+                review.assigned_to_team or "",
+                review.opened_at,
+                review.opened_by,
+                "" if review.due_in_hours is None else review.due_in_hours,
+                review.next_due_at or "",
+                review.policy_source,
+                review.summary,
+            ]
+        )
+    return output.getvalue()
+
+
+def _render_deployment_readiness_owner_team_queue_csv(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> str:
+    summary = job_service.runtime_validation_change_control_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise HTTPException(status_code=500, detail="Runtime-validation review service is not configured.")
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "request_id",
+            "environment_name",
+            "status",
+            "owner_team",
+            "assigned_to",
+            "assigned_to_team",
+            "opened_at",
+            "opened_by",
+            "governance_request_id",
+            "review_id",
+            "policy_source",
+            "summary",
+        ]
+    )
+    for request in summary.requests:
+        writer.writerow(
+            [
+                request.request_id,
+                request.environment_name,
+                request.status,
+                request.owner_team or "",
+                request.assigned_to or "",
+                request.assigned_to_team or "",
+                request.opened_at,
+                request.opened_by,
+                request.governance_request_id,
+                request.review_id,
+                request.policy_source,
+                request.summary,
+            ]
+        )
+    return output.getvalue()
+
+
+def _runtime_validation_review_queue_page() -> str:
+    return _ops_frontend_html("runtime-validation-review-queue.html")
+
+
+def _deployment_readiness_owner_team_queue_page() -> str:
+    return _ops_frontend_html("deployment-readiness-owner-team-queue.html")
+
+
+def _deployment_readiness_dashboard_page() -> str:
+    return _ops_frontend_html("deployment-readiness-dashboard.html")
+
+
+def _ops_home_page() -> str:
+    return _ops_frontend_html("index.html")
+
+
 @app.get("/metrics", response_class=PlainTextResponse, dependencies=[Depends(require_api_key)])
 async def metrics(days: int = Query(default=1, ge=1, le=30)) -> PlainTextResponse:
     return PlainTextResponse(metrics_service.render_prometheus(days=days), media_type="text/plain; version=0.0.4")
+
+
+@app.get(
+    "/ops",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def ops_home_page() -> HTMLResponse:
+    return HTMLResponse(_ops_home_page())
+
+
+@app.get(
+    "/ops/runtime-validation-review-queue",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def runtime_validation_review_queue_page() -> HTMLResponse:
+    return HTMLResponse(_runtime_validation_review_queue_page())
+
+
+@app.get(
+    "/ops/deployment-readiness-owner-team-queue",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def deployment_readiness_owner_team_queue_page() -> HTMLResponse:
+    return HTMLResponse(_deployment_readiness_owner_team_queue_page())
+
+
+@app.get(
+    "/ops/deployment-readiness-dashboard",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def deployment_readiness_dashboard_page() -> HTMLResponse:
+    return HTMLResponse(_deployment_readiness_dashboard_page())
 
 
 @app.get(
@@ -475,17 +674,160 @@ async def get_control_plane_runtime_validation() -> ControlPlaneRuntimeValidatio
 
 
 @app.get(
+    "/maintenance/control-plane-deployment-readiness",
+    response_model=ControlPlaneDeploymentReadinessResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_control_plane_deployment_readiness() -> ControlPlaneDeploymentReadinessResponse:
+    return ControlPlaneDeploymentReadinessResponse(**_control_plane_deployment_readiness_service().evaluate().to_dict())
+
+
+@app.get(
     "/maintenance/control-plane-runtime-validation-reviews",
     response_model=list[ControlPlaneRuntimeValidationReviewPayload],
     dependencies=[Depends(require_api_key)],
 )
 async def list_control_plane_runtime_validation_reviews(
     status: str | None = Query(default=None),
+    owner_team: str | None = Query(default=None),
+    assignment_state: str | None = Query(default=None),
 ) -> list[ControlPlaneRuntimeValidationReviewPayload]:
     return [
         ControlPlaneRuntimeValidationReviewPayload(**record.to_dict())
-        for record in job_service.list_runtime_validation_reviews(status=status)
+        for record in job_service.list_runtime_validation_reviews(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
     ]
+
+
+@app.get(
+    "/maintenance/control-plane-runtime-validation-governance-requests",
+    response_model=list[ControlPlaneRuntimeValidationGovernancePayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_control_plane_runtime_validation_governance_requests(
+    status: str | None = Query(default=None),
+    owner_team: str | None = Query(default=None),
+) -> list[ControlPlaneRuntimeValidationGovernancePayload]:
+    return [
+        ControlPlaneRuntimeValidationGovernancePayload(**record.to_dict())
+        for record in job_service.list_runtime_validation_governance_requests(
+            status=status,
+            owner_team=owner_team,
+        )
+    ]
+
+
+@app.get(
+    "/maintenance/control-plane-runtime-validation-change-control-requests",
+    response_model=list[ControlPlaneRuntimeValidationChangeControlPayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_control_plane_runtime_validation_change_control_requests(
+    status: str | None = Query(default=None),
+    owner_team: str | None = Query(default=None),
+) -> list[ControlPlaneRuntimeValidationChangeControlPayload]:
+    return [
+        ControlPlaneRuntimeValidationChangeControlPayload(**record.to_dict())
+        for record in job_service.list_runtime_validation_change_control_requests(
+            status=status,
+            owner_team=owner_team,
+        )
+    ]
+
+
+@app.get(
+    "/maintenance/control-plane-deployment-readiness/owner-team-queue",
+    response_model=ControlPlaneRuntimeValidationChangeControlQueuePayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_control_plane_deployment_readiness_owner_team_queue(
+    status: str | None = Query(default=None),
+    owner_team: str | None = Query(default=None),
+    assignment_state: str | None = Query(default=None),
+) -> ControlPlaneRuntimeValidationChangeControlQueuePayload:
+    summary = job_service.runtime_validation_change_control_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise HTTPException(status_code=500, detail="Runtime-validation review service is not configured.")
+    return ControlPlaneRuntimeValidationChangeControlQueuePayload(**summary.to_dict())
+
+
+@app.get(
+    "/maintenance/control-plane-deployment-readiness/owner-team-queue.csv",
+    response_class=PlainTextResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def export_control_plane_deployment_readiness_owner_team_queue_csv(
+    status: str | None = Query(default=None),
+    owner_team: str | None = Query(default=None),
+    assignment_state: str | None = Query(default=None),
+) -> PlainTextResponse:
+    owner_label = (owner_team or "all").replace("/", "-")
+    return PlainTextResponse(
+        _render_deployment_readiness_owner_team_queue_csv(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        ),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="deployment-readiness-owner-team-queue-{owner_label}.csv"'
+            )
+        },
+    )
+
+
+@app.get(
+    "/maintenance/control-plane-runtime-validation-review-queue",
+    response_model=ControlPlaneRuntimeValidationReviewQueuePayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_control_plane_runtime_validation_review_queue(
+    status: str | None = Query(default=None),
+    owner_team: str | None = Query(default=None),
+    assignment_state: str | None = Query(default=None),
+) -> ControlPlaneRuntimeValidationReviewQueuePayload:
+    summary = job_service.runtime_validation_review_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise HTTPException(status_code=500, detail="Runtime-validation review service is not configured.")
+    return ControlPlaneRuntimeValidationReviewQueuePayload(**summary.to_dict())
+
+
+@app.get(
+    "/maintenance/control-plane-runtime-validation-review-queue.csv",
+    response_class=PlainTextResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def export_control_plane_runtime_validation_review_queue_csv(
+    status: str | None = Query(default=None),
+    owner_team: str | None = Query(default=None),
+    assignment_state: str | None = Query(default=None),
+) -> PlainTextResponse:
+    owner_label = (owner_team or "all").replace("/", "-")
+    return PlainTextResponse(
+        _render_runtime_validation_review_queue_csv(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        ),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="runtime-validation-review-queue-{owner_label}.csv"'
+            )
+        },
+    )
 
 
 @app.post(
@@ -504,6 +846,130 @@ async def process_control_plane_runtime_validation_reviews(
             force=request.force,
         )
     ]
+
+
+@app.post(
+    "/maintenance/control-plane-runtime-validation-governance-requests/process",
+    response_model=list[ControlPlaneRuntimeValidationGovernancePayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def process_control_plane_runtime_validation_governance_requests(
+    request: ProcessRuntimeValidationGovernanceRequest,
+) -> list[ControlPlaneRuntimeValidationGovernancePayload]:
+    return [
+        ControlPlaneRuntimeValidationGovernancePayload(**record.to_dict())
+        for record in job_service.process_runtime_validation_governance(
+            changed_by=request.changed_by,
+            reason=request.reason,
+            force=request.force,
+        )
+    ]
+
+
+@app.post(
+    "/maintenance/control-plane-runtime-validation-change-control-requests/process",
+    response_model=list[ControlPlaneRuntimeValidationChangeControlPayload],
+    dependencies=[Depends(require_api_key)],
+)
+async def process_control_plane_runtime_validation_change_control_requests(
+    request: ProcessRuntimeValidationChangeControlRequest,
+) -> list[ControlPlaneRuntimeValidationChangeControlPayload]:
+    return [
+        ControlPlaneRuntimeValidationChangeControlPayload(**record.to_dict())
+        for record in job_service.process_runtime_validation_change_control(
+            changed_by=request.changed_by,
+            reason=request.reason,
+            force=request.force,
+        )
+    ]
+
+
+@app.post(
+    "/maintenance/control-plane-runtime-validation-change-control-requests/{request_id}/assign",
+    response_model=ControlPlaneRuntimeValidationChangeControlPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def assign_control_plane_runtime_validation_change_control_request(
+    request_id: str,
+    request: AssignRuntimeValidationChangeControlRequest,
+) -> ControlPlaneRuntimeValidationChangeControlPayload:
+    try:
+        record = job_service.assign_runtime_validation_change_control_request(
+            request_id=request_id,
+            assigned_to=request.assigned_to,
+            assigned_to_team=request.assigned_to_team,
+            assigned_by=request.assigned_by,
+            assignment_note=request.assignment_note,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneRuntimeValidationChangeControlPayload(**record.to_dict())
+
+
+@app.post(
+    "/maintenance/control-plane-runtime-validation-change-control-requests/{request_id}/review",
+    response_model=ControlPlaneRuntimeValidationChangeControlPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def review_control_plane_runtime_validation_change_control_request(
+    request_id: str,
+    request: ReviewRuntimeValidationChangeControlRequest,
+) -> ControlPlaneRuntimeValidationChangeControlPayload:
+    try:
+        record = job_service.decide_runtime_validation_change_control_request(
+            request_id=request_id,
+            decision=request.decision,
+            decided_by=request.decided_by,
+            decision_note=request.decision_note,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneRuntimeValidationChangeControlPayload(**record.to_dict())
+
+
+@app.post(
+    "/maintenance/control-plane-runtime-validation-change-control-requests/bulk-assign",
+    response_model=ControlPlaneRuntimeValidationChangeControlBulkActionPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def bulk_assign_control_plane_runtime_validation_change_control_requests(
+    request: BulkAssignRuntimeValidationChangeControlRequest,
+) -> ControlPlaneRuntimeValidationChangeControlBulkActionPayload:
+    try:
+        result = job_service.bulk_assign_runtime_validation_change_control_requests(
+            assigned_to=request.assigned_to,
+            assigned_to_team=request.assigned_to_team,
+            assigned_by=request.assigned_by,
+            assignment_note=request.assignment_note,
+            status=request.status,
+            owner_team=request.owner_team,
+            assignment_state=request.assignment_state,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneRuntimeValidationChangeControlBulkActionPayload(**result.to_dict())
+
+
+@app.post(
+    "/maintenance/control-plane-runtime-validation-change-control-requests/bulk-review",
+    response_model=ControlPlaneRuntimeValidationChangeControlBulkActionPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def bulk_review_control_plane_runtime_validation_change_control_requests(
+    request: BulkReviewRuntimeValidationChangeControlRequest,
+) -> ControlPlaneRuntimeValidationChangeControlBulkActionPayload:
+    try:
+        result = job_service.bulk_decide_runtime_validation_change_control_requests(
+            decision=request.decision,
+            decided_by=request.decided_by,
+            decision_note=request.decision_note,
+            status=request.status,
+            owner_team=request.owner_team,
+            assignment_state=request.assignment_state,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneRuntimeValidationChangeControlBulkActionPayload(**result.to_dict())
 
 
 @app.post(
@@ -529,6 +995,29 @@ async def assign_control_plane_runtime_validation_review(
 
 
 @app.post(
+    "/maintenance/control-plane-runtime-validation-reviews/bulk-assign",
+    response_model=ControlPlaneRuntimeValidationReviewBulkActionPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def bulk_assign_control_plane_runtime_validation_reviews(
+    request: BulkAssignRuntimeValidationReviewsRequest,
+) -> ControlPlaneRuntimeValidationReviewBulkActionPayload:
+    try:
+        result = job_service.bulk_assign_runtime_validation_reviews(
+            assigned_to=request.assigned_to,
+            assigned_to_team=request.assigned_to_team,
+            assigned_by=request.assigned_by,
+            assignment_note=request.assignment_note,
+            status=request.status,
+            owner_team=request.owner_team,
+            assignment_state=request.assignment_state,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneRuntimeValidationReviewBulkActionPayload(**result.to_dict())
+
+
+@app.post(
     "/maintenance/control-plane-runtime-validation-reviews/{review_id}/resolve",
     response_model=ControlPlaneRuntimeValidationReviewPayload,
     dependencies=[Depends(require_api_key)],
@@ -547,6 +1036,28 @@ async def resolve_control_plane_runtime_validation_review(
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ControlPlaneRuntimeValidationReviewPayload(**record.to_dict())
+
+
+@app.post(
+    "/maintenance/control-plane-runtime-validation-reviews/bulk-resolve",
+    response_model=ControlPlaneRuntimeValidationReviewBulkActionPayload,
+    dependencies=[Depends(require_api_key)],
+)
+async def bulk_resolve_control_plane_runtime_validation_reviews(
+    request: BulkResolveRuntimeValidationReviewsRequest,
+) -> ControlPlaneRuntimeValidationReviewBulkActionPayload:
+    try:
+        result = job_service.bulk_resolve_runtime_validation_reviews(
+            resolved_by=request.resolved_by,
+            resolution_note=request.resolution_note,
+            resolution_reason=request.resolution_reason,
+            status=request.status,
+            owner_team=request.owner_team,
+            assignment_state=request.assignment_state,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ControlPlaneRuntimeValidationReviewBulkActionPayload(**result.to_dict())
 
 
 @app.get(

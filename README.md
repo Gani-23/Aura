@@ -302,7 +302,32 @@ The same runtime-validation policy bundle can now also govern review ownership w
 
 That lets `prod` reviews open directly into the right team lane instead of relying on ad hoc assignment after the fact.
 
+Runtime-validation review analytics now also expose owner-team rollups plus stale/unassigned review counts, and the review list surfaces can be filtered by `status`, `owner_team`, and `assignment_state` for queue-style operator views.
+
+There is now also a dedicated queue summary surface for this backlog:
+
+- `GET /maintenance/control-plane-runtime-validation-review-queue`
+- `lsa control-plane-runtime-validation-review-queue`
+
+Those surfaces return owner-team rollups, stale/unassigned totals, and the filtered matching reviews in one operator-friendly payload.
+
 On top of that, runtime proof now has a first-class review queue. `lsa process-control-plane-runtime-validation-reviews` and `POST /maintenance/control-plane-runtime-validation-reviews/process` open review requests when proof is `due_soon`, `aging`, `overdue`, `missing`, or `failed`, and automatically resolve them when proof returns to policy. Reviews are rebuilt from the append-only maintenance-event stream, so the workflow stays durable and audit-friendly without introducing a second fragile state store.
+
+Critical unassigned runtime-proof review debt can now auto-open governance escalation requests as a second lane of operator work. `lsa process-control-plane-runtime-validation-governance-requests` and `POST /maintenance/control-plane-runtime-validation-governance-requests/process` derive those requests from the same maintenance-event stream, so stricter team-level SLA breaches can become explicit governed work instead of living only as alerts.
+
+Those governance requests can now also auto-open explicit change-control requests through `lsa process-control-plane-runtime-validation-change-control-requests` and `POST /maintenance/control-plane-runtime-validation-change-control-requests/process`, so the escalation path is no longer only “alert, then governance note.” It can now become a tracked change-control lane that operators can list and process directly.
+
+That change-control lane now supports assignment plus approve/reject review decisions through matching API and CLI flows, so teams can move the escalation from “opened” to explicit owned and decided states without leaving the runtime-validation workflow.
+
+Unresolved or rejected runtime-validation change-control requests now also flow into cutover readiness as explicit blockers, so a backend promotion cannot present as ready while runtime-proof governance is still unresolved.
+
+Promotion policy is now more specific too: rejected runtime-validation change-control debt is non-overridable during cutover promotion, while merely pending change-control debt can still be surfaced distinctly and handled under explicit operator override policy.
+
+There is now also a broader deployment-readiness surface, so these runtime-validation and change-control outcomes are not only visible inside cutover logic. Operators can query deployment readiness directly and see the same runtime-proof and change-control blockers before broader release actions.
+
+That deployment-readiness signal can now also be enforced by maintenance preflight and runtime rehearsal through explicit environment flags, so the project can move from “visible policy” to “gating policy” without rewriting the operator flow.
+
+Deployment readiness now also has its own alert family, and it can optionally block new audit job submissions when the environment is not ready. That lets teams choose whether deployment policy remains advisory or starts preventing new control-plane work from entering the queue under blocked conditions.
 
 Runtime proof now also has its own alert family in the control-plane pipeline. When proof is `due_soon`, `aging`, `overdue`, `missing`, or `failed`, the worker can emit a dedicated `control-plane-runtime-validation:*` incident alongside the broader aggregate control-plane evaluation alert. That keeps runtime-proof freshness visible even when other degraded conditions are present, and it gives reminders/escalations a stable chain to follow for this one operator concern.
 
@@ -417,7 +442,7 @@ History retention is now time-based and configurable. Worker heartbeat history d
 
 Those same rollups now feed a control-plane analytics surface for operators. `GET /analytics/control-plane?days=30` and `lsa control-plane-analytics --days 30` summarize queue shape, current worker health, lease churn, and job throughput over a bounded time window by merging both raw recent history and already-compacted day buckets. That keeps the newest operating window accurate instead of making the post-compaction timeline look artificially sparse.
 
-That analytics payload now also includes a `runtime_validation` block derived from the latest runtime rehearsal evidence, and the evaluation layer can raise findings like `runtime_rehearsal_missing`, `runtime_rehearsal_failed`, or `runtime_rehearsal_age` when control-plane runtime proof is absent or stale.
+That analytics payload now also includes a `runtime_validation` block derived from the latest runtime rehearsal evidence, plus a `deployment_readiness` block with blocker counts, warning counts, and pending/rejected runtime-validation change-control debt. The evaluation layer can raise findings like `runtime_rehearsal_missing`, `runtime_rehearsal_failed`, `runtime_rehearsal_age`, or `deployment_readiness_blocked` when runtime proof or release governance is not healthy.
 
 It can also now raise `runtime_rehearsal_due_soon` before the warning-age threshold is actually crossed, so teams can refresh runtime proof proactively instead of finding out at cutover or promotion time.
 

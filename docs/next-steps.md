@@ -3,9 +3,8 @@
 ## Immediate
 
 1. Keep runtime-proof review work actionable:
-   - decide when unresolved review work should auto-open stronger change-control paths
-   - decide when unresolved review work should auto-open stronger change-control paths
-   - add review-level SLA analytics beyond the current alert escalation path
+   - add owner-team escalation and queue-burn views on top of deployment-readiness analytics
+   - decide when unresolved review debt should block more day-2 operator workflows, not just deployment/cutover
 2. Keep reducing mixed-backend risk:
    - extend live Postgres runtime coverage beyond the current slices
    - prove more of the steady-state control plane on Postgres

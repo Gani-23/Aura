@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LSA Ops</title>
+  <link rel="stylesheet" href="/ops-assets/ops-shell.css" />
+  <style>
+    .toolbar{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;margin-bottom:18px}
+    .stats{grid-template-columns:repeat(4,minmax(0,1fr))}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="nav">
+      <div class="brand"><div class="mark"></div><div class="copy"><strong>LSA Ops</strong><span>Control plane operations</span></div></div>
+    </section>
+    <section class="hero">
+      <h1>Ops Home</h1>
+      <p>Fast launch point for deployment governance, owner-team debt, and runtime-proof review operations.</p>
+    </section>
+    <section class="toolbar">
+      <div class="span-8"><label>API Key</label><input id="api-key" type="password" /></div>
+      <div class="span-4" style="display:flex;align-items:end"><button id="refresh-btn" type="button">Refresh Status</button></div>
+    </section>
+    <div class="notice" id="notice"></div>
+    <section class="stats">
+      <div class="stat"><div class="k">Deployment Ready</div><div class="v" id="stat-ready">-</div></div>
+      <div class="stat"><div class="k">Blockers</div><div class="v" id="stat-blockers">0</div></div>
+      <div class="stat"><div class="k">Owner Teams</div><div class="v" id="stat-owner-teams">0</div></div>
+      <div class="stat"><div class="k">Active Alerts</div><div class="v" id="stat-alerts">0</div></div>
+    </section>
+    <section class="cards">
+      <a class="card" href="/ops/deployment-readiness-dashboard">
+        <span class="pill">Dashboard</span>
+        <h2>Deployment Readiness</h2>
+        <p>Readiness, cutover blockers, alerts, silences, and release decisions in one surface.</p>
+      </a>
+      <a class="card" href="/ops/deployment-readiness-owner-team-queue">
+        <span class="pill">Queue</span>
+        <h2>Owner-Team Debt</h2>
+        <p>Team-scoped deployment blockers with bulk assign, review, and export flows.</p>
+      </a>
+      <a class="card" href="/ops/runtime-validation-review-queue">
+        <span class="pill">Runtime</span>
+        <h2>Runtime Reviews</h2>
+        <p>Runtime-proof freshness queue with owner rollups and backlog handling.</p>
+      </a>
+    </section>
+  </div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+  <script>
+    const els={apiKey:document.getElementById("api-key"),notice:document.getElementById("notice"),ready:document.getElementById("stat-ready"),blockers:document.getElementById("stat-blockers"),ownerTeams:document.getElementById("stat-owner-teams"),alerts:document.getElementById("stat-alerts"),refreshBtn:document.getElementById("refresh-btn")};
+    const keyStore="lsa-ops-api-key"; els.apiKey.value=localStorage.getItem(keyStore)||""; const statState={blockers:0,ownerTeams:0,alerts:0};
+    function setNotice(t,c=""){els.notice.className=`notice ${c}`; els.notice.textContent=t}
+    function authHeaders(){const key=els.apiKey.value.trim(); localStorage.setItem(keyStore,key); return key?{"X-API-Key":key,"Content-Type":"application/json"}:{"Content-Type":"application/json"}}
+    async function fetchJson(url){const r=await fetch(url,{headers:authHeaders()}); if(!r.ok){let d=`${r.status} ${r.statusText}`; try{const p=await r.json(); if(p.detail)d=p.detail}catch{} throw new Error(d)} return r.json()}
+    function animateNumber(el,key,next){if(!window.anime){el.textContent=String(next); statState[key]=next; return} const state={value:statState[key]||0}; anime({targets:state,value:Number(next)||0,round:1,easing:"easeOutExpo",duration:900,update(){el.textContent=String(state.value)}}); statState[key]=Number(next)||0}
+    function pulse(){if(!window.anime)return; anime({targets:'.stat,.card,.hero,.nav',opacity:[0,1],translateY:[10,0],delay:anime.stagger(40,{start:50}),duration:560,easing:'easeOutCubic'})}
+    async function load(){setNotice("Loading status..."); try{const [readiness,alerts]=await Promise.all([fetchJson("/maintenance/control-plane-deployment-readiness"),fetchJson("/control-plane-alerts?limit=50")]); els.ready.textContent=readiness.ready?"yes":"no"; animateNumber(els.blockers,"blockers",readiness.blockers.length||0); animateNumber(els.ownerTeams,"ownerTeams",readiness.blocked_owner_team_count||0); animateNumber(els.alerts,"alerts",(alerts||[]).filter(a=>a.status!=="healthy").length); pulse(); setNotice("Status loaded.","good")}catch(e){setNotice(String(e.message||e),"bad")}}
+    els.refreshBtn.addEventListener("click",load); load();
+  </script>
+</body>
+</html>

@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deployment Readiness Dashboard</title>
+  <link rel="stylesheet" href="/ops-assets/ops-shell.css" />
+  <style>
+    .stats{grid-template-columns:repeat(6,minmax(0,1fr))}
+    .layout{grid-template-columns:1.05fr .95fr}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav class="nav">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div class="brand-copy">
+          <strong>LSA Ops</strong>
+          <span>Deployment governance cockpit</span>
+        </div>
+      </div>
+      <div class="nav-links">
+        <a class="nav-link" href="/ops">Home</a>
+        <a class="nav-link" href="/ops/deployment-readiness-owner-team-queue">Owner-Team Queue</a>
+        <a class="nav-link active" href="/ops/deployment-readiness-dashboard">Dashboard</a>
+        <a class="nav-link" href="/ops/runtime-validation-review-queue">Runtime Reviews</a>
+      </div>
+    </nav>
+    <section class="hero">
+      <h1>Deployment Readiness Dashboard</h1>
+      <p>Single ops view for deployment readiness, owner-team blocking debt, cutover blockers, and recent control-plane alerts.</p>
+    </section>
+
+    <section class="panel" style="margin-bottom:16px">
+      <div class="filters">
+        <div class="span-4"><label>API Key</label><input id="api-key" type="password" /></div>
+        <div class="span-4"><label>Target Database URL</label><input id="target-db" type="text" placeholder="postgresql://..." /></div>
+        <div class="span-4"><label>Cutover Package Dir</label><input id="package-dir" type="text" placeholder="/path/to/package" /></div>
+        <div class="span-3"><label>Owner Team</label><input id="owner-team" type="text" placeholder="platform" /></div>
+        <div class="span-3"><label>Queue Status</label><select id="queue-status"><option value="">Any</option><option value="pending_review">Pending Review</option><option value="rejected">Rejected</option></select></div>
+        <div class="span-3"><label>Assignment</label><select id="assignment-state"><option value="">Any</option><option value="assigned">Assigned</option><option value="unassigned">Unassigned</option></select></div>
+        <div class="span-3"><label>Alert Limit</label><input id="alert-limit" type="number" min="1" max="200" value="20" /></div>
+        <div class="span-3"><label>Auto Refresh</label><select id="auto-refresh-seconds"><option value="0">Off</option><option value="15">15s</option><option value="30" selected>30s</option><option value="60">60s</option><option value="120">120s</option></select></div>
+        <div class="span-12">
+          <button id="refresh-btn">Refresh Dashboard</button>
+          <button id="pause-btn" class="ghost" type="button">Pause Auto Refresh</button>
+          <button id="queue-btn" class="ghost" type="button">Open Owner-Team Queue</button>
+        </div>
+      </div>
+      <div id="notice" class="muted"></div>
+      <div class="livebar">
+        <span id="live-dot" class="dot live"></span>
+        <span id="live-status" class="mini">Auto refresh active.</span>
+        <span id="last-refresh" class="mini">Last refresh: never</span>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="stat"><div class="k">Ready</div><div class="v" id="stat-ready">-</div></div>
+      <div class="stat"><div class="k">Blockers</div><div class="v bad" id="stat-blockers">0</div></div>
+      <div class="stat"><div class="k">Warnings</div><div class="v warn" id="stat-warnings">0</div></div>
+      <div class="stat"><div class="k">Owner Teams</div><div class="v" id="stat-owner-teams">0</div></div>
+      <div class="stat"><div class="k">Pending Debt</div><div class="v warn" id="stat-pending">0</div></div>
+      <div class="stat"><div class="k">Rejected Debt</div><div class="v bad" id="stat-rejected">0</div></div>
+    </section>
+
+    <section class="layout">
+      <div class="grid">
+        <section class="panel">
+          <h2>Deployment Readiness</h2>
+          <div id="readiness-summary" class="muted">No data yet.</div>
+          <table><thead><tr><th>Blocker</th></tr></thead><tbody id="readiness-blockers"></tbody></table>
+        </section>
+        <section class="panel">
+          <h2>Owner Team Debt</h2>
+          <table><thead><tr><th>Owner Team</th><th>Total</th><th>Pending</th><th>Rejected</th><th>Assigned</th><th>Unassigned</th><th>Oldest Rejected</th></tr></thead><tbody id="owner-rollups"></tbody></table>
+        </section>
+      </div>
+      <div class="grid">
+        <section class="panel">
+          <h2>Cutover Readiness</h2>
+          <div id="cutover-summary" class="muted">Enter target DB and package dir to evaluate.</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">
+            <button id="runtime-rehearsal-btn" type="button">Run Runtime Rehearsal</button>
+            <button id="cutover-refresh-btn" type="button">Run Cutover Readiness</button>
+            <select id="cutover-decision"><option value="approve">Approve</option><option value="reject">Reject</option></select>
+            <input id="cutover-by" type="text" placeholder="operator-prod" style="max-width:220px" />
+            <input id="cutover-note" type="text" placeholder="decision note" style="flex:1;min-width:220px" />
+            <button id="cutover-decide-btn" class="ghost" type="button">Submit Decision</button>
+          </div>
+          <table><thead><tr><th>Blocker</th></tr></thead><tbody id="cutover-blockers"></tbody></table>
+        </section>
+        <section class="panel">
+          <h2>Recent Alerts</h2>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+            <input id="alert-actor" type="text" placeholder="operator-prod" style="max-width:220px" />
+            <input id="alert-note" type="text" placeholder="note for acknowledge/silence" style="flex:1;min-width:220px" />
+            <input id="silence-minutes" type="number" min="1" value="60" style="max-width:130px" />
+            <button id="emit-alerts-btn" class="ghost" type="button">Emit Alerts Now</button>
+          </div>
+          <table><thead><tr><th>When</th><th>Status</th><th>Key</th><th>Summary</th></tr></thead><tbody id="alerts"></tbody></table>
+        </section>
+        <section class="panel">
+          <h2>Active Silences</h2>
+          <table><thead><tr><th>When</th><th>Matcher</th><th>Reason</th><th>Expires</th><th>Action</th></tr></thead><tbody id="silences"></tbody></table>
+        </section>
+        <section class="panel">
+          <h2>Recent Activity</h2>
+          <table><thead><tr><th>When</th><th>Type</th><th>By</th><th>Reason</th></tr></thead><tbody id="events"></tbody></table>
+        </section>
+      </div>
+    </section>
+  </div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+  <script>
+    const els={apiKey:document.getElementById("api-key"),targetDb:document.getElementById("target-db"),packageDir:document.getElementById("package-dir"),ownerTeam:document.getElementById("owner-team"),queueStatus:document.getElementById("queue-status"),assignmentState:document.getElementById("assignment-state"),alertLimit:document.getElementById("alert-limit"),autoRefreshSeconds:document.getElementById("auto-refresh-seconds"),notice:document.getElementById("notice"),liveDot:document.getElementById("live-dot"),liveStatus:document.getElementById("live-status"),lastRefresh:document.getElementById("last-refresh"),ready:document.getElementById("stat-ready"),blockers:document.getElementById("stat-blockers"),warnings:document.getElementById("stat-warnings"),ownerTeams:document.getElementById("stat-owner-teams"),pending:document.getElementById("stat-pending"),rejected:document.getElementById("stat-rejected"),readinessSummary:document.getElementById("readiness-summary"),readinessBlockers:document.getElementById("readiness-blockers"),ownerRollups:document.getElementById("owner-rollups"),cutoverSummary:document.getElementById("cutover-summary"),cutoverBlockers:document.getElementById("cutover-blockers"),alerts:document.getElementById("alerts"),silences:document.getElementById("silences"),events:document.getElementById("events"),refreshBtn:document.getElementById("refresh-btn"),pauseBtn:document.getElementById("pause-btn"),queueBtn:document.getElementById("queue-btn"),alertActor:document.getElementById("alert-actor"),alertNote:document.getElementById("alert-note"),silenceMinutes:document.getElementById("silence-minutes"),emitAlertsBtn:document.getElementById("emit-alerts-btn"),runtimeRehearsalBtn:document.getElementById("runtime-rehearsal-btn"),cutoverRefreshBtn:document.getElementById("cutover-refresh-btn"),cutoverDecision:document.getElementById("cutover-decision"),cutoverBy:document.getElementById("cutover-by"),cutoverNote:document.getElementById("cutover-note"),cutoverDecideBtn:document.getElementById("cutover-decide-btn")};
+    const keyStore="lsa-ops-api-key"; els.apiKey.value=localStorage.getItem(keyStore)||"";
+    const statState={blockers:0,warnings:0,ownerTeams:0,pending:0,rejected:0};
+    const autoRefreshStore="lsa-ops-dashboard-auto-refresh-seconds";
+    const autoRefreshPausedStore="lsa-ops-dashboard-auto-refresh-paused";
+    els.autoRefreshSeconds.value=localStorage.getItem(autoRefreshStore)||"30";
+    let autoRefreshTimer=null;
+    let autoRefreshPaused=localStorage.getItem(autoRefreshPausedStore)==="1";
+    let loadInFlight=false;
+    function setNotice(t,c="muted"){els.notice.className=c;els.notice.textContent=t}
+    function authHeaders(){const key=els.apiKey.value.trim(); localStorage.setItem(keyStore,key); return key?{"X-API-Key":key,"Content-Type":"application/json"}:{"Content-Type":"application/json"}}
+    async function fetchJson(url,opt={}){const r=await fetch(url,{...opt,headers:{...authHeaders(),...(opt.headers||{})}}); if(!r.ok){let d=`${r.status} ${r.statusText}`; try{const p=await r.json(); if(p.detail)d=p.detail}catch{} throw new Error(d)} return r.json()}
+    function badge(status){if(status==="healthy"||status==="ready")return `<span class="badge ok">${status}</span>`; if(status==="degraded"||status==="warning")return `<span class="badge degraded">${status}</span>`; return `<span class="badge blocked">${status}</span>`}
+    function animateNumber(el,key,next){if(!window.anime){el.textContent=String(next); statState[key]=next; return} const state={value:statState[key]||0}; anime({targets:state,value:Number(next)||0,round:1,easing:"easeOutExpo",duration:900,update(){el.textContent=String(state.value)}}); statState[key]=Number(next)||0}
+    function animateRows(selector){if(!window.anime)return; anime({targets:selector,translateY:[14,0],opacity:[0,1],delay:anime.stagger(28),duration:500,easing:"easeOutQuad"})}
+    function pulsePanels(){if(!window.anime)return; anime({targets:'.stat,.panel',opacity:[0,1],translateY:[8,0],delay:anime.stagger(35,{start:40}),duration:520,easing:'easeOutCubic'})}
+    function pulseLiveDot(){if(!window.anime)return; anime.remove(els.liveDot); anime({targets:els.liveDot,boxShadow:["0 0 0 0 rgba(13,107,107,.28)","0 0 0 12px rgba(13,107,107,0)"],duration:1200,easing:"easeOutCubic",loop:true})}
+    function stopLiveDot(){if(!window.anime)return; anime.remove(els.liveDot); els.liveDot.style.boxShadow="0 0 0 0 rgba(13,107,107,0)"}
+    function updateAutoRefreshUi(){const seconds=Number(els.autoRefreshSeconds.value||0); els.liveDot.classList.toggle("live",!autoRefreshPaused&&seconds>0); els.liveDot.classList.toggle("paused",autoRefreshPaused||seconds===0); els.pauseBtn.textContent=autoRefreshPaused?"Resume Auto Refresh":"Pause Auto Refresh"; els.liveStatus.textContent=seconds===0?"Auto refresh off.":autoRefreshPaused?`Auto refresh paused (${seconds}s).`:`Auto refresh every ${seconds}s.`; if(!autoRefreshPaused&&seconds>0)pulseLiveDot(); else stopLiveDot()}
+    function updateLastRefresh(){els.lastRefresh.textContent=`Last refresh: ${new Date().toLocaleTimeString()}`}
+    function syncAutoRefresh(){localStorage.setItem(autoRefreshStore,els.autoRefreshSeconds.value); localStorage.setItem(autoRefreshPausedStore,autoRefreshPaused?"1":"0"); if(autoRefreshTimer){clearInterval(autoRefreshTimer); autoRefreshTimer=null} const seconds=Number(els.autoRefreshSeconds.value||0); updateAutoRefreshUi(); if(autoRefreshPaused||seconds===0)return; autoRefreshTimer=setInterval(()=>{if(!loadInFlight)load({silent:true})},seconds*1000)}
+    function renderReadiness(data){els.ready.innerHTML=badge(data.ready?"ready":"blocked"); animateNumber(els.blockers,"blockers",data.blocker_count ?? data.blockers.length); animateNumber(els.warnings,"warnings",data.warning_count ?? data.warnings.length); animateNumber(els.ownerTeams,"ownerTeams",data.blocked_owner_team_count||0); animateNumber(els.pending,"pending",data.pending_change_control_count||0); animateNumber(els.rejected,"rejected",data.rejected_change_control_count||0); els.readinessSummary.innerHTML=`Env <span class="mono">${data.environment_name}</span>. ${data.ready?'<span class="good">Ready</span>':'<span class="bad">Blocked</span>'}. Oldest rejected age: ${data.oldest_rejected_age_hours??'n/a'}h.`; els.readinessBlockers.innerHTML=(data.blockers||[]).length?(data.blockers||[]).map(b=>`<tr><td class="mono">${b}</td></tr>`).join(""):`<tr><td class="muted">No blockers.</td></tr>`; animateRows('#readiness-blockers tr')}
+    function renderOwnerQueue(data){els.ownerRollups.innerHTML=(data.owner_team_rollups||[]).length?(data.owner_team_rollups||[]).map(r=>`<tr><td><button class="ghost owner-btn" data-owner="${r.owner_team}">${r.owner_team}</button></td><td>${r.total_requests||r.total_blocking_requests}</td><td>${r.pending_review_count}</td><td class="${r.rejected_count?'bad':''}">${r.rejected_count}</td><td>${r.assigned_requests||r.assigned_count}</td><td>${r.unassigned_requests||r.unassigned_count}</td><td>${r.oldest_rejected_age_hours??'<span class="muted">n/a</span>'}</td></tr>`).join(""):`<tr><td colspan="7" class="muted">No owner-team debt.</td></tr>`; document.querySelectorAll(".owner-btn").forEach(b=>b.addEventListener("click",()=>{els.ownerTeam.value=b.dataset.owner==="unowned"?"":b.dataset.owner; load()})); animateRows('#owner-rollups tr')}
+    function renderCutover(data){els.cutoverSummary.innerHTML=`Final status: ${badge(data.ready?"ready":"blocked")} ${data.package_valid===false?'<span class="bad">package invalid</span>':''}`; els.cutoverBlockers.innerHTML=(data.blockers||[]).length?(data.blockers||[]).map(b=>`<tr><td class="mono">${b}</td></tr>`).join(""):`<tr><td class="muted">No blockers.</td></tr>`; animateRows('#cutover-blockers tr')}
+    function renderAlerts(data){els.alerts.innerHTML=(data||[]).length?data.map(a=>`<tr><td class="mono">${a.created_at}</td><td>${badge(a.status)}</td><td class="mono">${a.alert_key}</td><td><div>${a.summary}</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"><button class="ghost ack-btn" data-id="${a.alert_id}">Ack</button><button class="ghost silence-key-btn" data-key="${a.alert_key}">Silence Key</button>${(a.finding_codes||[]).length?`<button class="ghost silence-code-btn" data-code="${a.finding_codes[0]}">Silence Code</button>`:""}</div></td></tr>`).join(""):`<tr><td colspan="4" class="muted">No alerts.</td></tr>`;
+      document.querySelectorAll(".ack-btn").forEach(b=>b.addEventListener("click",()=>ackAlert(b.dataset.id)));
+      document.querySelectorAll(".silence-key-btn").forEach(b=>b.addEventListener("click",()=>silenceAlertKey(b.dataset.key)));
+      document.querySelectorAll(".silence-code-btn").forEach(b=>b.addEventListener("click",()=>silenceFindingCode(b.dataset.code)));
+      animateRows('#alerts tr')
+    }
+    function renderSilences(data){els.silences.innerHTML=(data||[]).length?data.map(s=>`<tr><td class="mono">${s.created_at}</td><td class="mono">${s.match_alert_key||s.match_finding_code||""}</td><td>${s.reason}</td><td class="mono">${s.expires_at||""}</td><td><button class="ghost cancel-silence-btn" data-id="${s.silence_id}">Cancel</button></td></tr>`).join(""):`<tr><td colspan="5" class="muted">No active silences.</td></tr>`; document.querySelectorAll(".cancel-silence-btn").forEach(b=>b.addEventListener("click",()=>cancelSilence(b.dataset.id))); animateRows('#silences tr')}
+    function renderEvents(data){els.events.innerHTML=(data||[]).length?data.map(e=>`<tr><td class="mono">${e.recorded_at}</td><td class="mono">${e.event_type}</td><td>${e.changed_by}</td><td>${e.reason||'<span class="muted">n/a</span>'}</td></tr>`).join(""):`<tr><td colspan="4" class="muted">No recent events.</td></tr>`; animateRows('#events tr')}
+    async function ackAlert(alertId){try{await fetchJson(`/control-plane-alerts/${encodeURIComponent(alertId)}/acknowledge`,{method:"POST",body:JSON.stringify({acknowledged_by:els.alertActor.value.trim(),acknowledgement_note:els.alertNote.value.trim()||null})}); setNotice("Alert acknowledged.","good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function silenceAlertKey(alertKey){try{await fetchJson("/control-plane-alert-silences",{method:"POST",body:JSON.stringify({created_by:els.alertActor.value.trim(),reason:els.alertNote.value.trim()||"dashboard silence",duration_minutes:Number(els.silenceMinutes.value||60),match_alert_key:alertKey})}); setNotice("Alert key silenced.","good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function silenceFindingCode(code){try{await fetchJson("/control-plane-alert-silences",{method:"POST",body:JSON.stringify({created_by:els.alertActor.value.trim(),reason:els.alertNote.value.trim()||"dashboard silence",duration_minutes:Number(els.silenceMinutes.value||60),match_finding_code:code})}); setNotice("Finding code silenced.","good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function cancelSilence(silenceId){try{await fetchJson(`/control-plane-alert-silences/${encodeURIComponent(silenceId)}/cancel`,{method:"POST",body:JSON.stringify({cancelled_by:els.alertActor.value.trim()})}); setNotice("Silence cancelled.","good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function emitAlerts(){try{const r=await fetchJson("/maintenance/emit-control-plane-alerts",{method:"POST",body:JSON.stringify({})}); setNotice(`Emitted ${r.emitted_count} alert(s).`,"good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function runRuntimeRehearsal(){try{const by=els.cutoverBy.value.trim(); if(!by){setNotice("Operator required for runtime rehearsal.","bad"); return} const r=await fetchJson("/maintenance/control-plane-runtime-rehearsal",{method:"POST",body:JSON.stringify({changed_by:by,expected_backend:"postgres",expected_repository_layout:"shared",reason:els.cutoverNote.value.trim()||null,cleanup:true})}); setNotice(`Runtime rehearsal ${r.status}.`,"good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function loadCutover(){if(!(els.targetDb.value.trim()&&els.packageDir.value.trim())){els.cutoverSummary.textContent="Enter target DB and package dir to evaluate."; els.cutoverBlockers.innerHTML=""; return null} const cutover=await fetchJson("/maintenance/control-plane-cutover-readiness",{method:"POST",body:JSON.stringify({target_database_url:els.targetDb.value.trim(),package_dir:els.packageDir.value.trim()})}); renderCutover(cutover); return cutover}
+    async function decideCutover(){try{const r=await fetchJson("/maintenance/control-plane-cutover-decision",{method:"POST",body:JSON.stringify({target_database_url:els.targetDb.value.trim(),package_dir:els.packageDir.value.trim(),changed_by:els.cutoverBy.value.trim(),requested_decision:els.cutoverDecision.value,decision_note:els.cutoverNote.value.trim()||null,reason:els.cutoverNote.value.trim()||null})}); setNotice(`Cutover decision: ${r.final_decision}.`,"good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function load(opts={}){const silent=Boolean(opts.silent); if(loadInFlight)return; loadInFlight=true; if(!silent)setNotice("Loading dashboard..."); try{const q=new URLSearchParams(); if(els.queueStatus.value)q.set("status",els.queueStatus.value); if(els.ownerTeam.value.trim())q.set("owner_team",els.ownerTeam.value.trim()); if(els.assignmentState.value)q.set("assignment_state",els.assignmentState.value); const [readiness,queue,alerts,silences,events]=await Promise.all([fetchJson("/maintenance/control-plane-deployment-readiness"),fetchJson(`/maintenance/control-plane-deployment-readiness/owner-team-queue?${q.toString()}`),fetchJson(`/control-plane-alerts?limit=${encodeURIComponent(els.alertLimit.value||20)}`),fetchJson("/control-plane-alert-silences?active_only=true"),fetchJson("/maintenance/events?limit=12")]); renderReadiness(readiness); renderOwnerQueue(queue); renderAlerts(alerts); renderSilences(silences); renderEvents(events); await loadCutover(); pulsePanels(); updateLastRefresh(); if(!silent)setNotice("Dashboard loaded.","good")}catch(e){setNotice(String(e.message||e),"bad")}finally{loadInFlight=false}}
+    els.refreshBtn.addEventListener("click",()=>load()); els.pauseBtn.addEventListener("click",()=>{autoRefreshPaused=!autoRefreshPaused; syncAutoRefresh()}); els.autoRefreshSeconds.addEventListener("change",()=>{autoRefreshPaused=false; syncAutoRefresh()}); els.queueBtn.addEventListener("click",()=>{window.location.href="/ops/deployment-readiness-owner-team-queue"}); els.emitAlertsBtn.addEventListener("click",emitAlerts); els.runtimeRehearsalBtn.addEventListener("click",runRuntimeRehearsal); els.cutoverRefreshBtn.addEventListener("click",loadCutover); els.cutoverDecideBtn.addEventListener("click",decideCutover); syncAutoRefresh(); load();
+  </script>
+</body>
+</html>

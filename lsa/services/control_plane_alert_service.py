@@ -42,9 +42,13 @@ class ControlPlaneAlertService:
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
     runtime_validation_review_service: object | None = None
+    deployment_readiness_service: object | None = None
+    deployment_rejected_change_control_critical_age_hours: float = 24.0
 
     _RUNTIME_VALIDATION_ALERT_KEY_PREFIX = "control-plane-runtime-validation:"
     _RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX = "control-plane-runtime-validation-review:"
+    _DEPLOYMENT_READINESS_ALERT_KEY_PREFIX = "control-plane-deployment-readiness:"
+    _DEPLOYMENT_READINESS_TEAM_ALERT_KEY_PREFIX = "control-plane-deployment-readiness-team:"
 
     def emit_alerts(self, *, force: bool = False) -> list[ControlPlaneAlertRecord]:
         report = self.analytics_service.build_control_plane_analytics(days=self.window_days)
@@ -55,11 +59,15 @@ class ControlPlaneAlertService:
                 report_payload,
                 self._latest_alert_with_prefix(self._RUNTIME_VALIDATION_ALERT_KEY_PREFIX),
             ),
+            self._deployment_readiness_candidate(
+                self._latest_alert_with_prefix(self._DEPLOYMENT_READINESS_ALERT_KEY_PREFIX),
+            ),
             self._runtime_validation_review_candidate(
                 self._latest_alert_with_prefix(self._RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX),
             ),
             self._candidate_alert(report_payload, self.job_repository.latest_control_plane_alert()),
         ]
+        candidates.extend(self._deployment_readiness_team_candidates())
         for candidate in candidates:
             if candidate is None:
                 continue
@@ -669,6 +677,107 @@ class ControlPlaneAlertService:
             },
             error=None,
         )
+
+    def _deployment_readiness_candidate(
+        self,
+        latest: ControlPlaneAlertRecord | None,
+    ) -> ControlPlaneAlertRecord | None:
+        if self.deployment_readiness_service is None:
+            return None
+        summary = self.deployment_readiness_service.evaluate()
+        payload = summary.to_dict()
+        if summary.ready:
+            if latest is None or latest.status == "healthy" or self._lifecycle_event(latest) == "recovery":
+                return None
+            return ControlPlaneAlertRecord(
+                alert_id=uuid4().hex[:16],
+                created_at=_utc_now(),
+                alert_key=f"{self._DEPLOYMENT_READINESS_ALERT_KEY_PREFIX}healthy:recovered",
+                status="healthy",
+                severity="info",
+                summary="Deployment readiness returned to a healthy state.",
+                finding_codes=[],
+                delivery_state="skipped",
+                payload={
+                    "deployment_readiness": payload,
+                    "alert_family": "deployment_readiness",
+                    "lifecycle_event": "recovery",
+                    "source_alert_id": None,
+                },
+                error=None,
+            )
+        finding_codes = sorted(summary.blockers)
+        status = "critical" if "runtime_validation_change_control_rejected" in finding_codes else "degraded"
+        severity = "critical" if status == "critical" else "warning"
+        return ControlPlaneAlertRecord(
+            alert_id=uuid4().hex[:16],
+            created_at=_utc_now(),
+            alert_key=f"{self._DEPLOYMENT_READINESS_ALERT_KEY_PREFIX}{status}:{','.join(finding_codes)}",
+            status=status,
+            severity=severity,
+            summary="Deployment readiness is blocked by runtime-validation or change-control policy.",
+            finding_codes=finding_codes,
+            delivery_state="skipped",
+            payload={
+                "deployment_readiness": payload,
+                "alert_family": "deployment_readiness",
+                "lifecycle_event": "incident",
+                "source_alert_id": None,
+            },
+            error=None,
+        )
+
+    def _deployment_readiness_team_candidates(self) -> list[ControlPlaneAlertRecord]:
+        if self.deployment_readiness_service is None:
+            return []
+        summary = self.deployment_readiness_service.evaluate()
+        candidates: list[ControlPlaneAlertRecord] = []
+        for rollup in summary.owner_team_rollups:
+            finding_codes: list[str] = []
+            if rollup.pending_review_count > 0:
+                finding_codes.append("runtime_validation_change_control_pending")
+            if rollup.rejected_count > 0:
+                finding_codes.append("runtime_validation_change_control_rejected")
+            if (
+                rollup.oldest_rejected_age_hours is not None
+                and rollup.oldest_rejected_age_hours >= self.deployment_rejected_change_control_critical_age_hours
+            ):
+                finding_codes.append("runtime_validation_change_control_rejected_stale")
+            if not finding_codes:
+                continue
+            status = "critical" if rollup.rejected_count > 0 else "degraded"
+            severity = "critical" if status == "critical" else "warning"
+            owner_team = rollup.owner_team
+            latest = self._latest_alert_with_prefix(
+                f"{self._DEPLOYMENT_READINESS_TEAM_ALERT_KEY_PREFIX}{owner_team}:"
+            )
+            if latest is not None and latest.status == status and latest.finding_codes == finding_codes:
+                continue
+            candidates.append(
+                ControlPlaneAlertRecord(
+                    alert_id=uuid4().hex[:16],
+                    created_at=_utc_now(),
+                    alert_key=(
+                        f"{self._DEPLOYMENT_READINESS_TEAM_ALERT_KEY_PREFIX}"
+                        f"{owner_team}:{status}:{','.join(finding_codes)}"
+                    ),
+                    status=status,
+                    severity=severity,
+                    summary=f"Deployment readiness blocked for owner team '{owner_team}'.",
+                    finding_codes=finding_codes,
+                    delivery_state="skipped",
+                    payload={
+                        "deployment_readiness": summary.to_dict(),
+                        "owner_team_rollup": rollup.to_dict(),
+                        "owner_team": owner_team,
+                        "alert_family": "deployment_readiness_owner_team",
+                        "lifecycle_event": "incident",
+                        "source_alert_id": None,
+                    },
+                    error=None,
+                )
+            )
+        return candidates
 
     def _summary_for_status(self, status: str, findings: list[dict]) -> str:
         if not findings:

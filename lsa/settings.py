@@ -43,9 +43,13 @@ class WorkspaceSettings:
     analytics_runtime_rehearsal_due_soon_age_hours: float
     analytics_runtime_rehearsal_warning_age_hours: float
     analytics_runtime_rehearsal_critical_age_hours: float
+    analytics_deployment_rejected_change_control_critical_age_hours: float
     runtime_validation_policy_path: Path
     maintenance_runtime_validation_required: bool
+    maintenance_deployment_readiness_required: bool
     cutover_runtime_validation_required: bool
+    runtime_rehearsal_deployment_readiness_required: bool
+    job_submission_deployment_readiness_required: bool
     oncall_policy_path: Path
     oncall_approval_required_roles: tuple[str, ...]
     oncall_allow_self_approval: bool
@@ -143,6 +147,10 @@ def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceS
             "LSA_ANALYTICS_RUNTIME_REHEARSAL_CRITICAL_AGE_HOURS",
             default=72.0,
         ),
+        analytics_deployment_rejected_change_control_critical_age_hours=_env_float(
+            "LSA_ANALYTICS_DEPLOYMENT_REJECTED_CHANGE_CONTROL_CRITICAL_AGE_HOURS",
+            default=24.0,
+        ),
         runtime_validation_policy_path=Path(
             os.environ.get(
                 "LSA_RUNTIME_VALIDATION_POLICY_PATH",
@@ -153,9 +161,21 @@ def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceS
             "LSA_MAINTENANCE_RUNTIME_VALIDATION_REQUIRED",
             default=False,
         ),
+        maintenance_deployment_readiness_required=_env_flag(
+            "LSA_MAINTENANCE_DEPLOYMENT_READINESS_REQUIRED",
+            default=False,
+        ),
         cutover_runtime_validation_required=_env_flag(
             "LSA_CUTOVER_RUNTIME_VALIDATION_REQUIRED",
             default=True,
+        ),
+        runtime_rehearsal_deployment_readiness_required=_env_flag(
+            "LSA_RUNTIME_REHEARSAL_DEPLOYMENT_READINESS_REQUIRED",
+            default=False,
+        ),
+        job_submission_deployment_readiness_required=_env_flag(
+            "LSA_JOB_SUBMISSION_DEPLOYMENT_READINESS_REQUIRED",
+            default=False,
         ),
         oncall_policy_path=Path(
             os.environ.get("LSA_ONCALL_POLICY_PATH", str(data_dir / "oncall_policy.json"))

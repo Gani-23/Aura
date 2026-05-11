@@ -424,6 +424,7 @@ class ControlPlaneRuntimeRehearsalResponse(BaseModel):
     job_repository_runtime_active: bool
     database_runtime_available: bool
     database_runtime_blockers: list[str]
+    deployment_readiness: "ControlPlaneDeploymentReadinessResponse"
     checks: dict[str, bool]
     status: str
     smoke: dict[str, Any]
@@ -454,9 +455,24 @@ class ControlPlaneMaintenancePreflightResponse(BaseModel):
     completed_jobs: int
     failed_jobs: int
     runtime_validation: ControlPlaneRuntimeValidationResponse
+    deployment_readiness: "ControlPlaneDeploymentReadinessResponse"
+    runtime_validation_change_control_requests: list["ControlPlaneRuntimeValidationChangeControlPayload"] = Field(default_factory=list)
     blockers: list[str]
     warnings: list[str]
     can_execute: bool
+
+
+class ControlPlaneDeploymentReadinessResponse(BaseModel):
+    evaluated_at: str
+    environment_name: str
+    runtime_validation: "ControlPlaneRuntimeValidationResponse"
+    runtime_validation_change_control_requests: list["ControlPlaneRuntimeValidationChangeControlPayload"] = Field(default_factory=list)
+    owner_team_rollups: list[dict[str, Any]] = Field(default_factory=list)
+    blocked_owner_team_count: int = 0
+    oldest_rejected_age_hours: float | None = None
+    blockers: list[str]
+    warnings: list[str]
+    ready: bool
 
 
 class RunControlPlaneMaintenanceWorkflowRequest(BaseModel):
@@ -660,6 +676,7 @@ class ControlPlaneCutoverReadinessResponse(BaseModel):
     latest_bundle_event: ControlPlaneMaintenanceEventPayload | None = None
     latest_rehearsal_event: ControlPlaneMaintenanceEventPayload | None = None
     runtime_validation: ControlPlaneRuntimeValidationResponse
+    runtime_validation_change_control_requests: list["ControlPlaneRuntimeValidationChangeControlPayload"] = Field(default_factory=list)
     package_inspection: PostgresBootstrapPackageInspectionResponse | None = None
     blockers: list[str]
     warnings: list[str]
@@ -1080,6 +1097,14 @@ class RuntimeValidationReviewSamplePayload(BaseModel):
     summary: str | None = None
 
 
+class RuntimeValidationReviewOwnerRollupPayload(BaseModel):
+    owner_team: str
+    active_review_count: int
+    assigned_review_count: int
+    unassigned_review_count: int
+    stale_review_count: int
+
+
 class RuntimeValidationReviewAnalyticsPayload(BaseModel):
     active_review_count: int
     assigned_review_count: int
@@ -1088,6 +1113,22 @@ class RuntimeValidationReviewAnalyticsPayload(BaseModel):
     stale_unassigned_review_count: int
     oldest_review_age_hours: float | None = None
     review_samples: list[RuntimeValidationReviewSamplePayload]
+    owner_team_rollups: list[RuntimeValidationReviewOwnerRollupPayload]
+
+
+class DeploymentReadinessAnalyticsPayload(BaseModel):
+    evaluated_at: str
+    environment_name: str
+    ready: bool
+    blocker_count: int
+    warning_count: int
+    pending_change_control_count: int
+    rejected_change_control_count: int
+    blocked_owner_team_count: int
+    oldest_rejected_age_hours: float | None = None
+    owner_team_rollups: list[dict[str, Any]]
+    blockers: list[str]
+    warnings: list[str]
 
 
 class ControlPlaneAlertThresholdsPayload(BaseModel):
@@ -1185,10 +1226,144 @@ class ControlPlaneRuntimeValidationReviewPayload(BaseModel):
     policy_source: str
 
 
+class ControlPlaneRuntimeValidationReviewOwnerQueueRollupPayload(BaseModel):
+    owner_team: str
+    total_reviews: int
+    assigned_reviews: int
+    unassigned_reviews: int
+    stale_reviews: int
+
+
+class ControlPlaneRuntimeValidationReviewQueuePayload(BaseModel):
+    environment_name: str
+    total_reviews: int
+    assigned_reviews: int
+    unassigned_reviews: int
+    stale_reviews: int
+    stale_unassigned_reviews: int
+    oldest_review_age_hours: float | None = None
+    owner_team_rollups: list[ControlPlaneRuntimeValidationReviewOwnerQueueRollupPayload]
+    reviews: list[ControlPlaneRuntimeValidationReviewPayload]
+
+
+class ControlPlaneRuntimeValidationReviewBulkActionPayload(BaseModel):
+    environment_name: str
+    action: str
+    matched_count: int
+    changed_count: int
+    reviews: list[ControlPlaneRuntimeValidationReviewPayload]
+
+
+class ControlPlaneRuntimeValidationGovernancePayload(BaseModel):
+    request_id: str
+    opened_at: str
+    opened_by: str
+    environment_name: str
+    review_id: str
+    owner_team: str | None = None
+    review_opened_at: str
+    summary: str
+    status: str
+    trigger_code: str
+    policy_source: str
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+    resolution_reason: str | None = None
+
+
+class ControlPlaneRuntimeValidationChangeControlPayload(BaseModel):
+    request_id: str
+    opened_at: str
+    opened_by: str
+    environment_name: str
+    governance_request_id: str
+    review_id: str
+    owner_team: str | None = None
+    summary: str
+    status: str
+    trigger_code: str
+    policy_source: str
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    assigned_at: str | None = None
+    assigned_by: str | None = None
+    assignment_note: str | None = None
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+    resolution_reason: str | None = None
+
+
+class ControlPlaneRuntimeValidationChangeControlQueuePayload(BaseModel):
+    environment_name: str
+    total_requests: int
+    assigned_requests: int
+    unassigned_requests: int
+    pending_review_count: int
+    rejected_count: int
+    owner_team_rollups: list[dict[str, Any]]
+    requests: list["ControlPlaneRuntimeValidationChangeControlPayload"]
+
+
+class ControlPlaneRuntimeValidationChangeControlBulkActionPayload(BaseModel):
+    environment_name: str
+    action: str
+    matched_count: int
+    changed_count: int
+    requests: list["ControlPlaneRuntimeValidationChangeControlPayload"]
+
+
 class ProcessRuntimeValidationReviewsRequest(BaseModel):
     changed_by: str = "system"
     reason: str | None = None
     force: bool = False
+
+
+class ProcessRuntimeValidationGovernanceRequest(BaseModel):
+    changed_by: str = "system"
+    reason: str | None = None
+    force: bool = False
+
+
+class ProcessRuntimeValidationChangeControlRequest(BaseModel):
+    changed_by: str = "system"
+    reason: str | None = None
+    force: bool = False
+
+
+class AssignRuntimeValidationChangeControlRequest(BaseModel):
+    assigned_to: str
+    assigned_to_team: str | None = None
+    assigned_by: str
+    assignment_note: str | None = None
+
+
+class ReviewRuntimeValidationChangeControlRequest(BaseModel):
+    decision: str
+    decided_by: str
+    decision_note: str | None = None
+
+
+class BulkAssignRuntimeValidationChangeControlRequest(BaseModel):
+    assigned_to: str
+    assigned_to_team: str | None = None
+    assigned_by: str
+    assignment_note: str | None = None
+    status: str | None = None
+    owner_team: str | None = None
+    assignment_state: str | None = None
+
+
+class BulkReviewRuntimeValidationChangeControlRequest(BaseModel):
+    decision: str
+    decided_by: str
+    decision_note: str | None = None
+    status: str | None = None
+    owner_team: str | None = None
+    assignment_state: str | None = None
 
 
 class AssignRuntimeValidationReviewRequest(BaseModel):
@@ -1204,6 +1379,25 @@ class ResolveRuntimeValidationReviewRequest(BaseModel):
     resolution_reason: str = "manual_resolution"
 
 
+class BulkAssignRuntimeValidationReviewsRequest(BaseModel):
+    assigned_to: str
+    assigned_to_team: str | None = None
+    assigned_by: str
+    assignment_note: str | None = None
+    status: str | None = None
+    owner_team: str | None = None
+    assignment_state: str | None = None
+
+
+class BulkResolveRuntimeValidationReviewsRequest(BaseModel):
+    resolved_by: str
+    resolution_note: str | None = None
+    resolution_reason: str = "manual_resolution"
+    status: str | None = None
+    owner_team: str | None = None
+    assignment_state: str | None = None
+
+
 class ControlPlaneAnalyticsResponse(BaseModel):
     generated_at: str
     window_days: int
@@ -1215,5 +1409,6 @@ class ControlPlaneAnalyticsResponse(BaseModel):
     jobs: JobAnalyticsPayload
     oncall: OnCallAnalyticsPayload
     runtime_validation: ControlPlaneRuntimeValidationResponse
+    deployment_readiness: DeploymentReadinessAnalyticsPayload
     runtime_validation_reviews: RuntimeValidationReviewAnalyticsPayload
     evaluation: ControlPlaneEvaluationPayload

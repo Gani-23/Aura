@@ -76,6 +76,7 @@ class ControlPlaneMetricsService:
         lines.extend(self._oncall_lines(analytics))
         lines.extend(self._evaluation_lines(analytics))
         lines.extend(self._runtime_validation_lines(analytics))
+        lines.extend(self._deployment_readiness_lines(analytics))
         lines.extend(self._alert_lines())
         lines.extend(self._maintenance_event_lines())
 
@@ -193,6 +194,82 @@ class ControlPlaneMetricsService:
             lines.append(self._line("runtime_rehearsal_present", 1))
         else:
             lines.append(self._line("runtime_rehearsal_present", 0))
+        return lines
+
+    def _deployment_readiness_lines(self, analytics: ControlPlaneAnalyticsReport) -> list[str]:
+        summary = analytics.deployment_readiness
+        ready_values = {
+            "ready": 1 if summary.ready else 0,
+            "blocked": 0 if summary.ready else 1,
+        }
+        lines = [
+            self._line("deployment_readiness_status", value, {"status": status})
+            for status, value in ready_values.items()
+        ]
+        lines.extend(
+            [
+                self._line("deployment_readiness_blockers", summary.blocker_count),
+                self._line("deployment_readiness_warnings", summary.warning_count),
+                self._line("deployment_readiness_blocked_owner_teams", summary.blocked_owner_team_count),
+                self._line(
+                    "deployment_readiness_change_control_requests",
+                    summary.pending_change_control_count,
+                    {"status": "pending_review"},
+                ),
+                self._line(
+                    "deployment_readiness_change_control_requests",
+                    summary.rejected_change_control_count,
+                    {"status": "rejected"},
+                ),
+            ]
+        )
+        if summary.oldest_rejected_age_hours is not None:
+            lines.append(
+                self._line("deployment_readiness_oldest_rejected_age_hours", summary.oldest_rejected_age_hours)
+            )
+        for rollup in summary.owner_team_rollups:
+            owner_team = str(rollup.get("owner_team", "unowned"))
+            lines.extend(
+                [
+                    self._line(
+                        "deployment_readiness_owner_team_requests",
+                        int(rollup.get("total_blocking_requests", 0)),
+                        {"owner_team": owner_team, "status": "total"},
+                    ),
+                    self._line(
+                        "deployment_readiness_owner_team_requests",
+                        int(rollup.get("pending_review_count", 0)),
+                        {"owner_team": owner_team, "status": "pending_review"},
+                    ),
+                    self._line(
+                        "deployment_readiness_owner_team_requests",
+                        int(rollup.get("rejected_count", 0)),
+                        {"owner_team": owner_team, "status": "rejected"},
+                    ),
+                    self._line(
+                        "deployment_readiness_owner_team_requests",
+                        int(rollup.get("assigned_count", 0)),
+                        {"owner_team": owner_team, "status": "assigned"},
+                    ),
+                    self._line(
+                        "deployment_readiness_owner_team_requests",
+                        int(rollup.get("unassigned_count", 0)),
+                        {"owner_team": owner_team, "status": "unassigned"},
+                    ),
+                ]
+            )
+            if rollup.get("oldest_rejected_age_hours") is not None:
+                lines.append(
+                    self._line(
+                        "deployment_readiness_owner_team_oldest_rejected_age_hours",
+                        float(rollup["oldest_rejected_age_hours"]),
+                        {"owner_team": owner_team},
+                    )
+                )
+        for blocker in summary.blockers:
+            lines.append(self._line("deployment_readiness_blocker_active", 1, {"code": blocker}))
+        for warning in summary.warnings:
+            lines.append(self._line("deployment_readiness_warning_active", 1, {"code": warning}))
         return lines
 
     def _alert_lines(self) -> list[str]:

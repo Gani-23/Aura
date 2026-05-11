@@ -37,8 +37,10 @@ class JobService:
     history_prune_interval_seconds: float = 300.0
     control_plane_alert_service: ControlPlaneAlertService | None = None
     runtime_validation_review_service: Any | None = None
+    deployment_readiness_service: Any | None = None
     control_plane_alert_interval_seconds: float = 60.0
     control_plane_alerts_enabled: bool = True
+    deployment_readiness_required_for_job_submission: bool = False
     _worker_thread: Thread | None = field(init=False, default=None)
     _stop_event: Event = field(init=False, default_factory=Event)
     _lock: Lock = field(init=False, default_factory=Lock)
@@ -123,6 +125,8 @@ class JobService:
         if now - self._last_alert_emit_at < self.control_plane_alert_interval_seconds:
             return []
         self.process_runtime_validation_reviews(changed_by="system", reason="scheduled control-plane cadence")
+        self.process_runtime_validation_governance(changed_by="system", reason="scheduled control-plane cadence")
+        self.process_runtime_validation_change_control(changed_by="system", reason="scheduled control-plane cadence")
         emitted = self.emit_control_plane_alerts()
         if emitted:
             return emitted
@@ -157,10 +161,232 @@ class JobService:
             force=force,
         )
 
-    def list_runtime_validation_reviews(self, *, status: str | None = None):
+    def process_runtime_validation_governance(
+        self,
+        *,
+        changed_by: str,
+        reason: str | None = None,
+        force: bool = False,
+    ):
         if self.runtime_validation_review_service is None:
             return []
-        return self.runtime_validation_review_service.list_reviews(status=status)
+        return self.runtime_validation_review_service.process_governance_requests(
+            changed_by=changed_by,
+            reason=reason,
+            force=force,
+        )
+
+    def process_runtime_validation_change_control(
+        self,
+        *,
+        changed_by: str,
+        reason: str | None = None,
+        force: bool = False,
+    ):
+        if self.runtime_validation_review_service is None:
+            return []
+        return self.runtime_validation_review_service.process_change_control_requests(
+            changed_by=changed_by,
+            reason=reason,
+            force=force,
+        )
+
+    def list_runtime_validation_reviews(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            return []
+        return self.runtime_validation_review_service.list_reviews(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+
+    def list_runtime_validation_governance_requests(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            return []
+        return self.runtime_validation_review_service.list_governance_requests(
+            status=status,
+            owner_team=owner_team,
+        )
+
+    def list_runtime_validation_change_control_requests(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            return []
+        return self.runtime_validation_review_service.list_change_control_requests(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+
+    def runtime_validation_change_control_queue_summary(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            return None
+        return self.runtime_validation_review_service.change_control_queue_summary(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+
+    def assign_runtime_validation_change_control_request(
+        self,
+        *,
+        request_id: str,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.assign_change_control_request(
+            request_id=request_id,
+            assigned_to=assigned_to,
+            assigned_to_team=assigned_to_team,
+            assigned_by=assigned_by,
+            assignment_note=assignment_note,
+        )
+
+    def decide_runtime_validation_change_control_request(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        decided_by: str,
+        decision_note: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.decide_change_control_request(
+            request_id=request_id,
+            decision=decision,
+            decided_by=decided_by,
+            decision_note=decision_note,
+        )
+
+    def bulk_assign_runtime_validation_change_control_requests(
+        self,
+        *,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.bulk_assign_change_control_requests(
+            assigned_to=assigned_to,
+            assigned_to_team=assigned_to_team,
+            assigned_by=assigned_by,
+            assignment_note=assignment_note,
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+
+    def bulk_decide_runtime_validation_change_control_requests(
+        self,
+        *,
+        decision: str,
+        decided_by: str,
+        decision_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.bulk_decide_change_control_requests(
+            decision=decision,
+            decided_by=decided_by,
+            decision_note=decision_note,
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+
+    def runtime_validation_review_queue_summary(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            return None
+        return self.runtime_validation_review_service.queue_summary(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+
+    def bulk_assign_runtime_validation_reviews(
+        self,
+        *,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.bulk_assign_reviews(
+            assigned_to=assigned_to,
+            assigned_to_team=assigned_to_team,
+            assigned_by=assigned_by,
+            assignment_note=assignment_note,
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+
+    def bulk_resolve_runtime_validation_reviews(
+        self,
+        *,
+        resolved_by: str,
+        resolution_reason: str,
+        resolution_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.bulk_resolve_reviews(
+            resolved_by=resolved_by,
+            resolution_reason=resolution_reason,
+            resolution_note=resolution_note,
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
 
     def assign_runtime_validation_review(
         self,
@@ -301,11 +527,23 @@ class JobService:
     def submit_audit_trace(self, request_payload: dict) -> JobRecord:
         if self.is_maintenance_mode_active():
             raise RuntimeError("Control-plane maintenance mode is active.")
+        if self.deployment_readiness_required_for_job_submission and self.deployment_readiness_service is not None:
+            readiness = self.deployment_readiness_service.evaluate()
+            if not readiness.ready:
+                raise RuntimeError(
+                    "Deployment readiness blocks job submission: " + ", ".join(sorted(readiness.blockers))
+                )
         return self.job_repository.create(job_type="audit-trace", request_payload=request_payload)
 
     def submit_collect_audit(self, request_payload: dict) -> JobRecord:
         if self.is_maintenance_mode_active():
             raise RuntimeError("Control-plane maintenance mode is active.")
+        if self.deployment_readiness_required_for_job_submission and self.deployment_readiness_service is not None:
+            readiness = self.deployment_readiness_service.evaluate()
+            if not readiness.ready:
+                raise RuntimeError(
+                    "Deployment readiness blocks job submission: " + ", ".join(sorted(readiness.blockers))
+                )
         return self.job_repository.create(job_type="collect-audit", request_payload=request_payload)
 
     def list_jobs(self) -> list[JobRecord]:

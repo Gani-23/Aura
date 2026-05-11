@@ -57,3 +57,20 @@ Living Systems Auditor is no longer a thin prototype. It is a production-shaped 
 - runtime-proof now opens assignable review work before proof goes stale
 - runtime-proof reviews now escalate through dedicated alert incidents when they sit unowned or unresolved
 - runtime-validation policy can now stamp review ownership and optional auto-assignment rules per environment
+- runtime-validation review analytics now expose owner-team queue rollups and filtered queue views
+- runtime-validation review backlog now has a dedicated queue-summary API/CLI surface
+- runtime-validation review queue now has a direct operator page and CSV export path
+- runtime-validation policy now supports separate assigned vs unassigned review SLA thresholds per environment
+- critical unassigned runtime-validation review debt now auto-opens governance escalation requests
+- governance debt can now auto-open explicit change-control requests
+- change-control requests now support assignment and approve/reject decisions
+- unresolved or rejected runtime-validation change-control requests now block cutover readiness
+- rejected change-control debt is now non-overridable during cutover promotion
+- deployment readiness now has a first-class surface on top of runtime-validation and change-control state
+- maintenance preflight and runtime rehearsal can now enforce deployment-readiness policy via explicit flags
+- deployment readiness now has its own alert family and can optionally gate job submission
+- control-plane analytics and metrics now carry deployment-readiness state, blocker counts, and change-control debt
+- deployment readiness now has owner-team queue views plus bulk assign/review actions for linked change-control debt
+- deployment readiness owner-team queue now exports CSV and marks stale rejected debt for stronger escalation
+- deployment readiness owner-team queue now has direct browser page for bulk assign and bulk review
+- deployment readiness now also has unified dashboard page tying readiness, owner-team debt, cutover readiness, and recent alerts

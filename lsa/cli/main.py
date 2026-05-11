@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime
+from io import StringIO
 import json
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from lsa.services.control_plane_backup_service import ControlPlaneBackupService
 from lsa.services.control_plane_cutover_promotion_service import ControlPlaneCutoverPromotionService
 from lsa.services.control_plane_cutover_service import ControlPlaneCutoverService
 from lsa.services.control_plane_cutover_readiness_service import ControlPlaneCutoverReadinessService
+from lsa.services.control_plane_deployment_readiness_service import ControlPlaneDeploymentReadinessService
 from lsa.services.control_plane_maintenance_service import ControlPlaneMaintenanceService
 from lsa.services.control_plane_runtime_rehearsal_service import ControlPlaneRuntimeRehearsalService
 from lsa.services.control_plane_runtime_smoke_service import ControlPlaneRuntimeSmokeService
@@ -98,6 +101,7 @@ control_plane_alert_service = ControlPlaneAlertService(
     sink_path=str(settings.control_plane_alert_sink_path),
     webhook_url=settings.control_plane_alert_webhook_url,
     escalation_webhook_url=settings.control_plane_alert_escalation_webhook_url,
+    deployment_rejected_change_control_critical_age_hours=settings.analytics_deployment_rejected_change_control_critical_age_hours,
 )
 control_plane_backup_service = ControlPlaneBackupService(
     settings=settings,
@@ -117,6 +121,7 @@ job_service = JobService(
     control_plane_alert_service=control_plane_alert_service,
     control_plane_alert_interval_seconds=settings.control_plane_alert_interval_seconds,
     control_plane_alerts_enabled=settings.control_plane_alerts_enabled,
+    deployment_readiness_required_for_job_submission=settings.job_submission_deployment_readiness_required,
 )
 runtime_validation_review_service = ControlPlaneRuntimeValidationReviewService(
     settings=settings,
@@ -125,6 +130,14 @@ runtime_validation_review_service = ControlPlaneRuntimeValidationReviewService(
 )
 job_service.runtime_validation_review_service = runtime_validation_review_service
 control_plane_alert_service.runtime_validation_review_service = runtime_validation_review_service
+deployment_readiness_service = ControlPlaneDeploymentReadinessService(
+    settings=settings,
+    job_repository=job_repository,
+    job_service=job_service,
+)
+analytics_service.deployment_readiness_service = deployment_readiness_service
+job_service.deployment_readiness_service = deployment_readiness_service
+control_plane_alert_service.deployment_readiness_service = deployment_readiness_service
 metrics_service = ControlPlaneMetricsService(
     job_repository=job_repository,
     job_service=job_service,
@@ -228,6 +241,10 @@ def _control_plane_runtime_validation_service() -> ControlPlaneRuntimeValidation
         reminder_interval_seconds=runtime_policy.reminder_interval_seconds,
         escalation_interval_seconds=runtime_policy.escalation_interval_seconds,
     )
+
+
+def _control_plane_deployment_readiness_service() -> ControlPlaneDeploymentReadinessService:
+    return deployment_readiness_service
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -348,11 +365,58 @@ def build_parser() -> argparse.ArgumentParser:
         "control-plane-runtime-validation",
         help="Show the latest runtime rehearsal evidence and whether it is missing, stale, failed, or healthy.",
     )
+    subparsers.add_parser(
+        "control-plane-deployment-readiness",
+        help="Show broader deployment readiness, including runtime-validation and change-control blockers.",
+    )
+    deployment_readiness_owner_team_queue = subparsers.add_parser(
+        "control-plane-deployment-readiness-owner-team-queue",
+        help="Summarize linked runtime-validation change-control debt by owner team.",
+    )
+    deployment_readiness_owner_team_queue.add_argument("--status", default=None)
+    deployment_readiness_owner_team_queue.add_argument("--owner-team", default=None)
+    deployment_readiness_owner_team_queue.add_argument("--assignment-state", default=None)
     list_runtime_validation_reviews = subparsers.add_parser(
         "list-control-plane-runtime-validation-reviews",
         help="List runtime-validation review requests derived from maintenance history.",
     )
     list_runtime_validation_reviews.add_argument("--status", default=None)
+    list_runtime_validation_reviews.add_argument("--owner-team", default=None)
+    list_runtime_validation_reviews.add_argument("--assignment-state", default=None)
+    runtime_validation_review_queue = subparsers.add_parser(
+        "control-plane-runtime-validation-review-queue",
+        help="Summarize runtime-validation review backlog by owner team and assignment state.",
+    )
+    runtime_validation_review_queue.add_argument("--status", default=None)
+    runtime_validation_review_queue.add_argument("--owner-team", default=None)
+    runtime_validation_review_queue.add_argument("--assignment-state", default=None)
+    export_runtime_validation_review_queue_csv = subparsers.add_parser(
+        "export-control-plane-runtime-validation-review-queue-csv",
+        help="Export the filtered runtime-validation review queue as CSV.",
+    )
+    export_runtime_validation_review_queue_csv.add_argument("--status", default=None)
+    export_runtime_validation_review_queue_csv.add_argument("--owner-team", default=None)
+    export_runtime_validation_review_queue_csv.add_argument("--assignment-state", default=None)
+    export_deployment_readiness_owner_team_queue_csv = subparsers.add_parser(
+        "export-control-plane-deployment-readiness-owner-team-queue-csv",
+        help="Export the filtered deployment-readiness owner-team queue as CSV.",
+    )
+    export_deployment_readiness_owner_team_queue_csv.add_argument("--status", default=None)
+    export_deployment_readiness_owner_team_queue_csv.add_argument("--owner-team", default=None)
+    export_deployment_readiness_owner_team_queue_csv.add_argument("--assignment-state", default=None)
+    list_runtime_validation_governance_requests = subparsers.add_parser(
+        "list-control-plane-runtime-validation-governance-requests",
+        help="List governance escalation requests derived from critical unassigned runtime-validation review debt.",
+    )
+    list_runtime_validation_governance_requests.add_argument("--status", default=None)
+    list_runtime_validation_governance_requests.add_argument("--owner-team", default=None)
+    list_runtime_validation_change_control_requests = subparsers.add_parser(
+        "list-control-plane-runtime-validation-change-control-requests",
+        help="List change-control requests derived from runtime-validation governance debt.",
+    )
+    list_runtime_validation_change_control_requests.add_argument("--status", default=None)
+    list_runtime_validation_change_control_requests.add_argument("--owner-team", default=None)
+    list_runtime_validation_change_control_requests.add_argument("--assignment-state", default=None)
     process_runtime_validation_reviews = subparsers.add_parser(
         "process-control-plane-runtime-validation-reviews",
         help="Open or auto-resolve runtime-validation review requests for the active environment.",
@@ -360,6 +424,58 @@ def build_parser() -> argparse.ArgumentParser:
     process_runtime_validation_reviews.add_argument("--by", default="system")
     process_runtime_validation_reviews.add_argument("--reason", default=None)
     process_runtime_validation_reviews.add_argument("--force", action="store_true")
+    process_runtime_validation_governance = subparsers.add_parser(
+        "process-control-plane-runtime-validation-governance-requests",
+        help="Open or auto-resolve governance escalation requests for critical unassigned runtime-validation review debt.",
+    )
+    process_runtime_validation_governance.add_argument("--by", default="system")
+    process_runtime_validation_governance.add_argument("--reason", default=None)
+    process_runtime_validation_governance.add_argument("--force", action="store_true")
+    process_runtime_validation_change_control = subparsers.add_parser(
+        "process-control-plane-runtime-validation-change-control-requests",
+        help="Open or auto-resolve change-control requests derived from runtime-validation governance debt.",
+    )
+    process_runtime_validation_change_control.add_argument("--by", default="system")
+    process_runtime_validation_change_control.add_argument("--reason", default=None)
+    process_runtime_validation_change_control.add_argument("--force", action="store_true")
+    assign_runtime_validation_change_control = subparsers.add_parser(
+        "assign-control-plane-runtime-validation-change-control-request",
+        help="Assign a runtime-validation change-control request.",
+    )
+    assign_runtime_validation_change_control.add_argument("request_id")
+    assign_runtime_validation_change_control.add_argument("--assigned-to", required=True)
+    assign_runtime_validation_change_control.add_argument("--assigned-team", default=None)
+    assign_runtime_validation_change_control.add_argument("--by", required=True)
+    assign_runtime_validation_change_control.add_argument("--note", default=None)
+    review_runtime_validation_change_control = subparsers.add_parser(
+        "review-control-plane-runtime-validation-change-control-request",
+        help="Approve or reject a runtime-validation change-control request.",
+    )
+    review_runtime_validation_change_control.add_argument("request_id")
+    review_runtime_validation_change_control.add_argument("--decision", required=True)
+    review_runtime_validation_change_control.add_argument("--by", required=True)
+    review_runtime_validation_change_control.add_argument("--note", default=None)
+    bulk_assign_runtime_validation_change_control = subparsers.add_parser(
+        "bulk-assign-control-plane-runtime-validation-change-control-requests",
+        help="Bulk assign filtered runtime-validation change-control requests.",
+    )
+    bulk_assign_runtime_validation_change_control.add_argument("--assigned-to", required=True)
+    bulk_assign_runtime_validation_change_control.add_argument("--assigned-team", default=None)
+    bulk_assign_runtime_validation_change_control.add_argument("--by", required=True)
+    bulk_assign_runtime_validation_change_control.add_argument("--note", default=None)
+    bulk_assign_runtime_validation_change_control.add_argument("--status", default=None)
+    bulk_assign_runtime_validation_change_control.add_argument("--owner-team", default=None)
+    bulk_assign_runtime_validation_change_control.add_argument("--assignment-state", default=None)
+    bulk_review_runtime_validation_change_control = subparsers.add_parser(
+        "bulk-review-control-plane-runtime-validation-change-control-requests",
+        help="Bulk approve or reject filtered runtime-validation change-control requests.",
+    )
+    bulk_review_runtime_validation_change_control.add_argument("--decision", required=True)
+    bulk_review_runtime_validation_change_control.add_argument("--by", required=True)
+    bulk_review_runtime_validation_change_control.add_argument("--note", default=None)
+    bulk_review_runtime_validation_change_control.add_argument("--status", default=None)
+    bulk_review_runtime_validation_change_control.add_argument("--owner-team", default=None)
+    bulk_review_runtime_validation_change_control.add_argument("--assignment-state", default=None)
     assign_runtime_validation_review = subparsers.add_parser(
         "assign-control-plane-runtime-validation-review",
         help="Assign an active runtime-validation review request to an owner.",
@@ -369,6 +485,17 @@ def build_parser() -> argparse.ArgumentParser:
     assign_runtime_validation_review.add_argument("--assigned-team", default=None)
     assign_runtime_validation_review.add_argument("--by", required=True)
     assign_runtime_validation_review.add_argument("--note", default=None)
+    bulk_assign_runtime_validation_reviews = subparsers.add_parser(
+        "bulk-assign-control-plane-runtime-validation-reviews",
+        help="Bulk assign filtered runtime-validation reviews.",
+    )
+    bulk_assign_runtime_validation_reviews.add_argument("--assigned-to", required=True)
+    bulk_assign_runtime_validation_reviews.add_argument("--assigned-team", default=None)
+    bulk_assign_runtime_validation_reviews.add_argument("--by", required=True)
+    bulk_assign_runtime_validation_reviews.add_argument("--note", default=None)
+    bulk_assign_runtime_validation_reviews.add_argument("--status", default=None)
+    bulk_assign_runtime_validation_reviews.add_argument("--owner-team", default=None)
+    bulk_assign_runtime_validation_reviews.add_argument("--assignment-state", default=None)
     resolve_runtime_validation_review = subparsers.add_parser(
         "resolve-control-plane-runtime-validation-review",
         help="Resolve an active runtime-validation review request.",
@@ -377,6 +504,16 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_runtime_validation_review.add_argument("--by", required=True)
     resolve_runtime_validation_review.add_argument("--reason", default="manual_resolution")
     resolve_runtime_validation_review.add_argument("--note", default=None)
+    bulk_resolve_runtime_validation_reviews = subparsers.add_parser(
+        "bulk-resolve-control-plane-runtime-validation-reviews",
+        help="Bulk resolve filtered runtime-validation reviews.",
+    )
+    bulk_resolve_runtime_validation_reviews.add_argument("--by", required=True)
+    bulk_resolve_runtime_validation_reviews.add_argument("--reason", default="manual_resolution")
+    bulk_resolve_runtime_validation_reviews.add_argument("--note", default=None)
+    bulk_resolve_runtime_validation_reviews.add_argument("--status", default=None)
+    bulk_resolve_runtime_validation_reviews.add_argument("--owner-team", default=None)
+    bulk_resolve_runtime_validation_reviews.add_argument("--assignment-state", default=None)
     subparsers.add_parser(
         "control-plane-runtime-backend",
         help="Show runtime backend activation support for the current control-plane database.",
@@ -952,8 +1089,226 @@ def run_control_plane_runtime_validation() -> int:
     return 0
 
 
-def run_list_control_plane_runtime_validation_reviews(*, status: str | None) -> int:
-    print(json.dumps([record.to_dict() for record in job_service.list_runtime_validation_reviews(status=status)], indent=2))
+def run_control_plane_deployment_readiness() -> int:
+    print(json.dumps(_control_plane_deployment_readiness_service().evaluate().to_dict(), indent=2))
+    return 0
+
+
+def _render_runtime_validation_review_queue_csv(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> str:
+    summary = job_service.runtime_validation_review_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise RuntimeError("Runtime-validation review service is not configured.")
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "review_id",
+            "environment_name",
+            "status",
+            "owner_team",
+            "assigned_to",
+            "assigned_to_team",
+            "opened_at",
+            "opened_by",
+            "due_in_hours",
+            "next_due_at",
+            "policy_source",
+            "summary",
+        ]
+    )
+    for review in summary.reviews:
+        writer.writerow(
+            [
+                review.review_id,
+                review.environment_name,
+                review.status,
+                review.owner_team or "",
+                review.assigned_to or "",
+                review.assigned_to_team or "",
+                review.opened_at,
+                review.opened_by,
+                "" if review.due_in_hours is None else review.due_in_hours,
+                review.next_due_at or "",
+                review.policy_source,
+                review.summary,
+            ]
+        )
+    return output.getvalue()
+
+
+def run_list_control_plane_runtime_validation_reviews(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    print(
+        json.dumps(
+            [
+                record.to_dict()
+                for record in job_service.list_runtime_validation_reviews(
+                    status=status,
+                    owner_team=owner_team,
+                    assignment_state=assignment_state,
+                )
+            ],
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_control_plane_runtime_validation_review_queue(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    summary = job_service.runtime_validation_review_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise RuntimeError("Runtime-validation review service is not configured.")
+    print(json.dumps(summary.to_dict(), indent=2))
+    return 0
+
+
+def run_export_control_plane_runtime_validation_review_queue_csv(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    print(
+        _render_runtime_validation_review_queue_csv(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        ),
+        end="",
+    )
+    return 0
+
+
+def run_list_control_plane_runtime_validation_governance_requests(
+    *,
+    status: str | None,
+    owner_team: str | None,
+) -> int:
+    print(
+        json.dumps(
+            [
+                record.to_dict()
+                for record in job_service.list_runtime_validation_governance_requests(
+                    status=status,
+                    owner_team=owner_team,
+                )
+            ],
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_list_control_plane_runtime_validation_change_control_requests(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None = None,
+) -> int:
+    print(
+        json.dumps(
+            [
+                record.to_dict()
+                for record in job_service.list_runtime_validation_change_control_requests(
+                    status=status,
+                    owner_team=owner_team,
+                    assignment_state=assignment_state,
+                )
+            ],
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_control_plane_deployment_readiness_owner_team_queue(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    summary = job_service.runtime_validation_change_control_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise RuntimeError("Runtime-validation review service is not configured.")
+    print(json.dumps(summary.to_dict(), indent=2))
+    return 0
+
+
+def run_export_control_plane_deployment_readiness_owner_team_queue_csv(
+    *,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    summary = job_service.runtime_validation_change_control_queue_summary(
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    if summary is None:
+        raise RuntimeError("Runtime-validation review service is not configured.")
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "request_id",
+            "environment_name",
+            "status",
+            "owner_team",
+            "assigned_to",
+            "assigned_to_team",
+            "opened_at",
+            "opened_by",
+            "governance_request_id",
+            "review_id",
+            "policy_source",
+            "summary",
+        ]
+    )
+    for request in summary.requests:
+        writer.writerow(
+            [
+                request.request_id,
+                request.environment_name,
+                request.status,
+                request.owner_team or "",
+                request.assigned_to or "",
+                request.assigned_to_team or "",
+                request.opened_at,
+                request.opened_by,
+                request.governance_request_id,
+                request.review_id,
+                request.policy_source,
+                request.summary,
+            ]
+        )
+    print(output.getvalue(), end="")
     return 0
 
 
@@ -969,6 +1324,132 @@ def run_process_control_plane_runtime_validation_reviews(
         force=force,
     )
     print(json.dumps([record.to_dict() for record in records], indent=2))
+    return 0
+
+
+def run_process_control_plane_runtime_validation_governance_requests(
+    *,
+    changed_by: str,
+    reason: str | None,
+    force: bool,
+) -> int:
+    records = job_service.process_runtime_validation_governance(
+        changed_by=changed_by,
+        reason=reason,
+        force=force,
+    )
+    print(json.dumps([record.to_dict() for record in records], indent=2))
+    return 0
+
+
+def run_process_control_plane_runtime_validation_change_control_requests(
+    *,
+    changed_by: str,
+    reason: str | None,
+    force: bool,
+) -> int:
+    records = job_service.process_runtime_validation_change_control(
+        changed_by=changed_by,
+        reason=reason,
+        force=force,
+    )
+    print(json.dumps([record.to_dict() for record in records], indent=2))
+    return 0
+
+
+def run_assign_control_plane_runtime_validation_change_control_request(
+    *,
+    request_id: str,
+    assigned_to: str,
+    assigned_to_team: str | None,
+    assigned_by: str,
+    assignment_note: str | None,
+) -> int:
+    print(
+        json.dumps(
+            job_service.assign_runtime_validation_change_control_request(
+                request_id=request_id,
+                assigned_to=assigned_to,
+                assigned_to_team=assigned_to_team,
+                assigned_by=assigned_by,
+                assignment_note=assignment_note,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_bulk_assign_control_plane_runtime_validation_change_control_requests(
+    *,
+    assigned_to: str,
+    assigned_to_team: str | None,
+    assigned_by: str,
+    assignment_note: str | None,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    print(
+        json.dumps(
+            job_service.bulk_assign_runtime_validation_change_control_requests(
+                assigned_to=assigned_to,
+                assigned_to_team=assigned_to_team,
+                assigned_by=assigned_by,
+                assignment_note=assignment_note,
+                status=status,
+                owner_team=owner_team,
+                assignment_state=assignment_state,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_review_control_plane_runtime_validation_change_control_request(
+    *,
+    request_id: str,
+    decision: str,
+    decided_by: str,
+    decision_note: str | None,
+) -> int:
+    print(
+        json.dumps(
+            job_service.decide_runtime_validation_change_control_request(
+                request_id=request_id,
+                decision=decision,
+                decided_by=decided_by,
+                decision_note=decision_note,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_bulk_review_control_plane_runtime_validation_change_control_requests(
+    *,
+    decision: str,
+    decided_by: str,
+    decision_note: str | None,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    print(
+        json.dumps(
+            job_service.bulk_decide_runtime_validation_change_control_requests(
+                decision=decision,
+                decided_by=decided_by,
+                decision_note=decision_note,
+                status=status,
+                owner_team=owner_team,
+                assignment_state=assignment_state,
+            ).to_dict(),
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -991,6 +1472,29 @@ def run_assign_control_plane_runtime_validation_review(
     return 0
 
 
+def run_bulk_assign_control_plane_runtime_validation_reviews(
+    *,
+    assigned_to: str,
+    assigned_to_team: str | None,
+    assigned_by: str,
+    assignment_note: str | None,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    result = job_service.bulk_assign_runtime_validation_reviews(
+        assigned_to=assigned_to,
+        assigned_to_team=assigned_to_team,
+        assigned_by=assigned_by,
+        assignment_note=assignment_note,
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    print(json.dumps(result.to_dict(), indent=2))
+    return 0
+
+
 def run_resolve_control_plane_runtime_validation_review(
     *,
     review_id: str,
@@ -1005,6 +1509,27 @@ def run_resolve_control_plane_runtime_validation_review(
         resolution_reason=resolution_reason,
     )
     print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_bulk_resolve_control_plane_runtime_validation_reviews(
+    *,
+    resolved_by: str,
+    resolution_reason: str,
+    resolution_note: str | None,
+    status: str | None,
+    owner_team: str | None,
+    assignment_state: str | None,
+) -> int:
+    result = job_service.bulk_resolve_runtime_validation_reviews(
+        resolved_by=resolved_by,
+        resolution_reason=resolution_reason,
+        resolution_note=resolution_note,
+        status=status,
+        owner_team=owner_team,
+        assignment_state=assignment_state,
+    )
+    print(json.dumps(result.to_dict(), indent=2))
     return 0
 
 
@@ -1681,13 +2206,100 @@ def main() -> int:
         )
     if args.command == "control-plane-runtime-validation":
         return run_control_plane_runtime_validation()
+    if args.command == "control-plane-deployment-readiness":
+        return run_control_plane_deployment_readiness()
+    if args.command == "control-plane-deployment-readiness-owner-team-queue":
+        return run_control_plane_deployment_readiness_owner_team_queue(
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
+        )
     if args.command == "list-control-plane-runtime-validation-reviews":
-        return run_list_control_plane_runtime_validation_reviews(status=args.status)
+        return run_list_control_plane_runtime_validation_reviews(
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
+        )
+    if args.command == "control-plane-runtime-validation-review-queue":
+        return run_control_plane_runtime_validation_review_queue(
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
+        )
+    if args.command == "export-control-plane-runtime-validation-review-queue-csv":
+        return run_export_control_plane_runtime_validation_review_queue_csv(
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
+        )
+    if args.command == "export-control-plane-deployment-readiness-owner-team-queue-csv":
+        return run_export_control_plane_deployment_readiness_owner_team_queue_csv(
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
+        )
+    if args.command == "list-control-plane-runtime-validation-governance-requests":
+        return run_list_control_plane_runtime_validation_governance_requests(
+            status=args.status,
+            owner_team=args.owner_team,
+        )
+    if args.command == "list-control-plane-runtime-validation-change-control-requests":
+        return run_list_control_plane_runtime_validation_change_control_requests(
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=getattr(args, "assignment_state", None),
+        )
     if args.command == "process-control-plane-runtime-validation-reviews":
         return run_process_control_plane_runtime_validation_reviews(
             changed_by=args.by,
             reason=args.reason,
             force=args.force,
+        )
+    if args.command == "process-control-plane-runtime-validation-governance-requests":
+        return run_process_control_plane_runtime_validation_governance_requests(
+            changed_by=args.by,
+            reason=args.reason,
+            force=args.force,
+        )
+    if args.command == "process-control-plane-runtime-validation-change-control-requests":
+        return run_process_control_plane_runtime_validation_change_control_requests(
+            changed_by=args.by,
+            reason=args.reason,
+            force=args.force,
+        )
+    if args.command == "assign-control-plane-runtime-validation-change-control-request":
+        return run_assign_control_plane_runtime_validation_change_control_request(
+            request_id=args.request_id,
+            assigned_to=args.assigned_to,
+            assigned_to_team=args.assigned_team,
+            assigned_by=args.by,
+            assignment_note=args.note,
+        )
+    if args.command == "bulk-assign-control-plane-runtime-validation-change-control-requests":
+        return run_bulk_assign_control_plane_runtime_validation_change_control_requests(
+            assigned_to=args.assigned_to,
+            assigned_to_team=args.assigned_team,
+            assigned_by=args.by,
+            assignment_note=args.note,
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
+        )
+    if args.command == "review-control-plane-runtime-validation-change-control-request":
+        return run_review_control_plane_runtime_validation_change_control_request(
+            request_id=args.request_id,
+            decision=args.decision,
+            decided_by=args.by,
+            decision_note=args.note,
+        )
+    if args.command == "bulk-review-control-plane-runtime-validation-change-control-requests":
+        return run_bulk_review_control_plane_runtime_validation_change_control_requests(
+            decision=args.decision,
+            decided_by=args.by,
+            decision_note=args.note,
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
         )
     if args.command == "assign-control-plane-runtime-validation-review":
         return run_assign_control_plane_runtime_validation_review(
@@ -1697,12 +2309,31 @@ def main() -> int:
             assigned_by=args.by,
             assignment_note=args.note,
         )
+    if args.command == "bulk-assign-control-plane-runtime-validation-reviews":
+        return run_bulk_assign_control_plane_runtime_validation_reviews(
+            assigned_to=args.assigned_to,
+            assigned_to_team=args.assigned_team,
+            assigned_by=args.by,
+            assignment_note=args.note,
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
+        )
     if args.command == "resolve-control-plane-runtime-validation-review":
         return run_resolve_control_plane_runtime_validation_review(
             review_id=args.review_id,
             resolved_by=args.by,
             resolution_reason=args.reason,
             resolution_note=args.note,
+        )
+    if args.command == "bulk-resolve-control-plane-runtime-validation-reviews":
+        return run_bulk_resolve_control_plane_runtime_validation_reviews(
+            resolved_by=args.by,
+            resolution_reason=args.reason,
+            resolution_note=args.note,
+            status=args.status,
+            owner_team=args.owner_team,
+            assignment_state=args.assignment_state,
         )
     if args.command == "control-plane-runtime-backend":
         return run_control_plane_runtime_backend()

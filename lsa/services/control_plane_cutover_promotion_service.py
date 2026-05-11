@@ -100,6 +100,7 @@ class ControlPlaneCutoverPromotionService:
         blockers = list(readiness.blockers)
         warnings = list(readiness.warnings)
         override_applied = False
+        has_rejected_change_control = "runtime_validation_change_control_rejected" in blockers
 
         if requested_decision == "reject":
             final_decision: Literal["approved", "approved_with_override", "blocked", "rejected"] = "rejected"
@@ -107,6 +108,11 @@ class ControlPlaneCutoverPromotionService:
         elif readiness.ready:
             final_decision = "approved"
             event_type = "postgres_cutover_promoted"
+        elif has_rejected_change_control:
+            final_decision = "blocked"
+            event_type = "postgres_cutover_promotion_blocked"
+            if allow_override:
+                warnings.append("override_denied_for_rejected_change_control")
         elif allow_override:
             final_decision = "approved_with_override"
             event_type = "postgres_cutover_promoted_with_override"

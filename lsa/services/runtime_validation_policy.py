@@ -10,6 +10,10 @@ class RuntimeValidationPolicy:
     due_soon_age_hours: float | None = None
     warning_age_hours: float | None = None
     critical_age_hours: float | None = None
+    review_warning_age_hours: float | None = None
+    review_critical_age_hours: float | None = None
+    unassigned_review_warning_age_hours: float | None = None
+    unassigned_review_critical_age_hours: float | None = None
     reminder_interval_seconds: float | None = None
     escalation_interval_seconds: float | None = None
     owner_team: str | None = None
@@ -24,6 +28,10 @@ class RuntimeValidationPolicy:
             due_soon_age_hours=_optional_float(payload.get("due_soon_age_hours")),
             warning_age_hours=_optional_float(payload.get("warning_age_hours")),
             critical_age_hours=_optional_float(payload.get("critical_age_hours")),
+            review_warning_age_hours=_optional_float(payload.get("review_warning_age_hours")),
+            review_critical_age_hours=_optional_float(payload.get("review_critical_age_hours")),
+            unassigned_review_warning_age_hours=_optional_float(payload.get("unassigned_review_warning_age_hours")),
+            unassigned_review_critical_age_hours=_optional_float(payload.get("unassigned_review_critical_age_hours")),
             reminder_interval_seconds=_optional_float(payload.get("reminder_interval_seconds")),
             escalation_interval_seconds=_optional_float(payload.get("escalation_interval_seconds")),
             owner_team=_optional_normalized_string(payload.get("owner_team")),
@@ -43,6 +51,18 @@ class RuntimeValidationPolicy:
             critical_age_hours=override.critical_age_hours
             if override.critical_age_hours is not None
             else self.critical_age_hours,
+            review_warning_age_hours=override.review_warning_age_hours
+            if override.review_warning_age_hours is not None
+            else self.review_warning_age_hours,
+            review_critical_age_hours=override.review_critical_age_hours
+            if override.review_critical_age_hours is not None
+            else self.review_critical_age_hours,
+            unassigned_review_warning_age_hours=override.unassigned_review_warning_age_hours
+            if override.unassigned_review_warning_age_hours is not None
+            else self.unassigned_review_warning_age_hours,
+            unassigned_review_critical_age_hours=override.unassigned_review_critical_age_hours
+            if override.unassigned_review_critical_age_hours is not None
+            else self.unassigned_review_critical_age_hours,
             reminder_interval_seconds=override.reminder_interval_seconds
             if override.reminder_interval_seconds is not None
             else self.reminder_interval_seconds,
@@ -70,6 +90,18 @@ class RuntimeValidationPolicy:
             critical_age_hours=self.critical_age_hours
             if self.critical_age_hours is not None
             else fallback.critical_age_hours,
+            review_warning_age_hours=self.review_warning_age_hours
+            if self.review_warning_age_hours is not None
+            else fallback.review_warning_age_hours,
+            review_critical_age_hours=self.review_critical_age_hours
+            if self.review_critical_age_hours is not None
+            else fallback.review_critical_age_hours,
+            unassigned_review_warning_age_hours=self.unassigned_review_warning_age_hours
+            if self.unassigned_review_warning_age_hours is not None
+            else fallback.unassigned_review_warning_age_hours,
+            unassigned_review_critical_age_hours=self.unassigned_review_critical_age_hours
+            if self.unassigned_review_critical_age_hours is not None
+            else fallback.unassigned_review_critical_age_hours,
             reminder_interval_seconds=self.reminder_interval_seconds
             if self.reminder_interval_seconds is not None
             else fallback.reminder_interval_seconds,
@@ -91,6 +123,10 @@ class RuntimeValidationPolicy:
             "due_soon_age_hours": self.due_soon_age_hours,
             "warning_age_hours": self.warning_age_hours,
             "critical_age_hours": self.critical_age_hours,
+            "review_warning_age_hours": self.review_warning_age_hours,
+            "review_critical_age_hours": self.review_critical_age_hours,
+            "unassigned_review_warning_age_hours": self.unassigned_review_warning_age_hours,
+            "unassigned_review_critical_age_hours": self.unassigned_review_critical_age_hours,
             "reminder_interval_seconds": self.reminder_interval_seconds,
             "escalation_interval_seconds": self.escalation_interval_seconds,
             "owner_team": self.owner_team,

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deployment Readiness Owner Team Queue</title>
+  <link rel="stylesheet" href="/ops-assets/ops-shell.css" />
+  <style>
+    .grid{grid-template-columns:repeat(12,minmax(0,1fr))}
+    .stats{grid-template-columns:repeat(5,minmax(0,1fr))}
+    .layout{grid-template-columns:1.2fr 1fr}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav class="nav">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div class="brand-copy">
+          <strong>LSA Ops</strong>
+          <span>Deployment governance cockpit</span>
+        </div>
+      </div>
+      <div class="nav-links">
+        <a class="nav-link" href="/ops">Home</a>
+        <a class="nav-link active" href="/ops/deployment-readiness-owner-team-queue">Owner-Team Queue</a>
+        <a class="nav-link" href="/ops/deployment-readiness-dashboard">Dashboard</a>
+        <a class="nav-link" href="/ops/runtime-validation-review-queue">Runtime Reviews</a>
+      </div>
+    </nav>
+    <section class="hero">
+      <h1>Deployment Readiness Owner Team Queue</h1>
+      <p>Owner-team view for deployment-blocking runtime-validation change-control debt. Filter, export, bulk assign, bulk approve, bulk reject.</p>
+    </section>
+
+    <section class="panel">
+      <div class="grid">
+        <div class="span-4"><label>API Key</label><input id="api-key" type="password" /></div>
+        <div class="span-3"><label>Status</label><select id="status"><option value="">Any</option><option value="pending_review">Pending Review</option><option value="rejected">Rejected</option><option value="resolved">Resolved</option></select></div>
+        <div class="span-3"><label>Owner Team</label><input id="owner-team" type="text" placeholder="platform" /></div>
+        <div class="span-2"><label>Assignment</label><select id="assignment-state"><option value="">Any</option><option value="assigned">Assigned</option><option value="unassigned">Unassigned</option></select></div>
+        <div class="span-3"><label>Auto Refresh</label><select id="auto-refresh-seconds"><option value="0">Off</option><option value="15">15s</option><option value="30" selected>30s</option><option value="60">60s</option><option value="120">120s</option></select></div>
+        <div class="span-12">
+          <button id="refresh-btn">Refresh</button>
+          <button id="pause-btn" class="ghost" type="button">Pause Auto Refresh</button>
+          <button id="csv-btn" class="ghost" type="button">Download CSV</button>
+          <button id="top-owner-btn" class="ghost" type="button">Use Top Owner</button>
+        </div>
+      </div>
+      <div id="notice" class="muted"></div>
+      <div class="livebar">
+        <span id="live-dot" class="dot live"></span>
+        <span id="live-status" class="mini">Auto refresh active.</span>
+        <span id="last-refresh" class="mini">Last refresh: never</span>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="stat"><div class="k">Total</div><div class="v" id="stat-total">0</div></div>
+      <div class="stat"><div class="k">Assigned</div><div class="v" id="stat-assigned">0</div></div>
+      <div class="stat"><div class="k">Unassigned</div><div class="v" id="stat-unassigned">0</div></div>
+      <div class="stat"><div class="k">Pending</div><div class="v" id="stat-pending">0</div></div>
+      <div class="stat"><div class="k">Rejected</div><div class="v bad" id="stat-rejected">0</div></div>
+    </section>
+
+    <section class="layout">
+      <div>
+        <section class="panel">
+          <h2>Owner Team Rollups</h2>
+          <table><thead><tr><th>Owner Team</th><th>Total</th><th>Pending</th><th>Rejected</th><th>Assigned</th><th>Unassigned</th><th>Oldest Rejected</th></tr></thead><tbody id="rollups"></tbody></table>
+        </section>
+        <section class="panel">
+          <h2>Requests</h2>
+          <table><thead><tr><th>Request</th><th>Status</th><th>Owner</th><th>Assignee</th><th>Opened</th><th>Summary</th></tr></thead><tbody id="requests"></tbody></table>
+        </section>
+      </div>
+      <div>
+        <section class="panel">
+          <h2>Bulk Assign</h2>
+          <div class="grid">
+            <div class="span-6"><label>Assign To</label><input id="assign-to" type="text" /></div>
+            <div class="span-6"><label>Assigned Team</label><input id="assign-team" type="text" /></div>
+            <div class="span-6"><label>Changed By</label><input id="assign-by" type="text" /></div>
+            <div class="span-6"><label>Note</label><input id="assign-note" type="text" /></div>
+            <div class="span-12"><button id="bulk-assign-btn">Bulk Assign</button></div>
+          </div>
+        </section>
+        <section class="panel">
+          <h2>Bulk Review</h2>
+          <div class="grid">
+            <div class="span-6"><label>Decision</label><select id="review-decision"><option value="approve">Approve</option><option value="reject">Reject</option></select></div>
+            <div class="span-6"><label>Changed By</label><input id="review-by" type="text" /></div>
+            <div class="span-12"><label>Note</label><textarea id="review-note"></textarea></div>
+            <div class="span-12"><button id="bulk-review-btn" class="secondary">Bulk Review</button></div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+  <script>
+    const els={apiKey:apiKey=document.getElementById("api-key"),status:document.getElementById("status"),ownerTeam:document.getElementById("owner-team"),assignmentState:document.getElementById("assignment-state"),autoRefreshSeconds:document.getElementById("auto-refresh-seconds"),notice:document.getElementById("notice"),liveDot:document.getElementById("live-dot"),liveStatus:document.getElementById("live-status"),lastRefresh:document.getElementById("last-refresh"),rollups:document.getElementById("rollups"),requests:document.getElementById("requests"),total:document.getElementById("stat-total"),assigned:document.getElementById("stat-assigned"),unassigned:document.getElementById("stat-unassigned"),pending:document.getElementById("stat-pending"),rejected:document.getElementById("stat-rejected"),assignTo:document.getElementById("assign-to"),assignTeam:document.getElementById("assign-team"),assignBy:document.getElementById("assign-by"),assignNote:document.getElementById("assign-note"),reviewDecision:document.getElementById("review-decision"),reviewBy:document.getElementById("review-by"),reviewNote:document.getElementById("review-note"),refreshBtn:document.getElementById("refresh-btn"),pauseBtn:document.getElementById("pause-btn"),csvBtn:document.getElementById("csv-btn"),topOwnerBtn:document.getElementById("top-owner-btn"),bulkAssignBtn:document.getElementById("bulk-assign-btn"),bulkReviewBtn:document.getElementById("bulk-review-btn")};
+    const keyStore="lsa-ops-api-key"; const autoRefreshStore="lsa-deployment-owner-queue-auto-refresh-seconds"; const autoRefreshPausedStore="lsa-deployment-owner-queue-auto-refresh-paused"; els.apiKey.value=localStorage.getItem(keyStore)||""; els.autoRefreshSeconds.value=localStorage.getItem(autoRefreshStore)||"30"; let latest=null; let autoRefreshTimer=null; let autoRefreshPaused=localStorage.getItem(autoRefreshPausedStore)==="1"; let loadInFlight=false; const statState={total:0,assigned:0,unassigned:0,pending:0,rejected:0};
+    function setNotice(t,c="muted"){els.notice.className=c;els.notice.textContent=t}
+    function params(){const p=new URLSearchParams(); if(els.status.value)p.set("status",els.status.value); if(els.ownerTeam.value.trim())p.set("owner_team",els.ownerTeam.value.trim()); if(els.assignmentState.value)p.set("assignment_state",els.assignmentState.value); return p}
+    function headers(){const key=els.apiKey.value.trim(); localStorage.setItem(keyStore,key); return key?{"X-API-Key":key,"Content-Type":"application/json"}:{"Content-Type":"application/json"}}
+    async function fetchJson(url,opt={}){const r=await fetch(url,{...opt,headers:{...headers(),...(opt.headers||{})}}); if(!r.ok){let d=`${r.status} ${r.statusText}`; try{const p=await r.json(); if(p.detail)d=p.detail}catch{} throw new Error(d)} return r.json()}
+    async function fetchBlob(url){const r=await fetch(url,{headers:{...headers()}}); if(!r.ok){let d=`${r.status} ${r.statusText}`; try{const p=await r.json(); if(p.detail)d=p.detail}catch{} throw new Error(d)} return r.blob()}
+    function badge(status){return `<span class="badge ${status}">${status.replaceAll("_"," ")}</span>`}
+    function animateNumber(el,key,next){if(!window.anime){el.textContent=String(next); statState[key]=next; return} const state={value:statState[key]||0}; anime({targets:state,value:Number(next)||0,round:1,easing:"easeOutExpo",duration:900,update(){el.textContent=String(state.value)}}); statState[key]=Number(next)||0}
+    function animateRows(selector){if(!window.anime)return; anime({targets:selector,translateY:[14,0],opacity:[0,1],delay:anime.stagger(24),duration:460,easing:"easeOutQuad"})}
+    function pulsePanels(){if(!window.anime)return; anime({targets:'.stat,.panel',opacity:[0,1],translateY:[8,0],delay:anime.stagger(35,{start:40}),duration:520,easing:'easeOutCubic'})}
+    function pulseLiveDot(){if(!window.anime)return; anime.remove(els.liveDot); anime({targets:els.liveDot,boxShadow:["0 0 0 0 rgba(13,107,107,.28)","0 0 0 12px rgba(13,107,107,0)"],duration:1200,easing:"easeOutCubic",loop:true})}
+    function stopLiveDot(){if(!window.anime)return; anime.remove(els.liveDot); els.liveDot.style.boxShadow="0 0 0 0 rgba(13,107,107,0)"}
+    function updateAutoRefreshUi(){const seconds=Number(els.autoRefreshSeconds.value||0); els.liveDot.classList.toggle("live",!autoRefreshPaused&&seconds>0); els.liveDot.classList.toggle("paused",autoRefreshPaused||seconds===0); els.pauseBtn.textContent=autoRefreshPaused?"Resume Auto Refresh":"Pause Auto Refresh"; els.liveStatus.textContent=seconds===0?"Auto refresh off.":autoRefreshPaused?`Auto refresh paused (${seconds}s).`:`Auto refresh every ${seconds}s.`; if(!autoRefreshPaused&&seconds>0)pulseLiveDot(); else stopLiveDot()}
+    function updateLastRefresh(){els.lastRefresh.textContent=`Last refresh: ${new Date().toLocaleTimeString()}`}
+    function syncAutoRefresh(){localStorage.setItem(autoRefreshStore,els.autoRefreshSeconds.value); localStorage.setItem(autoRefreshPausedStore,autoRefreshPaused?"1":"0"); if(autoRefreshTimer){clearInterval(autoRefreshTimer); autoRefreshTimer=null} const seconds=Number(els.autoRefreshSeconds.value||0); updateAutoRefreshUi(); if(autoRefreshPaused||seconds===0)return; autoRefreshTimer=setInterval(()=>{if(!loadInFlight)load({silent:true})},seconds*1000)}
+    function render(q){latest=q; animateNumber(els.total,'total',q.total_requests); animateNumber(els.assigned,'assigned',q.assigned_requests); animateNumber(els.unassigned,'unassigned',q.unassigned_requests); animateNumber(els.pending,'pending',q.pending_review_count); animateNumber(els.rejected,'rejected',q.rejected_count);
+      els.rollups.innerHTML=q.owner_team_rollups.length?q.owner_team_rollups.map(r=>`<tr><td><button class="ghost owner-btn" data-owner="${r.owner_team}">${r.owner_team}</button></td><td>${r.total_requests}</td><td>${r.pending_review_count}</td><td class="${r.rejected_count?"bad":""}">${r.rejected_count}</td><td>${r.assigned_requests}</td><td>${r.unassigned_requests}</td><td>${r.oldest_rejected_age_hours??"<span class='muted'>n/a</span>"}</td></tr>`).join(""):`<tr><td colspan="7" class="muted">No data.</td></tr>`;
+      els.requests.innerHTML=q.requests.length?q.requests.map(r=>`<tr><td class="mono">${r.request_id}</td><td>${badge(r.status)}</td><td>${r.owner_team||"<span class='muted'>unowned</span>"}</td><td>${r.assigned_to||"<span class='muted'>unassigned</span>"}</td><td>${r.opened_at}</td><td>${r.summary}</td></tr>`).join(""):`<tr><td colspan="6" class="muted">No requests matched.</td></tr>`;
+      document.querySelectorAll(".owner-btn").forEach(b=>b.addEventListener("click",()=>{els.ownerTeam.value=b.dataset.owner==="unowned"?"":b.dataset.owner; load()}));
+      animateRows('#rollups tr'); animateRows('#requests tr');
+    }
+    async function load(options={}){const silent=Boolean(options.silent); if(loadInFlight)return; loadInFlight=true; if(!silent)setNotice("Loading..."); try{const q=await fetchJson(`/maintenance/control-plane-deployment-readiness/owner-team-queue?${params().toString()}`); render(q); pulsePanels(); updateLastRefresh(); if(!silent)setNotice("Queue loaded.","good")}catch(e){setNotice(String(e.message||e),"bad")}finally{loadInFlight=false}}
+    async function bulkAssign(){try{const r=await fetchJson("/maintenance/control-plane-runtime-validation-change-control-requests/bulk-assign",{method:"POST",body:JSON.stringify({assigned_to:els.assignTo.value.trim(),assigned_to_team:els.assignTeam.value.trim()||null,assigned_by:els.assignBy.value.trim(),assignment_note:els.assignNote.value.trim()||null,status:els.status.value||null,owner_team:els.ownerTeam.value.trim()||null,assignment_state:els.assignmentState.value||null})}); setNotice(`Bulk assign changed ${r.changed_count} request(s).`,"good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function bulkReview(){try{const r=await fetchJson("/maintenance/control-plane-runtime-validation-change-control-requests/bulk-review",{method:"POST",body:JSON.stringify({decision:els.reviewDecision.value,decided_by:els.reviewBy.value.trim(),decision_note:els.reviewNote.value.trim()||null,status:els.status.value||null,owner_team:els.ownerTeam.value.trim()||null,assignment_state:els.assignmentState.value||null})}); setNotice(`Bulk review changed ${r.changed_count} request(s).`,"good"); await load()}catch(e){setNotice(String(e.message||e),"bad")}}
+    async function csv(){try{const blob=await fetchBlob(`/maintenance/control-plane-deployment-readiness/owner-team-queue.csv?${params().toString()}`); const link=document.createElement("a"); const owner=els.ownerTeam.value.trim()||"all"; link.href=URL.createObjectURL(blob); link.download=`deployment-readiness-owner-team-queue-${owner}.csv`; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(link.href); setNotice("CSV ready.","good")}catch(e){setNotice(String(e.message||e),"bad")}}
+    els.refreshBtn.addEventListener("click",load); els.pauseBtn.addEventListener("click",()=>{autoRefreshPaused=!autoRefreshPaused; syncAutoRefresh()}); els.autoRefreshSeconds.addEventListener("change",()=>{autoRefreshPaused=false; syncAutoRefresh()}); els.csvBtn.addEventListener("click",csv); els.bulkAssignBtn.addEventListener("click",bulkAssign); els.bulkReviewBtn.addEventListener("click",bulkReview); els.topOwnerBtn.addEventListener("click",()=>{if(!latest||!latest.owner_team_rollups.length)return; const top=latest.owner_team_rollups[0].owner_team; els.ownerTeam.value=top==="unowned"?"":top; load()}); syncAutoRefresh(); load();
+  </script>
+</body>
+</html>

@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from lsa.services.control_plane_deployment_readiness_service import (
+    ControlPlaneDeploymentReadinessSummary,
+)
 from lsa.services.control_plane_runtime_validation_service import ControlPlaneRuntimeValidationService
 from lsa.services.runtime_validation_policy import (
     RuntimeValidationPolicy,
@@ -321,6 +324,24 @@ class RuntimeValidationReviewSample:
 
 
 @dataclass(slots=True)
+class RuntimeValidationReviewOwnerRollup:
+    owner_team: str
+    active_review_count: int
+    assigned_review_count: int
+    unassigned_review_count: int
+    stale_review_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "owner_team": self.owner_team,
+            "active_review_count": self.active_review_count,
+            "assigned_review_count": self.assigned_review_count,
+            "unassigned_review_count": self.unassigned_review_count,
+            "stale_review_count": self.stale_review_count,
+        }
+
+
+@dataclass(slots=True)
 class RuntimeValidationReviewAnalyticsSummary:
     active_review_count: int
     assigned_review_count: int
@@ -329,6 +350,7 @@ class RuntimeValidationReviewAnalyticsSummary:
     stale_unassigned_review_count: int
     oldest_review_age_hours: float | None = None
     review_samples: list[RuntimeValidationReviewSample] = field(default_factory=list)
+    owner_team_rollups: list[RuntimeValidationReviewOwnerRollup] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -339,6 +361,39 @@ class RuntimeValidationReviewAnalyticsSummary:
             "stale_unassigned_review_count": self.stale_unassigned_review_count,
             "oldest_review_age_hours": self.oldest_review_age_hours,
             "review_samples": [item.to_dict() for item in self.review_samples],
+            "owner_team_rollups": [item.to_dict() for item in self.owner_team_rollups],
+        }
+
+
+@dataclass(slots=True)
+class DeploymentReadinessAnalyticsSummary:
+    evaluated_at: str
+    environment_name: str
+    ready: bool
+    blocker_count: int
+    warning_count: int
+    pending_change_control_count: int = 0
+    rejected_change_control_count: int = 0
+    blocked_owner_team_count: int = 0
+    oldest_rejected_age_hours: float | None = None
+    owner_team_rollups: list[dict] = field(default_factory=list)
+    blockers: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "evaluated_at": self.evaluated_at,
+            "environment_name": self.environment_name,
+            "ready": self.ready,
+            "blocker_count": self.blocker_count,
+            "warning_count": self.warning_count,
+            "pending_change_control_count": self.pending_change_control_count,
+            "rejected_change_control_count": self.rejected_change_control_count,
+            "blocked_owner_team_count": self.blocked_owner_team_count,
+            "oldest_rejected_age_hours": self.oldest_rejected_age_hours,
+            "owner_team_rollups": [dict(item) for item in self.owner_team_rollups],
+            "blockers": list(self.blockers),
+            "warnings": list(self.warnings),
         }
 
 
@@ -436,6 +491,7 @@ class ControlPlaneAnalyticsReport:
     jobs: JobAnalyticsSummary
     oncall: OnCallAnalyticsSummary
     runtime_validation: RuntimeValidationAnalyticsSummary
+    deployment_readiness: DeploymentReadinessAnalyticsSummary
     runtime_validation_reviews: RuntimeValidationReviewAnalyticsSummary
     evaluation: ControlPlaneEvaluation
 
@@ -451,6 +507,7 @@ class ControlPlaneAnalyticsReport:
             "jobs": self.jobs.to_dict(),
             "oncall": self.oncall.to_dict(),
             "runtime_validation": self.runtime_validation.to_dict(),
+            "deployment_readiness": self.deployment_readiness.to_dict(),
             "runtime_validation_reviews": self.runtime_validation_reviews.to_dict(),
             "evaluation": self.evaluation.to_dict(),
         }
@@ -465,6 +522,7 @@ class AnalyticsService:
     runtime_validation_policy_path: str | None = None
     runtime_validation_reminder_interval_seconds: float = 900.0
     runtime_validation_escalation_interval_seconds: float = 1800.0
+    deployment_readiness_service: object | None = None
 
     def build_control_plane_analytics(
         self,
@@ -518,6 +576,9 @@ class AnalyticsService:
             warning_age_hours=effective_thresholds.runtime_rehearsal_warning_age_hours,
             critical_age_hours=effective_thresholds.runtime_rehearsal_critical_age_hours,
         )
+        deployment_readiness_summary = self._build_deployment_readiness_summary(
+            runtime_validation=runtime_validation_summary
+        )
         runtime_validation_review_summary = self._build_runtime_validation_review_summary(now=now)
         evaluation = self._build_evaluation(
             queue=queue,
@@ -526,6 +587,7 @@ class AnalyticsService:
             jobs=job_summary,
             oncall=oncall_summary,
             runtime_validation=runtime_validation_summary,
+            deployment_readiness=deployment_readiness_summary,
             runtime_validation_reviews=runtime_validation_review_summary,
             thresholds=effective_thresholds,
         )
@@ -541,6 +603,7 @@ class AnalyticsService:
             jobs=job_summary,
             oncall=oncall_summary,
             runtime_validation=runtime_validation_summary,
+            deployment_readiness=deployment_readiness_summary,
             runtime_validation_reviews=runtime_validation_review_summary,
             evaluation=evaluation,
         )
@@ -631,6 +694,63 @@ class AnalyticsService:
             blockers=[] if summary.blockers is None else list(summary.blockers),
         )
 
+    def _build_deployment_readiness_summary(
+        self,
+        *,
+        runtime_validation: RuntimeValidationAnalyticsSummary,
+    ) -> DeploymentReadinessAnalyticsSummary:
+        if self.deployment_readiness_service is not None:
+            summary = self.deployment_readiness_service.evaluate()
+            return self._deployment_readiness_analytics_from_summary(summary)
+        blockers = []
+        if runtime_validation.status != "passed":
+            blockers.append(f"runtime_validation_{runtime_validation.status}")
+        warnings = []
+        maintenance_mode = self.job_repository.maintenance_mode_status()
+        if maintenance_mode["active"]:
+            warnings.append("maintenance_mode_active")
+        return DeploymentReadinessAnalyticsSummary(
+            evaluated_at=runtime_validation.generated_at,
+            environment_name=self.default_environment_name,
+            ready=not blockers,
+            blocker_count=len(blockers),
+            warning_count=len(warnings),
+            pending_change_control_count=0,
+            rejected_change_control_count=0,
+            blocked_owner_team_count=0,
+            oldest_rejected_age_hours=None,
+            owner_team_rollups=[],
+            blockers=blockers,
+            warnings=warnings,
+        )
+
+    def _deployment_readiness_analytics_from_summary(
+        self,
+        summary: ControlPlaneDeploymentReadinessSummary,
+    ) -> DeploymentReadinessAnalyticsSummary:
+        pending_change_control_count = 0
+        rejected_change_control_count = 0
+        for record in summary.runtime_validation_change_control_requests:
+            status = str(record.get("status", ""))
+            if status == "pending_review":
+                pending_change_control_count += 1
+            elif status == "rejected":
+                rejected_change_control_count += 1
+        return DeploymentReadinessAnalyticsSummary(
+            evaluated_at=summary.evaluated_at,
+            environment_name=summary.environment_name,
+            ready=summary.ready,
+            blocker_count=len(summary.blockers),
+            warning_count=len(summary.warnings),
+            pending_change_control_count=pending_change_control_count,
+            rejected_change_control_count=rejected_change_control_count,
+            blocked_owner_team_count=len(summary.owner_team_rollups),
+            oldest_rejected_age_hours=summary.oldest_rejected_age_hours,
+            owner_team_rollups=[item.to_dict() for item in summary.owner_team_rollups],
+            blockers=list(summary.blockers),
+            warnings=list(summary.warnings),
+        )
+
     def _build_runtime_validation_review_summary(
         self,
         *,
@@ -654,6 +774,7 @@ class AnalyticsService:
             escalation_interval_seconds=self.runtime_validation_escalation_interval_seconds,
         )
         review_samples: list[RuntimeValidationReviewSample] = []
+        owner_team_rollups: dict[str, dict[str, int]] = {}
         stale_review_count = 0
         stale_unassigned_review_count = 0
         oldest_review_age_hours = 0.0
@@ -667,6 +788,21 @@ class AnalyticsService:
                 assigned_review_count += 1
             else:
                 unassigned_review_count += 1
+            owner_team = _optional_str(review.get("owner_team")) or "unowned"
+            owner_rollup = owner_team_rollups.setdefault(
+                owner_team,
+                {
+                    "active_review_count": 0,
+                    "assigned_review_count": 0,
+                    "unassigned_review_count": 0,
+                    "stale_review_count": 0,
+                },
+            )
+            owner_rollup["active_review_count"] += 1
+            if review.get("assigned_to"):
+                owner_rollup["assigned_review_count"] += 1
+            else:
+                owner_rollup["unassigned_review_count"] += 1
             effective_policy = policy_bundle.resolve(
                 environment_name=str(review["environment_name"]),
                 fallback=fallback_policy,
@@ -677,6 +813,7 @@ class AnalyticsService:
             is_stale = age_hours * 3600.0 >= escalation_seconds
             if is_stale:
                 stale_review_count += 1
+                owner_rollup["stale_review_count"] += 1
                 if not review.get("assigned_to"):
                     stale_unassigned_review_count += 1
             review_samples.append(
@@ -702,6 +839,23 @@ class AnalyticsService:
             stale_unassigned_review_count=stale_unassigned_review_count,
             oldest_review_age_hours=round(oldest_review_age_hours, 2) if reviews else None,
             review_samples=review_samples[:3],
+            owner_team_rollups=[
+                RuntimeValidationReviewOwnerRollup(
+                    owner_team=owner_team,
+                    active_review_count=values["active_review_count"],
+                    assigned_review_count=values["assigned_review_count"],
+                    unassigned_review_count=values["unassigned_review_count"],
+                    stale_review_count=values["stale_review_count"],
+                )
+                for owner_team, values in sorted(
+                    owner_team_rollups.items(),
+                    key=lambda item: (
+                        -item[1]["stale_review_count"],
+                        -item[1]["active_review_count"],
+                        item[0],
+                    ),
+                )
+            ],
         )
 
     def _build_queue_summary(self, jobs: list) -> QueueAnalyticsSummary:
@@ -1045,6 +1199,7 @@ class AnalyticsService:
         jobs: JobAnalyticsSummary,
         oncall: OnCallAnalyticsSummary,
         runtime_validation: RuntimeValidationAnalyticsSummary,
+        deployment_readiness: DeploymentReadinessAnalyticsSummary,
         runtime_validation_reviews: RuntimeValidationReviewAnalyticsSummary,
         thresholds: ControlPlaneAlertThresholds,
     ) -> ControlPlaneEvaluation:
@@ -1242,6 +1397,25 @@ class AnalyticsService:
                             for item in runtime_validation_reviews.review_samples
                             if item.assigned_to is None
                         ],
+                    },
+                )
+            )
+
+        if not deployment_readiness.ready:
+            severity = "critical" if deployment_readiness.rejected_change_control_count > 0 else "warning"
+            findings.append(
+                ControlPlaneFinding(
+                    severity=severity,
+                    code="deployment_readiness_blocked",
+                    metric="deployment_readiness.blocker_count",
+                    summary="Deployment readiness is blocked for active environment.",
+                    observed_value=float(deployment_readiness.blocker_count),
+                    threshold_value=1.0,
+                    context={
+                        "blockers": list(deployment_readiness.blockers),
+                        "warnings": list(deployment_readiness.warnings),
+                        "pending_change_control_count": deployment_readiness.pending_change_control_count,
+                        "rejected_change_control_count": deployment_readiness.rejected_change_control_count,
                     },
                 )
             )

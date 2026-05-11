@@ -5,7 +5,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lsa.services.control_plane_backup_service import ControlPlaneBackupService, ControlPlaneBackupSummary
+from lsa.services.control_plane_deployment_readiness_service import ControlPlaneDeploymentReadinessService
 from lsa.services.job_service import JobService
+from lsa.services.control_plane_runtime_validation_review_service import ControlPlaneRuntimeValidationReviewService
 from lsa.services.control_plane_runtime_validation_service import ControlPlaneRuntimeValidationService
 from lsa.services.runtime_validation_policy import RuntimeValidationPolicy, load_runtime_validation_policy_bundle
 from lsa.storage.files import JobRepository
@@ -40,6 +42,8 @@ class ControlPlaneMaintenancePreflight:
     completed_jobs: int
     failed_jobs: int
     runtime_validation: dict[str, Any]
+    deployment_readiness: dict[str, Any]
+    runtime_validation_change_control_requests: list[dict[str, Any]] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -72,6 +76,10 @@ class ControlPlaneMaintenancePreflight:
             "completed_jobs": self.completed_jobs,
             "failed_jobs": self.failed_jobs,
             "runtime_validation": dict(self.runtime_validation),
+            "deployment_readiness": dict(self.deployment_readiness),
+            "runtime_validation_change_control_requests": [
+                dict(item) for item in self.runtime_validation_change_control_requests
+            ],
             "blockers": list(self.blockers),
             "warnings": list(self.warnings),
             "can_execute": self.can_execute,
@@ -155,6 +163,28 @@ class ControlPlaneMaintenanceService:
             or self.settings.analytics_runtime_rehearsal_critical_age_hours,
             policy_source=runtime_policy_bundle.source_for(environment_name=self.settings.environment_name),
         ).build_summary()
+        review_service = ControlPlaneRuntimeValidationReviewService(
+            settings=self.settings,
+            job_service=self.job_service,
+            job_repository=self.job_repository,
+        )
+        deployment_readiness = ControlPlaneDeploymentReadinessService(
+            settings=self.settings,
+            job_repository=self.job_repository,
+            job_service=self.job_service,
+        ).evaluate()
+        runtime_validation_change_control_requests = [
+            request.to_dict()
+            for request in review_service.list_change_control_requests(owner_team=None)
+            if request.environment_name == self.settings.environment_name
+            and request.status in {"pending_review", "rejected"}
+        ]
+        pending_change_control_requests = [
+            request for request in runtime_validation_change_control_requests if request["status"] == "pending_review"
+        ]
+        rejected_change_control_requests = [
+            request for request in runtime_validation_change_control_requests if request["status"] == "rejected"
+        ]
 
         blockers: list[str] = []
         warnings: list[str] = []
@@ -180,6 +210,23 @@ class ControlPlaneMaintenanceService:
                 blockers.append(runtime_warning_code)
             else:
                 warnings.append(runtime_warning_code)
+        if not deployment_readiness.ready:
+            if self.settings.maintenance_deployment_readiness_required:
+                blockers.extend(
+                    code
+                    for code in deployment_readiness.blockers
+                    if code not in blockers
+                )
+            else:
+                warnings.extend(
+                    code
+                    for code in deployment_readiness.blockers
+                    if code not in warnings
+                )
+        if pending_change_control_requests:
+            warnings.append("runtime_validation_change_control_pending")
+        if rejected_change_control_requests:
+            warnings.append("runtime_validation_change_control_rejected")
 
         return ControlPlaneMaintenancePreflight(
             generated_at=_utc_now(),
@@ -205,6 +252,8 @@ class ControlPlaneMaintenanceService:
             completed_jobs=completed_jobs,
             failed_jobs=failed_jobs,
             runtime_validation=runtime_validation.to_dict(),
+            deployment_readiness=deployment_readiness.to_dict(),
+            runtime_validation_change_control_requests=runtime_validation_change_control_requests,
             blockers=blockers,
             warnings=warnings,
         )

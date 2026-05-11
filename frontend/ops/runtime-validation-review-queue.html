@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Runtime Validation Review Queue</title>
+  <link rel="stylesheet" href="/ops-assets/ops-shell.css" />
+  <style>
+    .shell { max-width: 1380px; padding: 28px 20px 48px; }
+    .grid { grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; }
+    .layout { grid-template-columns: 1.25fr 1fr; align-items: start; }
+    .stats { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 18px; }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field label { font-size: 12px; letter-spacing: 0.05em; font-weight: 700; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+    .panel h2 { margin: 0 0 14px; font-size: 18px; letter-spacing: -0.02em; }
+    #notice { font-size: 14px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav class="nav">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div class="brand-copy">
+          <strong>LSA Ops</strong>
+          <span>Deployment governance cockpit</span>
+        </div>
+      </div>
+      <div class="nav-links">
+        <a class="nav-link" href="/ops">Home</a>
+        <a class="nav-link" href="/ops/deployment-readiness-dashboard">Dashboard</a>
+        <a class="nav-link" href="/ops/deployment-readiness-owner-team-queue">Owner-Team Queue</a>
+        <a class="nav-link active" href="/ops/runtime-validation-review-queue">Runtime Reviews</a>
+      </div>
+    </nav>
+    <section class="hero">
+      <h1>Runtime Validation Review Queue</h1>
+      <p>Owner-team queue view for runtime-proof review debt. Filter the backlog, inspect stale work, and run bulk assignment or resolution actions without leaving the operator surface.</p>
+    </section>
+
+    <section class="toolbar">
+      <div class="grid">
+        <div class="field span-4">
+          <label for="api-key">API Key</label>
+          <input id="api-key" type="password" placeholder="X-API-Key" />
+        </div>
+        <div class="field span-3">
+          <label for="status-filter">Status</label>
+          <select id="status-filter">
+            <option value="">Any</option>
+            <option value="pending_review">Pending Review</option>
+            <option value="assigned">Assigned</option>
+            <option value="resolved">Resolved</option>
+          </select>
+        </div>
+        <div class="field span-3">
+          <label for="owner-team-filter">Owner Team</label>
+          <input id="owner-team-filter" type="text" placeholder="platform" />
+        </div>
+        <div class="field span-2">
+          <label for="assignment-state-filter">Assignment</label>
+          <select id="assignment-state-filter">
+            <option value="">Any</option>
+            <option value="assigned">Assigned</option>
+            <option value="unassigned">Unassigned</option>
+          </select>
+        </div>
+        <div class="field span-3">
+          <label for="auto-refresh-seconds">Auto Refresh</label>
+          <select id="auto-refresh-seconds">
+            <option value="0">Off</option>
+            <option value="15">15s</option>
+            <option value="30" selected>30s</option>
+            <option value="60">60s</option>
+            <option value="120">120s</option>
+          </select>
+        </div>
+        <div class="actions span-12">
+          <button id="refresh-btn">Refresh Queue</button>
+          <button id="pause-btn" class="ghost" type="button">Pause Auto Refresh</button>
+          <button id="download-csv-btn" class="ghost" type="button">Download CSV</button>
+          <button id="use-first-owner-btn" class="ghost" type="button">Use Top Owner Team</button>
+        </div>
+      </div>
+      <div id="notice" class="muted"></div>
+      <div class="livebar">
+        <span id="live-dot" class="dot live"></span>
+        <span id="live-status" class="mini">Auto refresh active.</span>
+        <span id="last-refresh" class="mini">Last refresh: never</span>
+      </div>
+    </section>
+
+    <section class="stats" id="stats">
+      <div class="stat"><div class="k">Total</div><div class="v" id="stat-total">0</div></div>
+      <div class="stat"><div class="k">Assigned</div><div class="v" id="stat-assigned">0</div></div>
+      <div class="stat"><div class="k">Unassigned</div><div class="v" id="stat-unassigned">0</div></div>
+      <div class="stat"><div class="k">Stale</div><div class="v tone-bad" id="stat-stale">0</div></div>
+      <div class="stat"><div class="k">Stale Unassigned</div><div class="v tone-bad" id="stat-stale-unassigned">0</div></div>
+    </section>
+
+    <section class="layout">
+      <div class="stack">
+        <section class="panel">
+          <h2>Owner Team Rollups</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Owner Team</th>
+                <th>Total</th>
+                <th>Assigned</th>
+                <th>Unassigned</th>
+                <th>Stale</th>
+              </tr>
+            </thead>
+            <tbody id="owner-rollups-body"></tbody>
+          </table>
+        </section>
+
+        <section class="panel">
+          <h2>Queue Reviews</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Review</th>
+                <th>Status</th>
+                <th>Owner</th>
+                <th>Assignee</th>
+                <th>Age</th>
+                <th>Summary</th>
+              </tr>
+            </thead>
+            <tbody id="reviews-body"></tbody>
+          </table>
+        </section>
+      </div>
+
+      <div class="stack">
+        <section class="panel">
+          <h2>Bulk Assign</h2>
+          <div class="grid">
+            <div class="field span-6">
+              <label for="bulk-assign-to">Assign To</label>
+              <input id="bulk-assign-to" type="text" placeholder="reviewer-prod" />
+            </div>
+            <div class="field span-6">
+              <label for="bulk-assign-team">Assigned Team</label>
+              <input id="bulk-assign-team" type="text" placeholder="platform" />
+            </div>
+            <div class="field span-6">
+              <label for="bulk-assign-by">Changed By</label>
+              <input id="bulk-assign-by" type="text" placeholder="lead-prod" />
+            </div>
+            <div class="field span-6">
+              <label for="bulk-assign-note">Note</label>
+              <input id="bulk-assign-note" type="text" placeholder="Own the queue" />
+            </div>
+            <div class="actions span-12">
+              <button id="bulk-assign-btn">Bulk Assign Filtered Reviews</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Bulk Resolve</h2>
+          <div class="grid">
+            <div class="field span-6">
+              <label for="bulk-resolve-by">Resolved By</label>
+              <input id="bulk-resolve-by" type="text" placeholder="lead-prod" />
+            </div>
+            <div class="field span-6">
+              <label for="bulk-resolve-reason">Reason</label>
+              <input id="bulk-resolve-reason" type="text" value="manual_resolution" />
+            </div>
+            <div class="field span-12">
+              <label for="bulk-resolve-note">Note</label>
+              <textarea id="bulk-resolve-note" placeholder="Resolved after fresh runtime rehearsal."></textarea>
+            </div>
+            <div class="actions span-12">
+              <button id="bulk-resolve-btn" class="secondary">Bulk Resolve Filtered Reviews</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Queue Snapshot</h2>
+          <div class="hint" id="queue-meta">No data loaded yet.</div>
+        </section>
+      </div>
+    </section>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+  <script>
+    const els = {
+      apiKey: document.getElementById("api-key"),
+      status: document.getElementById("status-filter"),
+      ownerTeam: document.getElementById("owner-team-filter"),
+      assignmentState: document.getElementById("assignment-state-filter"),
+      autoRefreshSeconds: document.getElementById("auto-refresh-seconds"),
+      notice: document.getElementById("notice"),
+      liveDot: document.getElementById("live-dot"),
+      liveStatus: document.getElementById("live-status"),
+      lastRefresh: document.getElementById("last-refresh"),
+      ownerRollupsBody: document.getElementById("owner-rollups-body"),
+      reviewsBody: document.getElementById("reviews-body"),
+      queueMeta: document.getElementById("queue-meta"),
+      total: document.getElementById("stat-total"),
+      assigned: document.getElementById("stat-assigned"),
+      unassigned: document.getElementById("stat-unassigned"),
+      stale: document.getElementById("stat-stale"),
+      staleUnassigned: document.getElementById("stat-stale-unassigned"),
+      bulkAssignTo: document.getElementById("bulk-assign-to"),
+      bulkAssignTeam: document.getElementById("bulk-assign-team"),
+      bulkAssignBy: document.getElementById("bulk-assign-by"),
+      bulkAssignNote: document.getElementById("bulk-assign-note"),
+      bulkResolveBy: document.getElementById("bulk-resolve-by"),
+      bulkResolveReason: document.getElementById("bulk-resolve-reason"),
+      bulkResolveNote: document.getElementById("bulk-resolve-note"),
+      refreshBtn: document.getElementById("refresh-btn"),
+      pauseBtn: document.getElementById("pause-btn"),
+      downloadCsvBtn: document.getElementById("download-csv-btn"),
+      topOwnerBtn: document.getElementById("use-first-owner-btn"),
+      bulkAssignBtn: document.getElementById("bulk-assign-btn"),
+      bulkResolveBtn: document.getElementById("bulk-resolve-btn"),
+    };
+
+    let latestQueue = null;
+    const statState = { total: 0, assigned: 0, unassigned: 0, stale: 0, staleUnassigned: 0 };
+    const keyStore = "lsa-ops-api-key";
+    const autoRefreshStore = "lsa-runtime-review-queue-auto-refresh-seconds";
+    const autoRefreshPausedStore = "lsa-runtime-review-queue-auto-refresh-paused";
+    els.apiKey.value = localStorage.getItem(keyStore) || "";
+    els.autoRefreshSeconds.value = localStorage.getItem(autoRefreshStore) || "30";
+    let autoRefreshTimer = null;
+    let autoRefreshPaused = localStorage.getItem(autoRefreshPausedStore) === "1";
+    let loadInFlight = false;
+
+    function setNotice(text, tone = "muted") {
+      els.notice.className = tone;
+      els.notice.textContent = text;
+    }
+
+    function currentParams() {
+      const params = new URLSearchParams();
+      if (els.status.value) params.set("status", els.status.value);
+      if (els.ownerTeam.value.trim()) params.set("owner_team", els.ownerTeam.value.trim());
+      if (els.assignmentState.value) params.set("assignment_state", els.assignmentState.value);
+      return params;
+    }
+
+    function authHeaders() {
+      const key = els.apiKey.value.trim();
+      localStorage.setItem(keyStore, key);
+      return key ? { "X-API-Key": key } : {};
+    }
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...authHeaders(),
+          ...(options.headers || {}),
+        },
+      });
+      if (!response.ok) {
+        let detail = `${response.status} ${response.statusText}`;
+        try {
+          const payload = await response.json();
+          if (payload.detail) detail = payload.detail;
+        } catch {}
+        throw new Error(detail);
+      }
+      return response.json();
+    }
+
+    async function fetchBlob(url) {
+      const response = await fetch(url, { headers: { ...authHeaders() } });
+      if (!response.ok) {
+        let detail = `${response.status} ${response.statusText}`;
+        try {
+          const payload = await response.json();
+          if (payload.detail) detail = payload.detail;
+        } catch {}
+        throw new Error(detail);
+      }
+      return response.blob();
+    }
+
+    function badge(status) {
+      return `<span class="badge ${status}">${status.replaceAll("_", " ")}</span>`;
+    }
+
+    function animateNumber(el, key, next) {
+      if (!window.anime) {
+        el.textContent = String(next);
+        statState[key] = next;
+        return;
+      }
+      const state = { value: statState[key] || 0 };
+      anime({
+        targets: state,
+        value: Number(next) || 0,
+        round: 1,
+        easing: "easeOutExpo",
+        duration: 900,
+        update() { el.textContent = String(state.value); },
+      });
+      statState[key] = Number(next) || 0;
+    }
+
+    function animateRows(selector) {
+      if (!window.anime) return;
+      anime({
+        targets: selector,
+        translateY: [14, 0],
+        opacity: [0, 1],
+        delay: anime.stagger(28),
+        duration: 500,
+        easing: "easeOutQuad",
+      });
+    }
+
+    function pulsePanels() {
+      if (!window.anime) return;
+      anime({
+        targets: ".stat,.panel,.toolbar,.nav",
+        opacity: [0, 1],
+        translateY: [8, 0],
+        delay: anime.stagger(35, { start: 40 }),
+        duration: 520,
+        easing: "easeOutCubic",
+      });
+    }
+
+    function pulseLiveDot() {
+      if (!window.anime) return;
+      anime.remove(els.liveDot);
+      anime({ targets: els.liveDot, boxShadow: ["0 0 0 0 rgba(13,107,107,.28)", "0 0 0 12px rgba(13,107,107,0)"], duration: 1200, easing: "easeOutCubic", loop: true });
+    }
+
+    function stopLiveDot() {
+      if (!window.anime) return;
+      anime.remove(els.liveDot);
+      els.liveDot.style.boxShadow = "0 0 0 0 rgba(13,107,107,0)";
+    }
+
+    function updateAutoRefreshUi() {
+      const seconds = Number(els.autoRefreshSeconds.value || 0);
+      els.liveDot.classList.toggle("live", !autoRefreshPaused && seconds > 0);
+      els.liveDot.classList.toggle("paused", autoRefreshPaused || seconds === 0);
+      els.pauseBtn.textContent = autoRefreshPaused ? "Resume Auto Refresh" : "Pause Auto Refresh";
+      els.liveStatus.textContent = seconds === 0 ? "Auto refresh off." : autoRefreshPaused ? `Auto refresh paused (${seconds}s).` : `Auto refresh every ${seconds}s.`;
+      if (!autoRefreshPaused && seconds > 0) pulseLiveDot(); else stopLiveDot();
+    }
+
+    function updateLastRefresh() {
+      els.lastRefresh.textContent = `Last refresh: ${new Date().toLocaleTimeString()}`;
+    }
+
+    function syncAutoRefresh() {
+      localStorage.setItem(autoRefreshStore, els.autoRefreshSeconds.value);
+      localStorage.setItem(autoRefreshPausedStore, autoRefreshPaused ? "1" : "0");
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+      const seconds = Number(els.autoRefreshSeconds.value || 0);
+      updateAutoRefreshUi();
+      if (autoRefreshPaused || seconds === 0) return;
+      autoRefreshTimer = setInterval(() => {
+        if (!loadInFlight) loadQueue({ silent: true });
+      }, seconds * 1000);
+    }
+
+    function renderQueue(queue) {
+      latestQueue = queue;
+      animateNumber(els.total, "total", queue.total_reviews);
+      animateNumber(els.assigned, "assigned", queue.assigned_reviews);
+      animateNumber(els.unassigned, "unassigned", queue.unassigned_reviews);
+      animateNumber(els.stale, "stale", queue.stale_reviews);
+      animateNumber(els.staleUnassigned, "staleUnassigned", queue.stale_unassigned_reviews);
+      els.queueMeta.textContent =
+        `Environment ${queue.environment_name}. Oldest review age: ${queue.oldest_review_age_hours ?? "n/a"} hours.`;
+
+      els.ownerRollupsBody.innerHTML = queue.owner_team_rollups.length
+        ? queue.owner_team_rollups.map((row) => `
+            <tr>
+              <td><button class="ghost owner-filter" data-owner="${row.owner_team}">${row.owner_team}</button></td>
+              <td>${row.total_reviews}</td>
+              <td>${row.assigned_reviews}</td>
+              <td>${row.unassigned_reviews}</td>
+              <td class="${row.stale_reviews ? "tone-bad" : ""}">${row.stale_reviews}</td>
+            </tr>
+          `).join("")
+        : `<tr><td colspan="5" class="muted">No owner-team data.</td></tr>`;
+
+      els.reviewsBody.innerHTML = queue.reviews.length
+        ? queue.reviews.map((row) => `
+            <tr>
+              <td class="mono">${row.review_id}</td>
+              <td>${badge(row.status)}</td>
+              <td>${row.owner_team || "<span class='muted'>unowned</span>"}</td>
+              <td>${row.assigned_to || "<span class='muted'>unassigned</span>"}</td>
+              <td>${row.next_due_at ? `${row.due_in_hours ?? "?"}h left` : "<span class='muted'>n/a</span>"}</td>
+              <td>${row.summary}</td>
+            </tr>
+          `).join("")
+        : `<tr><td colspan="6" class="muted">No reviews matched.</td></tr>`;
+
+      document.querySelectorAll(".owner-filter").forEach((button) => {
+        button.addEventListener("click", () => {
+          els.ownerTeam.value = button.dataset.owner === "unowned" ? "" : button.dataset.owner;
+          loadQueue();
+        });
+      });
+      animateRows("#owner-rollups-body tr");
+      animateRows("#reviews-body tr");
+    }
+
+    async function loadQueue(options = {}) {
+      const silent = Boolean(options.silent);
+      if (loadInFlight) return;
+      loadInFlight = true;
+      if (!silent) setNotice("Loading queue...");
+      try {
+        const queue = await fetchJson(`/maintenance/control-plane-runtime-validation-review-queue?${currentParams().toString()}`);
+        renderQueue(queue);
+        pulsePanels();
+        updateLastRefresh();
+        if (!silent) setNotice("Queue loaded.", "tone-good");
+      } catch (error) {
+        setNotice(String(error.message || error), "tone-bad");
+      } finally {
+        loadInFlight = false;
+      }
+    }
+
+    async function bulkAssign() {
+      try {
+        const payload = {
+          assigned_to: els.bulkAssignTo.value.trim(),
+          assigned_to_team: els.bulkAssignTeam.value.trim() || null,
+          assigned_by: els.bulkAssignBy.value.trim(),
+          assignment_note: els.bulkAssignNote.value.trim() || null,
+          status: els.status.value || null,
+          owner_team: els.ownerTeam.value.trim() || null,
+          assignment_state: els.assignmentState.value || null,
+        };
+        const result = await fetchJson("/maintenance/control-plane-runtime-validation-reviews/bulk-assign", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        setNotice(`Bulk assign changed ${result.changed_count} review(s).`, "tone-good");
+        await loadQueue();
+      } catch (error) {
+        setNotice(String(error.message || error), "tone-bad");
+      }
+    }
+
+    async function bulkResolve() {
+      try {
+        const payload = {
+          resolved_by: els.bulkResolveBy.value.trim(),
+          resolution_reason: els.bulkResolveReason.value.trim() || "manual_resolution",
+          resolution_note: els.bulkResolveNote.value.trim() || null,
+          status: els.status.value || null,
+          owner_team: els.ownerTeam.value.trim() || null,
+          assignment_state: els.assignmentState.value || null,
+        };
+        const result = await fetchJson("/maintenance/control-plane-runtime-validation-reviews/bulk-resolve", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        setNotice(`Bulk resolve changed ${result.changed_count} review(s).`, "tone-good");
+        await loadQueue();
+      } catch (error) {
+        setNotice(String(error.message || error), "tone-bad");
+      }
+    }
+
+    async function downloadCsv() {
+      try {
+        setNotice("Building CSV export...");
+        const blob = await fetchBlob(`/maintenance/control-plane-runtime-validation-review-queue.csv?${currentParams().toString()}`);
+        const link = document.createElement("a");
+        const owner = els.ownerTeam.value.trim() || "all";
+        link.href = URL.createObjectURL(blob);
+        link.download = `runtime-validation-review-queue-${owner}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(link.href);
+        setNotice("CSV ready.", "tone-good");
+      } catch (error) {
+        setNotice(String(error.message || error), "tone-bad");
+      }
+    }
+
+    els.refreshBtn.addEventListener("click", loadQueue);
+    els.pauseBtn.addEventListener("click", () => {
+      autoRefreshPaused = !autoRefreshPaused;
+      syncAutoRefresh();
+    });
+    els.autoRefreshSeconds.addEventListener("change", () => {
+      autoRefreshPaused = false;
+      syncAutoRefresh();
+    });
+    els.downloadCsvBtn.addEventListener("click", downloadCsv);
+    els.bulkAssignBtn.addEventListener("click", bulkAssign);
+    els.bulkResolveBtn.addEventListener("click", bulkResolve);
+    els.topOwnerBtn.addEventListener("click", () => {
+      if (!latestQueue || !latestQueue.owner_team_rollups.length) return;
+      const top = latestQueue.owner_team_rollups[0].owner_team;
+      els.ownerTeam.value = top === "unowned" ? "" : top;
+      loadQueue();
+    });
+
+    syncAutoRefresh();
+    loadQueue();
+  </script>
+</body>
+</html>

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from lsa.services.control_plane_deployment_readiness_service import ControlPlaneDeploymentReadinessService
 from lsa.services.control_plane_runtime_smoke_service import ControlPlaneRuntimeSmokeService
 
 
@@ -28,6 +29,7 @@ class ControlPlaneRuntimeRehearsalSummary:
     job_repository_runtime_active: bool
     database_runtime_available: bool
     database_runtime_blockers: list[str]
+    deployment_readiness: dict[str, Any]
     checks: dict[str, bool]
     status: str
     smoke: dict[str, Any]
@@ -54,6 +56,7 @@ class ControlPlaneRuntimeRehearsalSummary:
             "job_repository_runtime_active": self.job_repository_runtime_active,
             "database_runtime_available": self.database_runtime_available,
             "database_runtime_blockers": list(self.database_runtime_blockers),
+            "deployment_readiness": dict(self.deployment_readiness),
             "checks": dict(self.checks),
             "status": self.status,
             "smoke": dict(self.smoke),
@@ -81,6 +84,16 @@ class ControlPlaneRuntimeRehearsalService:
         rehearsal_id = uuid4().hex[:12]
         executed_at = self.now_factory()
         database_status = self.job_repository.database_status()
+        deployment_readiness = ControlPlaneDeploymentReadinessService(
+            settings=self.settings,
+            job_repository=self.job_repository,
+            job_service=self.job_service,
+        ).evaluate()
+        if self.settings.runtime_rehearsal_deployment_readiness_required and not deployment_readiness.ready:
+            raise ValueError(
+                "Runtime rehearsal blocked by deployment readiness: "
+                + ", ".join(sorted(deployment_readiness.blockers))
+            )
         smoke_summary = self.runtime_smoke_service.run(
             changed_by=changed_by,
             reason=reason,
@@ -99,6 +112,7 @@ class ControlPlaneRuntimeRehearsalService:
             "job_repository_backend_matches_expected": smoke_summary.job_repository_backend == expected_backend,
             "repository_layout_matches_expected": smoke_summary.repository_layout == expected_repository_layout,
             "database_runtime_available": bool(database_status["runtime_available"]),
+            "deployment_readiness_ok": deployment_readiness.ready,
             "snapshots_audits_repository_runtime_active_matches_expected": (
                 snapshots_audits_runtime_active if expected_backend == "postgres" else not snapshots_audits_runtime_active
             ),
@@ -134,6 +148,7 @@ class ControlPlaneRuntimeRehearsalService:
             job_repository_runtime_active=smoke_summary.job_repository_backend == "postgres",
             database_runtime_available=bool(database_status["runtime_available"]),
             database_runtime_blockers=[str(item) for item in database_status["runtime_blockers"]],
+            deployment_readiness=deployment_readiness.to_dict(),
             checks=checks,
             status=status,
             smoke=smoke_payload,

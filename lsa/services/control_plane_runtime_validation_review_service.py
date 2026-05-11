@@ -104,6 +104,206 @@ class RuntimeValidationReviewAlertState:
 
 
 @dataclass(slots=True)
+class RuntimeValidationReviewOwnerQueueRollup:
+    owner_team: str
+    total_reviews: int
+    assigned_reviews: int
+    unassigned_reviews: int
+    stale_reviews: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "owner_team": self.owner_team,
+            "total_reviews": self.total_reviews,
+            "assigned_reviews": self.assigned_reviews,
+            "unassigned_reviews": self.unassigned_reviews,
+            "stale_reviews": self.stale_reviews,
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationReviewQueueSummary:
+    environment_name: str
+    total_reviews: int
+    assigned_reviews: int
+    unassigned_reviews: int
+    stale_reviews: int
+    stale_unassigned_reviews: int
+    oldest_review_age_hours: float | None
+    owner_team_rollups: list[RuntimeValidationReviewOwnerQueueRollup]
+    reviews: list[RuntimeValidationReviewRequest]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "environment_name": self.environment_name,
+            "total_reviews": self.total_reviews,
+            "assigned_reviews": self.assigned_reviews,
+            "unassigned_reviews": self.unassigned_reviews,
+            "stale_reviews": self.stale_reviews,
+            "stale_unassigned_reviews": self.stale_unassigned_reviews,
+            "oldest_review_age_hours": self.oldest_review_age_hours,
+            "owner_team_rollups": [item.to_dict() for item in self.owner_team_rollups],
+            "reviews": [item.to_dict() for item in self.reviews],
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationReviewBulkActionResult:
+    environment_name: str
+    action: str
+    matched_count: int
+    changed_count: int
+    reviews: list[RuntimeValidationReviewRequest]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "environment_name": self.environment_name,
+            "action": self.action,
+            "matched_count": self.matched_count,
+            "changed_count": self.changed_count,
+            "reviews": [item.to_dict() for item in self.reviews],
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationReviewSLA:
+    warning_age_hours: float
+    critical_age_hours: float
+
+
+@dataclass(slots=True)
+class RuntimeValidationGovernanceRequest:
+    request_id: str
+    opened_at: str
+    opened_by: str
+    environment_name: str
+    review_id: str
+    owner_team: str | None
+    review_opened_at: str
+    summary: str
+    status: str
+    trigger_code: str
+    policy_source: str
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+    resolution_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "opened_at": self.opened_at,
+            "opened_by": self.opened_by,
+            "environment_name": self.environment_name,
+            "review_id": self.review_id,
+            "owner_team": self.owner_team,
+            "review_opened_at": self.review_opened_at,
+            "summary": self.summary,
+            "status": self.status,
+            "trigger_code": self.trigger_code,
+            "policy_source": self.policy_source,
+            "assigned_to": self.assigned_to,
+            "assigned_to_team": self.assigned_to_team,
+            "resolved_at": self.resolved_at,
+            "resolved_by": self.resolved_by,
+            "resolution_note": self.resolution_note,
+            "resolution_reason": self.resolution_reason,
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationChangeControlRequest:
+    request_id: str
+    opened_at: str
+    opened_by: str
+    environment_name: str
+    governance_request_id: str
+    review_id: str
+    owner_team: str | None
+    summary: str
+    status: str
+    trigger_code: str
+    policy_source: str
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    assigned_at: str | None = None
+    assigned_by: str | None = None
+    assignment_note: str | None = None
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+    resolution_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "opened_at": self.opened_at,
+            "opened_by": self.opened_by,
+            "environment_name": self.environment_name,
+            "governance_request_id": self.governance_request_id,
+            "review_id": self.review_id,
+            "owner_team": self.owner_team,
+            "summary": self.summary,
+            "status": self.status,
+            "trigger_code": self.trigger_code,
+            "policy_source": self.policy_source,
+            "assigned_to": self.assigned_to,
+            "assigned_to_team": self.assigned_to_team,
+            "assigned_at": self.assigned_at,
+            "assigned_by": self.assigned_by,
+            "assignment_note": self.assignment_note,
+            "resolved_at": self.resolved_at,
+            "resolved_by": self.resolved_by,
+            "resolution_note": self.resolution_note,
+            "resolution_reason": self.resolution_reason,
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationChangeControlQueueSummary:
+    environment_name: str
+    total_requests: int
+    assigned_requests: int
+    unassigned_requests: int
+    pending_review_count: int
+    rejected_count: int
+    owner_team_rollups: list[dict[str, Any]]
+    requests: list[RuntimeValidationChangeControlRequest]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "environment_name": self.environment_name,
+            "total_requests": self.total_requests,
+            "assigned_requests": self.assigned_requests,
+            "unassigned_requests": self.unassigned_requests,
+            "pending_review_count": self.pending_review_count,
+            "rejected_count": self.rejected_count,
+            "owner_team_rollups": [dict(item) for item in self.owner_team_rollups],
+            "requests": [item.to_dict() for item in self.requests],
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationChangeControlBulkActionResult:
+    environment_name: str
+    action: str
+    matched_count: int
+    changed_count: int
+    requests: list[RuntimeValidationChangeControlRequest]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "environment_name": self.environment_name,
+            "action": self.action,
+            "matched_count": self.matched_count,
+            "changed_count": self.changed_count,
+            "requests": [item.to_dict() for item in self.requests],
+        }
+
+
+@dataclass(slots=True)
 class ControlPlaneRuntimeValidationReviewService:
     settings: Any
     job_service: Any
@@ -112,13 +312,36 @@ class ControlPlaneRuntimeValidationReviewService:
     OPENED_EVENT_TYPE = "runtime_validation_review_opened"
     ASSIGNED_EVENT_TYPE = "runtime_validation_review_assigned"
     RESOLVED_EVENT_TYPE = "runtime_validation_review_resolved"
+    GOVERNANCE_OPENED_EVENT_TYPE = "runtime_validation_governance_opened"
+    GOVERNANCE_RESOLVED_EVENT_TYPE = "runtime_validation_governance_resolved"
+    CHANGE_CONTROL_OPENED_EVENT_TYPE = "runtime_validation_change_control_opened"
+    CHANGE_CONTROL_ASSIGNED_EVENT_TYPE = "runtime_validation_change_control_assigned"
+    CHANGE_CONTROL_DECIDED_EVENT_TYPE = "runtime_validation_change_control_decided"
+    CHANGE_CONTROL_RESOLVED_EVENT_TYPE = "runtime_validation_change_control_resolved"
 
-    def list_reviews(self, *, status: str | None = None) -> list[RuntimeValidationReviewRequest]:
+    def list_reviews(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> list[RuntimeValidationReviewRequest]:
         reviews = self._rebuild_reviews()
-        if status is None:
-            return reviews
-        normalized = status.strip().lower()
-        return [review for review in reviews if review.status == normalized]
+        if status is not None:
+            normalized = status.strip().lower()
+            reviews = [review for review in reviews if review.status == normalized]
+        if owner_team is not None:
+            normalized_owner_team = owner_team.strip().lower()
+            reviews = [review for review in reviews if review.owner_team == normalized_owner_team]
+        if assignment_state is not None:
+            normalized_assignment_state = assignment_state.strip().lower()
+            if normalized_assignment_state == "assigned":
+                reviews = [review for review in reviews if review.assigned_to is not None]
+            elif normalized_assignment_state == "unassigned":
+                reviews = [review for review in reviews if review.assigned_to is None]
+            elif normalized_assignment_state != "any":
+                raise ValueError("assignment_state must be one of: assigned, unassigned, any.")
+        return reviews
 
     def get_review(self, review_id: str) -> RuntimeValidationReviewRequest:
         for review in self._rebuild_reviews():
@@ -140,26 +363,174 @@ class ControlPlaneRuntimeValidationReviewService:
             return review
         return None
 
+    def queue_summary(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> RuntimeValidationReviewQueueSummary:
+        reviews = self.list_reviews(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+        fallback_policy = self._fallback_policy()
+        assigned_reviews = 0
+        unassigned_reviews = 0
+        stale_reviews = 0
+        stale_unassigned_reviews = 0
+        oldest_review_age_hours: float | None = None
+        owner_team_rollups: dict[str, dict[str, int]] = {}
+        now = datetime.now(UTC)
+
+        for review in reviews:
+            if review.assigned_to is not None:
+                assigned_reviews += 1
+            else:
+                unassigned_reviews += 1
+            age_hours = max((now - datetime.fromisoformat(review.opened_at)).total_seconds() / 3600.0, 0.0)
+            if oldest_review_age_hours is None or age_hours > oldest_review_age_hours:
+                oldest_review_age_hours = age_hours
+            sla = self._review_sla(review, fallback_policy=fallback_policy)
+            is_stale = age_hours >= sla.critical_age_hours
+            owner_key = review.owner_team or "unowned"
+            rollup = owner_team_rollups.setdefault(
+                owner_key,
+                {
+                    "total_reviews": 0,
+                    "assigned_reviews": 0,
+                    "unassigned_reviews": 0,
+                    "stale_reviews": 0,
+                },
+            )
+            rollup["total_reviews"] += 1
+            if review.assigned_to is not None:
+                rollup["assigned_reviews"] += 1
+            else:
+                rollup["unassigned_reviews"] += 1
+            if is_stale:
+                stale_reviews += 1
+                rollup["stale_reviews"] += 1
+                if review.assigned_to is None:
+                    stale_unassigned_reviews += 1
+
+        rollups = [
+            RuntimeValidationReviewOwnerQueueRollup(
+                owner_team=owner_team_key,
+                total_reviews=values["total_reviews"],
+                assigned_reviews=values["assigned_reviews"],
+                unassigned_reviews=values["unassigned_reviews"],
+                stale_reviews=values["stale_reviews"],
+            )
+            for owner_team_key, values in sorted(
+                owner_team_rollups.items(),
+                key=lambda item: (-item[1]["stale_reviews"], -item[1]["total_reviews"], item[0]),
+            )
+        ]
+        return RuntimeValidationReviewQueueSummary(
+            environment_name=self.settings.environment_name,
+            total_reviews=len(reviews),
+            assigned_reviews=assigned_reviews,
+            unassigned_reviews=unassigned_reviews,
+            stale_reviews=stale_reviews,
+            stale_unassigned_reviews=stale_unassigned_reviews,
+            oldest_review_age_hours=None if oldest_review_age_hours is None else round(oldest_review_age_hours, 2),
+            owner_team_rollups=rollups,
+            reviews=reviews,
+        )
+
+    def bulk_assign_reviews(
+        self,
+        *,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> RuntimeValidationReviewBulkActionResult:
+        reviews = self.list_reviews(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+        changed: list[RuntimeValidationReviewRequest] = []
+        for review in reviews:
+            updated = self.assign_review(
+                review_id=review.review_id,
+                assigned_to=assigned_to,
+                assigned_to_team=assigned_to_team,
+                assigned_by=assigned_by,
+                assignment_note=assignment_note,
+            )
+            changed.append(updated)
+        return RuntimeValidationReviewBulkActionResult(
+            environment_name=self.settings.environment_name,
+            action="bulk_assign",
+            matched_count=len(reviews),
+            changed_count=len(changed),
+            reviews=changed,
+        )
+
+    def bulk_resolve_reviews(
+        self,
+        *,
+        resolved_by: str,
+        resolution_reason: str,
+        resolution_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> RuntimeValidationReviewBulkActionResult:
+        reviews = self.list_reviews(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+        changed: list[RuntimeValidationReviewRequest] = []
+        for review in reviews:
+            updated = self.resolve_review(
+                review_id=review.review_id,
+                resolved_by=resolved_by,
+                resolution_note=resolution_note,
+                resolution_reason=resolution_reason,
+            )
+            changed.append(updated)
+        return RuntimeValidationReviewBulkActionResult(
+            environment_name=self.settings.environment_name,
+            action="bulk_resolve",
+            matched_count=len(reviews),
+            changed_count=len(changed),
+            reviews=changed,
+        )
+
     def build_alert_state(self, *, force: bool = False) -> RuntimeValidationReviewAlertState | None:
         review = self.active_review()
         if review is None:
             return None
+        fallback_policy = self._fallback_policy()
         policy, policy_source = self._effective_policy(review.environment_name)
+        effective_policy = policy.finalized(fallback_policy)
         reminder_interval_seconds = (
-            policy.reminder_interval_seconds or self.settings.control_plane_alert_reminder_interval_seconds
+            effective_policy.reminder_interval_seconds or self.settings.control_plane_alert_reminder_interval_seconds
         )
         escalation_interval_seconds = (
-            policy.escalation_interval_seconds or self.settings.control_plane_alert_escalation_interval_seconds
+            effective_policy.escalation_interval_seconds or self.settings.control_plane_alert_escalation_interval_seconds
         )
         age_seconds = max(
             (datetime.now(UTC) - datetime.fromisoformat(review.opened_at)).total_seconds(),
             0.0,
         )
-        if not force and age_seconds < reminder_interval_seconds:
+        sla = self._review_sla(review, fallback_policy=fallback_policy)
+        warning_age_seconds = sla.warning_age_hours * 3600.0
+        critical_age_seconds = sla.critical_age_hours * 3600.0
+        if not force and age_seconds < warning_age_seconds:
             return None
 
         is_assigned = review.assigned_to is not None
-        overdue = escalation_interval_seconds <= reminder_interval_seconds if force else age_seconds >= escalation_interval_seconds
+        overdue = critical_age_seconds <= warning_age_seconds if force else age_seconds >= critical_age_seconds
         if overdue:
             if is_assigned:
                 finding_codes = ["runtime_validation_review_overdue"]
@@ -206,6 +577,546 @@ class ControlPlaneRuntimeValidationReviewService:
             severity="warning",
             finding_codes=finding_codes,
             summary=summary,
+        )
+
+    def list_governance_requests(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+    ) -> list[RuntimeValidationGovernanceRequest]:
+        requests = self._rebuild_governance_requests()
+        if status is not None:
+            normalized = status.strip().lower()
+            requests = [request for request in requests if request.status == normalized]
+        if owner_team is not None:
+            normalized_owner_team = owner_team.strip().lower()
+            requests = [request for request in requests if request.owner_team == normalized_owner_team]
+        return requests
+
+    def process_governance_requests(
+        self,
+        *,
+        changed_by: str,
+        reason: str | None = None,
+        force: bool = False,
+    ) -> list[RuntimeValidationGovernanceRequest]:
+        fallback_policy = self._fallback_policy()
+        review = self.active_review()
+        active_requests = [
+            request
+            for request in self._rebuild_governance_requests()
+            if request.environment_name == self.settings.environment_name and request.status != "resolved"
+        ]
+        changed: list[RuntimeValidationGovernanceRequest] = []
+        governance_required = (
+            review is not None
+            and self._governance_required(review, fallback_policy=fallback_policy)
+        )
+        if not governance_required:
+            for request in active_requests:
+                changed.append(
+                    self._resolve_governance_request(
+                        request_id=request.request_id,
+                        resolved_by=changed_by,
+                        resolution_note=reason or "Governance condition cleared.",
+                        resolution_reason="review_recovered",
+                    )
+                )
+            return changed
+
+        assert review is not None
+        existing = next((request for request in active_requests if request.review_id == review.review_id), None)
+        if existing is None:
+            changed.append(
+                self._open_governance_request(
+                    review=review,
+                    changed_by=changed_by,
+                    reason=reason,
+                )
+            )
+            return changed
+        if force and len(active_requests) > 1:
+            for request in active_requests:
+                if request.request_id == existing.request_id:
+                    continue
+                changed.append(
+                    self._resolve_governance_request(
+                        request_id=request.request_id,
+                        resolved_by=changed_by,
+                        resolution_note="Superseded by current governance request.",
+                        resolution_reason="superseded",
+                    )
+                )
+        return changed
+
+    def list_change_control_requests(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> list[RuntimeValidationChangeControlRequest]:
+        requests = self._rebuild_change_control_requests()
+        if status is not None:
+            normalized = status.strip().lower()
+            requests = [request for request in requests if request.status == normalized]
+        if owner_team is not None:
+            normalized_owner_team = owner_team.strip().lower()
+            requests = [request for request in requests if request.owner_team == normalized_owner_team]
+        if assignment_state is not None:
+            normalized_assignment_state = assignment_state.strip().lower()
+            if normalized_assignment_state == "assigned":
+                requests = [request for request in requests if request.assigned_to is not None]
+            elif normalized_assignment_state == "unassigned":
+                requests = [request for request in requests if request.assigned_to is None]
+            elif normalized_assignment_state != "any":
+                raise ValueError("assignment_state must be one of: assigned, unassigned, any.")
+        return requests
+
+    def change_control_queue_summary(
+        self,
+        *,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> RuntimeValidationChangeControlQueueSummary:
+        requests = self.list_change_control_requests(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+        assigned_requests = 0
+        unassigned_requests = 0
+        pending_review_count = 0
+        rejected_count = 0
+        owner_team_rollups: dict[str, dict[str, int | str]] = {}
+
+        for request in requests:
+            if request.assigned_to is not None:
+                assigned_requests += 1
+            else:
+                unassigned_requests += 1
+            if request.status == "pending_review":
+                pending_review_count += 1
+            elif request.status == "rejected":
+                rejected_count += 1
+            owner_key = request.owner_team or "unowned"
+            rollup = owner_team_rollups.setdefault(
+                owner_key,
+                {
+                    "owner_team": owner_key,
+                    "total_requests": 0,
+                    "assigned_requests": 0,
+                    "unassigned_requests": 0,
+                    "pending_review_count": 0,
+                    "rejected_count": 0,
+                },
+            )
+            rollup["total_requests"] += 1
+            if request.assigned_to is not None:
+                rollup["assigned_requests"] += 1
+            else:
+                rollup["unassigned_requests"] += 1
+            if request.status == "pending_review":
+                rollup["pending_review_count"] += 1
+            elif request.status == "rejected":
+                rollup["rejected_count"] += 1
+
+        return RuntimeValidationChangeControlQueueSummary(
+            environment_name=self.settings.environment_name,
+            total_requests=len(requests),
+            assigned_requests=assigned_requests,
+            unassigned_requests=unassigned_requests,
+            pending_review_count=pending_review_count,
+            rejected_count=rejected_count,
+            owner_team_rollups=[
+                dict(item)
+                for item in sorted(
+                    owner_team_rollups.values(),
+                    key=lambda item: (-int(item["rejected_count"]), -int(item["total_requests"]), str(item["owner_team"])),
+                )
+            ],
+            requests=requests,
+        )
+
+    def assign_change_control_request(
+        self,
+        *,
+        request_id: str,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+    ) -> RuntimeValidationChangeControlRequest:
+        request = self.get_change_control_request(request_id)
+        if request.status != "pending_review":
+            raise ValueError(f"Change-control request '{request_id}' is not pending review.")
+        normalized_assigned_to = assigned_to.strip()
+        if not normalized_assigned_to:
+            raise ValueError("assigned_to must not be empty.")
+        self.job_service.record_maintenance_event(
+            event_type=self.CHANGE_CONTROL_ASSIGNED_EVENT_TYPE,
+            changed_by=assigned_by,
+            reason=assignment_note,
+            details={
+                "request_id": request_id,
+                "assigned_to": normalized_assigned_to,
+                "assigned_to_team": self._normalize_team(assigned_to_team),
+                "assigned_at": _utc_now(),
+                "assigned_by": assigned_by,
+                "assignment_note": assignment_note,
+            },
+        )
+        return self.get_change_control_request(request_id)
+
+    def decide_change_control_request(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        decided_by: str,
+        decision_note: str | None = None,
+    ) -> RuntimeValidationChangeControlRequest:
+        request = self.get_change_control_request(request_id)
+        if request.status != "pending_review":
+            raise ValueError(f"Change-control request '{request_id}' is not pending review.")
+        normalized_decision = decision.strip().lower()
+        if normalized_decision not in {"approve", "reject"}:
+            raise ValueError("decision must be either 'approve' or 'reject'.")
+        if normalized_decision == "reject" and (decision_note is None or not decision_note.strip()):
+            raise ValueError("decision_note is required when rejecting a change-control request.")
+        self.job_service.record_maintenance_event(
+            event_type=self.CHANGE_CONTROL_DECIDED_EVENT_TYPE,
+            changed_by=decided_by,
+            reason=decision_note,
+            details={
+                "request_id": request_id,
+                "decision": normalized_decision,
+                "decided_at": _utc_now(),
+                "decided_by": decided_by,
+                "decision_note": decision_note,
+            },
+        )
+        return self.get_change_control_request(request_id)
+
+    def bulk_assign_change_control_requests(
+        self,
+        *,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> RuntimeValidationChangeControlBulkActionResult:
+        requests = self.list_change_control_requests(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+        changed: list[RuntimeValidationChangeControlRequest] = []
+        for request in requests:
+            if request.status != "pending_review":
+                continue
+            changed.append(
+                self.assign_change_control_request(
+                    request_id=request.request_id,
+                    assigned_to=assigned_to,
+                    assigned_to_team=assigned_to_team,
+                    assigned_by=assigned_by,
+                    assignment_note=assignment_note,
+                )
+            )
+        return RuntimeValidationChangeControlBulkActionResult(
+            environment_name=self.settings.environment_name,
+            action="bulk_assign",
+            matched_count=len(requests),
+            changed_count=len(changed),
+            requests=changed,
+        )
+
+    def bulk_decide_change_control_requests(
+        self,
+        *,
+        decision: str,
+        decided_by: str,
+        decision_note: str | None = None,
+        status: str | None = None,
+        owner_team: str | None = None,
+        assignment_state: str | None = None,
+    ) -> RuntimeValidationChangeControlBulkActionResult:
+        requests = self.list_change_control_requests(
+            status=status,
+            owner_team=owner_team,
+            assignment_state=assignment_state,
+        )
+        changed: list[RuntimeValidationChangeControlRequest] = []
+        for request in requests:
+            if request.status != "pending_review":
+                continue
+            changed.append(
+                self.decide_change_control_request(
+                    request_id=request.request_id,
+                    decision=decision,
+                    decided_by=decided_by,
+                    decision_note=decision_note,
+                )
+            )
+        return RuntimeValidationChangeControlBulkActionResult(
+            environment_name=self.settings.environment_name,
+            action=f"bulk_{decision.strip().lower()}",
+            matched_count=len(requests),
+            changed_count=len(changed),
+            requests=changed,
+        )
+
+    def get_change_control_request(self, request_id: str) -> RuntimeValidationChangeControlRequest:
+        for request in self._rebuild_change_control_requests():
+            if request.request_id == request_id:
+                return request
+        raise FileNotFoundError(f"Runtime-validation change-control request '{request_id}' was not found.")
+
+    def process_change_control_requests(
+        self,
+        *,
+        changed_by: str,
+        reason: str | None = None,
+        force: bool = False,
+    ) -> list[RuntimeValidationChangeControlRequest]:
+        governance_requests = [
+            request
+            for request in self._rebuild_governance_requests()
+            if request.environment_name == self.settings.environment_name and request.status != "resolved"
+        ]
+        active_requests = [
+            request
+            for request in self._rebuild_change_control_requests()
+            if request.environment_name == self.settings.environment_name and request.status != "resolved"
+        ]
+        changed: list[RuntimeValidationChangeControlRequest] = []
+        if not governance_requests:
+            for request in active_requests:
+                changed.append(
+                    self._resolve_change_control_request(
+                        request_id=request.request_id,
+                        resolved_by=changed_by,
+                        resolution_note=reason or "Governance condition cleared.",
+                        resolution_reason="governance_cleared",
+                    )
+                )
+            return changed
+
+        governance = governance_requests[0]
+        existing = next(
+            (request for request in active_requests if request.governance_request_id == governance.request_id),
+            None,
+        )
+        if existing is None:
+            changed.append(
+                self._open_change_control_request(
+                    governance_request=governance,
+                    changed_by=changed_by,
+                    reason=reason,
+                )
+            )
+            return changed
+        if force and len(active_requests) > 1:
+            for request in active_requests:
+                if request.request_id == existing.request_id:
+                    continue
+                changed.append(
+                    self._resolve_change_control_request(
+                        request_id=request.request_id,
+                        resolved_by=changed_by,
+                        resolution_note="Superseded by current change-control request.",
+                        resolution_reason="superseded",
+                    )
+                )
+        return changed
+
+    def _review_sla(
+        self,
+        review: RuntimeValidationReviewRequest,
+        *,
+        fallback_policy: RuntimeValidationPolicy,
+    ) -> RuntimeValidationReviewSLA:
+        policy, _ = self._effective_policy(review.environment_name)
+        effective_policy = policy.finalized(fallback_policy)
+        if review.assigned_to is None:
+            warning_age_hours = (
+                effective_policy.unassigned_review_warning_age_hours
+                or effective_policy.review_warning_age_hours
+                or fallback_policy.unassigned_review_warning_age_hours
+                or fallback_policy.review_warning_age_hours
+                or 1.0
+            )
+            critical_age_hours = (
+                effective_policy.unassigned_review_critical_age_hours
+                or effective_policy.review_critical_age_hours
+                or fallback_policy.unassigned_review_critical_age_hours
+                or fallback_policy.review_critical_age_hours
+                or warning_age_hours
+            )
+        else:
+            warning_age_hours = (
+                effective_policy.review_warning_age_hours
+                or fallback_policy.review_warning_age_hours
+                or 1.0
+            )
+            critical_age_hours = (
+                effective_policy.review_critical_age_hours
+                or fallback_policy.review_critical_age_hours
+                or warning_age_hours
+            )
+        if critical_age_hours < warning_age_hours:
+            critical_age_hours = warning_age_hours
+        return RuntimeValidationReviewSLA(
+            warning_age_hours=warning_age_hours,
+            critical_age_hours=critical_age_hours,
+        )
+
+    def _fallback_policy(self) -> RuntimeValidationPolicy:
+        return RuntimeValidationPolicy(
+            review_warning_age_hours=(
+                self.settings.control_plane_alert_reminder_interval_seconds / 3600.0
+            ),
+            review_critical_age_hours=(
+                self.settings.control_plane_alert_escalation_interval_seconds / 3600.0
+            ),
+            unassigned_review_warning_age_hours=(
+                self.settings.control_plane_alert_reminder_interval_seconds / 3600.0
+            ),
+            unassigned_review_critical_age_hours=(
+                self.settings.control_plane_alert_escalation_interval_seconds / 3600.0
+            ),
+            reminder_interval_seconds=self.settings.control_plane_alert_reminder_interval_seconds,
+            escalation_interval_seconds=self.settings.control_plane_alert_escalation_interval_seconds,
+        )
+
+    def _governance_required(
+        self,
+        review: RuntimeValidationReviewRequest,
+        *,
+        fallback_policy: RuntimeValidationPolicy,
+    ) -> bool:
+        if review.assigned_to is not None:
+            return False
+        sla = self._review_sla(review, fallback_policy=fallback_policy)
+        age_hours = max((datetime.now(UTC) - datetime.fromisoformat(review.opened_at)).total_seconds() / 3600.0, 0.0)
+        return age_hours >= sla.critical_age_hours
+
+    def _open_governance_request(
+        self,
+        *,
+        review: RuntimeValidationReviewRequest,
+        changed_by: str,
+        reason: str | None,
+    ) -> RuntimeValidationGovernanceRequest:
+        request_id = uuid4().hex[:16]
+        self.job_service.record_maintenance_event(
+            event_type=self.GOVERNANCE_OPENED_EVENT_TYPE,
+            changed_by=changed_by,
+            reason=reason,
+            details={
+                "request_id": request_id,
+                "opened_at": _utc_now(),
+                "opened_by": changed_by,
+                "environment_name": review.environment_name,
+                "review_id": review.review_id,
+                "owner_team": review.owner_team,
+                "review_opened_at": review.opened_at,
+                "summary": (
+                    f"Critical unassigned runtime-proof review debt requires governance for review {review.review_id}."
+                ),
+                "trigger_code": "runtime_validation_review_unassigned_overdue",
+                "policy_source": review.policy_source,
+                "assigned_to": review.assigned_to,
+                "assigned_to_team": review.assigned_to_team,
+            },
+        )
+        return next(
+            request for request in self._rebuild_governance_requests() if request.request_id == request_id
+        )
+
+    def _resolve_governance_request(
+        self,
+        *,
+        request_id: str,
+        resolved_by: str,
+        resolution_note: str | None,
+        resolution_reason: str,
+    ) -> RuntimeValidationGovernanceRequest:
+        self.job_service.record_maintenance_event(
+            event_type=self.GOVERNANCE_RESOLVED_EVENT_TYPE,
+            changed_by=resolved_by,
+            reason=resolution_note,
+            details={
+                "request_id": request_id,
+                "resolved_at": _utc_now(),
+                "resolved_by": resolved_by,
+                "resolution_note": resolution_note,
+                "resolution_reason": resolution_reason,
+            },
+        )
+        return next(
+            request for request in self._rebuild_governance_requests() if request.request_id == request_id
+        )
+
+    def _open_change_control_request(
+        self,
+        *,
+        governance_request: RuntimeValidationGovernanceRequest,
+        changed_by: str,
+        reason: str | None,
+    ) -> RuntimeValidationChangeControlRequest:
+        request_id = uuid4().hex[:16]
+        self.job_service.record_maintenance_event(
+            event_type=self.CHANGE_CONTROL_OPENED_EVENT_TYPE,
+            changed_by=changed_by,
+            reason=reason,
+            details={
+                "request_id": request_id,
+                "opened_at": _utc_now(),
+                "opened_by": changed_by,
+                "environment_name": governance_request.environment_name,
+                "governance_request_id": governance_request.request_id,
+                "review_id": governance_request.review_id,
+                "owner_team": governance_request.owner_team,
+                "summary": (
+                    f"Change-control required for runtime-proof governance request {governance_request.request_id}."
+                ),
+                "trigger_code": "runtime_validation_change_control_required",
+                "policy_source": governance_request.policy_source,
+            },
+        )
+        return next(
+            request for request in self._rebuild_change_control_requests() if request.request_id == request_id
+        )
+
+    def _resolve_change_control_request(
+        self,
+        *,
+        request_id: str,
+        resolved_by: str,
+        resolution_note: str | None,
+        resolution_reason: str,
+    ) -> RuntimeValidationChangeControlRequest:
+        self.job_service.record_maintenance_event(
+            event_type=self.CHANGE_CONTROL_RESOLVED_EVENT_TYPE,
+            changed_by=resolved_by,
+            reason=resolution_note,
+            details={
+                "request_id": request_id,
+                "resolved_at": _utc_now(),
+                "resolved_by": resolved_by,
+                "resolution_note": resolution_note,
+                "resolution_reason": resolution_reason,
+            },
+        )
+        return next(
+            request for request in self._rebuild_change_control_requests() if request.request_id == request_id
         )
 
     def process_reviews(
@@ -374,6 +1285,154 @@ class ControlPlaneRuntimeValidationReviewService:
                 assignment_note="Auto-assigned by runtime-validation policy.",
             )
         return self.get_review(review_id)
+
+    def _rebuild_governance_requests(self) -> list[RuntimeValidationGovernanceRequest]:
+        requests: dict[str, RuntimeValidationGovernanceRequest] = {}
+        events = list(reversed(self.job_repository.list_control_plane_maintenance_events(limit=2000)))
+        for record in events:
+            details = dict(record.details)
+            if record.event_type == self.GOVERNANCE_OPENED_EVENT_TYPE:
+                request_id = str(details["request_id"])
+                requests[request_id] = RuntimeValidationGovernanceRequest(
+                    request_id=request_id,
+                    opened_at=str(details["opened_at"]),
+                    opened_by=str(details["opened_by"]),
+                    environment_name=str(details["environment_name"]),
+                    review_id=str(details["review_id"]),
+                    owner_team=_optional_str(details.get("owner_team")),
+                    review_opened_at=str(details["review_opened_at"]),
+                    summary=str(details["summary"]),
+                    status="pending_review",
+                    trigger_code=str(details["trigger_code"]),
+                    policy_source=str(details.get("policy_source", "defaults")),
+                    assigned_to=_optional_str(details.get("assigned_to")),
+                    assigned_to_team=_optional_str(details.get("assigned_to_team")),
+                )
+            elif record.event_type == self.GOVERNANCE_RESOLVED_EVENT_TYPE:
+                request_id = str(details["request_id"])
+                existing = requests.get(request_id)
+                if existing is None:
+                    continue
+                requests[request_id] = RuntimeValidationGovernanceRequest(
+                    request_id=existing.request_id,
+                    opened_at=existing.opened_at,
+                    opened_by=existing.opened_by,
+                    environment_name=existing.environment_name,
+                    review_id=existing.review_id,
+                    owner_team=existing.owner_team,
+                    review_opened_at=existing.review_opened_at,
+                    summary=existing.summary,
+                    status="resolved",
+                    trigger_code=existing.trigger_code,
+                    policy_source=existing.policy_source,
+                    assigned_to=existing.assigned_to,
+                    assigned_to_team=existing.assigned_to_team,
+                    resolved_at=str(details["resolved_at"]),
+                    resolved_by=str(details["resolved_by"]),
+                    resolution_note=_optional_str(details.get("resolution_note")),
+                    resolution_reason=_optional_str(details.get("resolution_reason")),
+                )
+        return list(requests.values())
+
+    def _rebuild_change_control_requests(self) -> list[RuntimeValidationChangeControlRequest]:
+        requests: dict[str, RuntimeValidationChangeControlRequest] = {}
+        events = list(reversed(self.job_repository.list_control_plane_maintenance_events(limit=2000)))
+        for record in events:
+            details = dict(record.details)
+            if record.event_type == self.CHANGE_CONTROL_OPENED_EVENT_TYPE:
+                request_id = str(details["request_id"])
+                requests[request_id] = RuntimeValidationChangeControlRequest(
+                    request_id=request_id,
+                    opened_at=str(details["opened_at"]),
+                    opened_by=str(details["opened_by"]),
+                    environment_name=str(details["environment_name"]),
+                    governance_request_id=str(details["governance_request_id"]),
+                    review_id=str(details["review_id"]),
+                    owner_team=_optional_str(details.get("owner_team")),
+                    summary=str(details["summary"]),
+                    status="pending_review",
+                    trigger_code=str(details["trigger_code"]),
+                    policy_source=str(details.get("policy_source", "defaults")),
+                )
+            elif record.event_type == self.CHANGE_CONTROL_ASSIGNED_EVENT_TYPE:
+                request_id = str(details["request_id"])
+                existing = requests.get(request_id)
+                if existing is None:
+                    continue
+                requests[request_id] = RuntimeValidationChangeControlRequest(
+                    request_id=existing.request_id,
+                    opened_at=existing.opened_at,
+                    opened_by=existing.opened_by,
+                    environment_name=existing.environment_name,
+                    governance_request_id=existing.governance_request_id,
+                    review_id=existing.review_id,
+                    owner_team=existing.owner_team,
+                    summary=existing.summary,
+                    status=existing.status,
+                    trigger_code=existing.trigger_code,
+                    policy_source=existing.policy_source,
+                    assigned_to=str(details["assigned_to"]),
+                    assigned_to_team=_optional_str(details.get("assigned_to_team")),
+                    assigned_at=str(details["assigned_at"]),
+                    assigned_by=str(details["assigned_by"]),
+                    assignment_note=_optional_str(details.get("assignment_note")),
+                )
+            elif record.event_type == self.CHANGE_CONTROL_DECIDED_EVENT_TYPE:
+                request_id = str(details["request_id"])
+                existing = requests.get(request_id)
+                if existing is None:
+                    continue
+                decision = str(details["decision"])
+                requests[request_id] = RuntimeValidationChangeControlRequest(
+                    request_id=existing.request_id,
+                    opened_at=existing.opened_at,
+                    opened_by=existing.opened_by,
+                    environment_name=existing.environment_name,
+                    governance_request_id=existing.governance_request_id,
+                    review_id=existing.review_id,
+                    owner_team=existing.owner_team,
+                    summary=existing.summary,
+                    status="approved" if decision == "approve" else "rejected",
+                    trigger_code=existing.trigger_code,
+                    policy_source=existing.policy_source,
+                    assigned_to=existing.assigned_to,
+                    assigned_to_team=existing.assigned_to_team,
+                    assigned_at=existing.assigned_at,
+                    assigned_by=existing.assigned_by,
+                    assignment_note=existing.assignment_note,
+                    resolved_at=str(details["decided_at"]),
+                    resolved_by=str(details["decided_by"]),
+                    resolution_note=_optional_str(details.get("decision_note")),
+                    resolution_reason=decision,
+                )
+            elif record.event_type == self.CHANGE_CONTROL_RESOLVED_EVENT_TYPE:
+                request_id = str(details["request_id"])
+                existing = requests.get(request_id)
+                if existing is None:
+                    continue
+                requests[request_id] = RuntimeValidationChangeControlRequest(
+                    request_id=existing.request_id,
+                    opened_at=existing.opened_at,
+                    opened_by=existing.opened_by,
+                    environment_name=existing.environment_name,
+                    governance_request_id=existing.governance_request_id,
+                    review_id=existing.review_id,
+                    owner_team=existing.owner_team,
+                    summary=existing.summary,
+                    status="resolved",
+                    trigger_code=existing.trigger_code,
+                    policy_source=existing.policy_source,
+                    assigned_to=existing.assigned_to,
+                    assigned_to_team=existing.assigned_to_team,
+                    assigned_at=existing.assigned_at,
+                    assigned_by=existing.assigned_by,
+                    assignment_note=existing.assignment_note,
+                    resolved_at=str(details["resolved_at"]),
+                    resolved_by=str(details["resolved_by"]),
+                    resolution_note=_optional_str(details.get("resolution_note")),
+                    resolution_reason=_optional_str(details.get("resolution_reason")),
+                )
+        return list(requests.values())
 
     def _rebuild_reviews(self) -> list[RuntimeValidationReviewRequest]:
         reviews: dict[str, RuntimeValidationReviewRequest] = {}

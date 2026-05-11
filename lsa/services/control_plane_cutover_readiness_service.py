@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from lsa.services.control_plane_runtime_validation_service import ControlPlaneRuntimeValidationService
+from lsa.services.control_plane_runtime_validation_review_service import ControlPlaneRuntimeValidationReviewService
 from lsa.services.postgres_bootstrap_service import PostgresBootstrapService
 from lsa.services.runtime_validation_policy import RuntimeValidationPolicy, load_runtime_validation_policy_bundle
 from lsa.storage.database import inspect_database_config
@@ -40,6 +41,7 @@ class ControlPlaneCutoverReadinessSummary:
     latest_rehearsal_event: dict[str, Any] | None
     runtime_validation: dict[str, Any]
     package_inspection: dict[str, Any] | None
+    runtime_validation_change_control_requests: list[dict[str, Any]] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -60,6 +62,9 @@ class ControlPlaneCutoverReadinessSummary:
             "latest_bundle_event": None if self.latest_bundle_event is None else dict(self.latest_bundle_event),
             "latest_rehearsal_event": None if self.latest_rehearsal_event is None else dict(self.latest_rehearsal_event),
             "runtime_validation": dict(self.runtime_validation),
+            "runtime_validation_change_control_requests": [
+                dict(item) for item in self.runtime_validation_change_control_requests
+            ],
             "package_inspection": None if self.package_inspection is None else dict(self.package_inspection),
             "blockers": list(self.blockers),
             "warnings": list(self.warnings),
@@ -117,6 +122,23 @@ class ControlPlaneCutoverReadinessService:
             or self.settings.analytics_runtime_rehearsal_critical_age_hours,
             policy_source=runtime_policy_bundle.source_for(environment_name=self.settings.environment_name),
         ).build_summary()
+        review_service = ControlPlaneRuntimeValidationReviewService(
+            settings=self.settings,
+            job_service=None,
+            job_repository=self.job_repository,
+        )
+        runtime_validation_change_control_requests = [
+            request.to_dict()
+            for request in review_service.list_change_control_requests(owner_team=None)
+            if request.environment_name == self.settings.environment_name
+            and request.status in {"pending_review", "rejected"}
+        ]
+        pending_change_control_requests = [
+            request for request in runtime_validation_change_control_requests if request["status"] == "pending_review"
+        ]
+        rejected_change_control_requests = [
+            request for request in runtime_validation_change_control_requests if request["status"] == "rejected"
+        ]
 
         try:
             package_inspection = self.bootstrap_service.inspect_package(package_dir=package_dir).to_dict()
@@ -175,6 +197,10 @@ class ControlPlaneCutoverReadinessService:
                 blockers.append(runtime_validation_code)
             else:
                 warnings.append(runtime_validation_code)
+        if pending_change_control_requests:
+            blockers.append("runtime_validation_change_control_pending")
+        if rejected_change_control_requests:
+            blockers.append("runtime_validation_change_control_rejected")
 
         return ControlPlaneCutoverReadinessSummary(
             evaluated_at=_utc_now(),
@@ -188,6 +214,7 @@ class ControlPlaneCutoverReadinessService:
             latest_bundle_event=latest_bundle_event,
             latest_rehearsal_event=latest_rehearsal_event,
             runtime_validation=runtime_validation.to_dict(),
+            runtime_validation_change_control_requests=runtime_validation_change_control_requests,
             package_inspection=package_inspection,
             blockers=blockers,
             warnings=warnings,
