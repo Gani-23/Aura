@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
+from typing import Any
 from uuid import uuid4
 
 from lsa.drift.trace_parser import load_trace_events
@@ -35,6 +36,7 @@ class JobService:
     job_lease_history_retention_days: int = 30
     history_prune_interval_seconds: float = 300.0
     control_plane_alert_service: ControlPlaneAlertService | None = None
+    runtime_validation_review_service: Any | None = None
     control_plane_alert_interval_seconds: float = 60.0
     control_plane_alerts_enabled: bool = True
     _worker_thread: Thread | None = field(init=False, default=None)
@@ -120,6 +122,7 @@ class JobService:
         now = monotonic()
         if now - self._last_alert_emit_at < self.control_plane_alert_interval_seconds:
             return []
+        self.process_runtime_validation_reviews(changed_by="system", reason="scheduled control-plane cadence")
         emitted = self.emit_control_plane_alerts()
         if emitted:
             return emitted
@@ -138,6 +141,62 @@ class JobService:
         alerts = self.control_plane_alert_service.process_follow_ups(force=force)
         self._last_alert_emit_at = monotonic()
         return alerts
+
+    def process_runtime_validation_reviews(
+        self,
+        *,
+        changed_by: str,
+        reason: str | None = None,
+        force: bool = False,
+    ):
+        if self.runtime_validation_review_service is None:
+            return []
+        return self.runtime_validation_review_service.process_reviews(
+            changed_by=changed_by,
+            reason=reason,
+            force=force,
+        )
+
+    def list_runtime_validation_reviews(self, *, status: str | None = None):
+        if self.runtime_validation_review_service is None:
+            return []
+        return self.runtime_validation_review_service.list_reviews(status=status)
+
+    def assign_runtime_validation_review(
+        self,
+        *,
+        review_id: str,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_by: str,
+        assignment_note: str | None = None,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.assign_review(
+            review_id=review_id,
+            assigned_to=assigned_to,
+            assigned_to_team=assigned_to_team,
+            assigned_by=assigned_by,
+            assignment_note=assignment_note,
+        )
+
+    def resolve_runtime_validation_review(
+        self,
+        *,
+        review_id: str,
+        resolved_by: str,
+        resolution_note: str | None,
+        resolution_reason: str,
+    ):
+        if self.runtime_validation_review_service is None:
+            raise RuntimeError("Runtime-validation review service is not configured.")
+        return self.runtime_validation_review_service.resolve_review(
+            review_id=review_id,
+            resolved_by=resolved_by,
+            resolution_note=resolution_note,
+            resolution_reason=resolution_reason,
+        )
 
     def list_control_plane_alerts(self, limit: int | None = None) -> list[ControlPlaneAlertRecord]:
         if self.control_plane_alert_service is None:
@@ -280,8 +339,8 @@ class JobService:
         changed_by: str,
         reason: str | None = None,
         details: dict | None = None,
-    ) -> None:
-        self._record_maintenance_event(
+    ) -> ControlPlaneMaintenanceEventRecord:
+        return self._record_maintenance_event(
             event_type=event_type,
             changed_by=changed_by,
             reason=reason,
@@ -592,17 +651,17 @@ class JobService:
         changed_by: str,
         reason: str | None,
         details: dict,
-    ) -> None:
-        self.job_repository.append_control_plane_maintenance_event(
-            ControlPlaneMaintenanceEventRecord(
-                event_id=uuid4().hex[:16],
-                recorded_at=_utc_now(),
-                event_type=event_type,
-                changed_by=changed_by,
-                reason=reason,
-                details=details,
-            )
+    ) -> ControlPlaneMaintenanceEventRecord:
+        record = ControlPlaneMaintenanceEventRecord(
+            event_id=uuid4().hex[:16],
+            recorded_at=_utc_now(),
+            event_type=event_type,
+            changed_by=changed_by,
+            reason=reason,
+            details=details,
         )
+        self.job_repository.append_control_plane_maintenance_event(record)
+        return record
 
     def _heartbeat_threshold(self) -> str:
         threshold = datetime.now(UTC) - timedelta(seconds=self.heartbeat_timeout_seconds)

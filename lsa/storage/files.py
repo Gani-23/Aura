@@ -3,14 +3,24 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 from uuid import uuid4
 
 from lsa.core.intent_graph import IntentGraph
 from lsa.core.models import IntentGraphSnapshot
 from lsa.settings import WorkspaceSettings
-from lsa.storage.database import resolve_database_config
+from lsa.storage.control_plane_schema import (
+    CONTROL_PLANE_SCHEMA_MIGRATION_DESCRIPTION,
+    CONTROL_PLANE_SCHEMA_MIGRATION_ID,
+    CONTROL_PLANE_SCHEMA_VERSION,
+    control_plane_schema_contract,
+    postgres_control_plane_schema_script,
+    sqlite_control_plane_schema_script,
+)
+from lsa.storage.database import build_database_runtime_support, resolve_database_config
 from lsa.storage.models import (
     AuditRecord,
     ControlPlaneAlertRecord,
@@ -34,11 +44,6 @@ def _utc_now() -> str:
 
 def _json_dumps(value: object) -> str:
     return json.dumps(value, sort_keys=True)
-
-
-CONTROL_PLANE_SCHEMA_VERSION = 1
-CONTROL_PLANE_SCHEMA_MIGRATION_ID = "2026-05-05-control-plane-schema-v1"
-CONTROL_PLANE_SCHEMA_MIGRATION_DESCRIPTION = "Bootstrap schema version tracking for the control-plane database."
 
 
 class _ControlPlaneDatabase:
@@ -92,6 +97,7 @@ class _ControlPlaneDatabase:
 
         path_target = self.config.sqlite_path if self.config.sqlite_path.exists() else self.config.sqlite_path.parent
         writable = writable and os.access(path_target, os.W_OK)
+        runtime_support = build_database_runtime_support(self.config).to_dict()
         return {
             "backend": self.config.backend,
             "url": self.config.url,
@@ -102,6 +108,7 @@ class _ControlPlaneDatabase:
             "expected_schema_version": expected_schema_version,
             "schema_ready": schema_ready,
             "pending_migration_count": max(0, expected_schema_version - schema_version),
+            **runtime_support,
         }
 
     def schema_status(self) -> dict[str, object]:
@@ -130,6 +137,9 @@ class _ControlPlaneDatabase:
             ],
         }
 
+    def schema_contract(self) -> dict[str, object]:
+        return control_plane_schema_contract()
+
     def migrate_schema(self) -> dict[str, object]:
         self._initialize()
         return self.schema_status()
@@ -157,246 +167,7 @@ class _ControlPlaneDatabase:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS control_plane_schema_metadata (
-                    metadata_key TEXT PRIMARY KEY,
-                    metadata_value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS control_plane_schema_migrations (
-                    migration_id TEXT PRIMARY KEY,
-                    schema_version INTEGER NOT NULL,
-                    applied_at TEXT NOT NULL,
-                    description TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS snapshots (
-                    snapshot_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    repo_path TEXT NOT NULL,
-                    node_count INTEGER NOT NULL,
-                    edge_count INTEGER NOT NULL,
-                    snapshot_path TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_snapshots_created_at
-                    ON snapshots (created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS audits (
-                    audit_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    snapshot_id TEXT,
-                    snapshot_path TEXT NOT NULL,
-                    alert_count INTEGER NOT NULL,
-                    report_paths_json TEXT NOT NULL,
-                    alerts_json TEXT NOT NULL,
-                    events_json TEXT NOT NULL,
-                    sessions_json TEXT NOT NULL,
-                    explanation_json TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_audits_created_at
-                    ON audits (created_at DESC);
-
-                CREATE INDEX IF NOT EXISTS idx_audits_snapshot_id
-                    ON audits (snapshot_id);
-
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    job_type TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    request_payload_json TEXT NOT NULL,
-                    result_payload_json TEXT NOT NULL,
-                    error TEXT,
-                    started_at TEXT,
-                    completed_at TEXT,
-                    claimed_by_worker_id TEXT,
-                    lease_expires_at TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_jobs_created_at
-                    ON jobs (created_at DESC);
-
-                CREATE INDEX IF NOT EXISTS idx_jobs_status
-                    ON jobs (status);
-
-                CREATE TABLE IF NOT EXISTS workers (
-                    worker_id TEXT PRIMARY KEY,
-                    mode TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    last_heartbeat_at TEXT NOT NULL,
-                    host_name TEXT NOT NULL,
-                    process_id INTEGER NOT NULL,
-                    current_job_id TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_workers_last_heartbeat_at
-                    ON workers (last_heartbeat_at DESC);
-
-                CREATE TABLE IF NOT EXISTS worker_heartbeats (
-                    heartbeat_id TEXT PRIMARY KEY,
-                    worker_id TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    current_job_id TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_worker_heartbeats_worker_id
-                    ON worker_heartbeats (worker_id, recorded_at DESC);
-
-                CREATE TABLE IF NOT EXISTS worker_heartbeat_rollups (
-                    day_bucket TEXT NOT NULL,
-                    worker_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    current_job_id TEXT,
-                    event_count INTEGER NOT NULL,
-                    PRIMARY KEY (day_bucket, worker_id, status, current_job_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS job_lease_events (
-                    event_id TEXT PRIMARY KEY,
-                    job_id TEXT NOT NULL,
-                    worker_id TEXT,
-                    event_type TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    details_json TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_job_lease_events_job_id
-                    ON job_lease_events (job_id, recorded_at DESC);
-
-                CREATE TABLE IF NOT EXISTS job_lease_event_rollups (
-                    day_bucket TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    worker_id TEXT,
-                    event_type TEXT NOT NULL,
-                    event_count INTEGER NOT NULL,
-                    PRIMARY KEY (day_bucket, job_id, worker_id, event_type)
-                );
-
-                CREATE TABLE IF NOT EXISTS control_plane_maintenance_events (
-                    event_id TEXT PRIMARY KEY,
-                    recorded_at TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    changed_by TEXT NOT NULL,
-                    reason TEXT,
-                    details_json TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_control_plane_maintenance_events_recorded_at
-                    ON control_plane_maintenance_events (recorded_at DESC);
-
-                CREATE TABLE IF NOT EXISTS control_plane_alerts (
-                    alert_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    alert_key TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    summary TEXT NOT NULL,
-                    finding_codes_json TEXT NOT NULL,
-                    delivery_state TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    error TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_control_plane_alerts_created_at
-                    ON control_plane_alerts (created_at DESC);
-
-                CREATE INDEX IF NOT EXISTS idx_control_plane_alerts_alert_key
-                    ON control_plane_alerts (alert_key, created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS control_plane_alert_silences (
-                    silence_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    created_by TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    match_alert_key TEXT,
-                    match_finding_code TEXT,
-                    starts_at TEXT,
-                    expires_at TEXT,
-                    cancelled_at TEXT,
-                    cancelled_by TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_control_plane_alert_silences_created_at
-                    ON control_plane_alert_silences (created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS control_plane_oncall_schedules (
-                    schedule_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    created_by TEXT NOT NULL,
-                    environment_name TEXT NOT NULL DEFAULT 'default',
-                    created_by_team TEXT,
-                    created_by_role TEXT,
-                    change_reason TEXT,
-                    approved_by TEXT,
-                    approved_by_team TEXT,
-                    approved_by_role TEXT,
-                    approved_at TEXT,
-                    approval_note TEXT,
-                    team_name TEXT NOT NULL,
-                    timezone_name TEXT NOT NULL,
-                    weekdays_json TEXT NOT NULL,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT NOT NULL,
-                    priority INTEGER NOT NULL DEFAULT 100,
-                    rotation_name TEXT,
-                    effective_start_date TEXT,
-                    effective_end_date TEXT,
-                    webhook_url TEXT,
-                    escalation_webhook_url TEXT,
-                    cancelled_at TEXT,
-                    cancelled_by TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_control_plane_oncall_schedules_created_at
-                    ON control_plane_oncall_schedules (created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS control_plane_oncall_change_requests (
-                    request_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    created_by TEXT NOT NULL,
-                    environment_name TEXT NOT NULL DEFAULT 'default',
-                    created_by_team TEXT,
-                    created_by_role TEXT,
-                    change_reason TEXT,
-                    status TEXT NOT NULL,
-                    review_required INTEGER NOT NULL,
-                    review_reasons_json TEXT NOT NULL,
-                    team_name TEXT NOT NULL,
-                    timezone_name TEXT NOT NULL,
-                    weekdays_json TEXT NOT NULL,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT NOT NULL,
-                    priority INTEGER NOT NULL DEFAULT 100,
-                    rotation_name TEXT,
-                    effective_start_date TEXT,
-                    effective_end_date TEXT,
-                    webhook_url TEXT,
-                    escalation_webhook_url TEXT,
-                    assigned_to TEXT,
-                    assigned_to_team TEXT,
-                    assigned_at TEXT,
-                    assigned_by TEXT,
-                    assignment_note TEXT,
-                    decision_at TEXT,
-                    decided_by TEXT,
-                    decided_by_team TEXT,
-                    decided_by_role TEXT,
-                    decision_note TEXT,
-                    applied_schedule_id TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_control_plane_oncall_change_requests_created_at
-                    ON control_plane_oncall_change_requests (created_at DESC);
-
-                CREATE INDEX IF NOT EXISTS idx_control_plane_oncall_change_requests_status
-                    ON control_plane_oncall_change_requests (status, created_at DESC);
-                """
-            )
+            connection.executescript(sqlite_control_plane_schema_script())
             self._initialize_schema_metadata(connection)
         self._ensure_job_columns()
         self._ensure_control_plane_alert_columns()
@@ -708,6 +479,28 @@ class _ControlPlaneDatabase:
             for row in rows
         ]
 
+    def delete_snapshot(self, snapshot_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM snapshots
+                WHERE snapshot_id = %s
+                """,
+                (snapshot_id,),
+            )
+        return cursor.rowcount > 0
+
+    def delete_snapshot(self, snapshot_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM snapshots
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            )
+        return cursor.rowcount > 0
+
     def upsert_audit(self, record: AuditRecord) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -818,6 +611,28 @@ class _ControlPlaneDatabase:
             )
             for row in rows
         ]
+
+    def delete_audit(self, audit_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM audits
+                WHERE audit_id = %s
+                """,
+                (audit_id,),
+            )
+        return cursor.rowcount > 0
+
+    def delete_audit(self, audit_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM audits
+                WHERE audit_id = ?
+                """,
+                (audit_id,),
+            )
+        return cursor.rowcount > 0
 
     def upsert_job(self, record: JobRecord) -> None:
         with self._connect() as connection:
@@ -936,6 +751,172 @@ class _ControlPlaneDatabase:
             )
             for row in rows
         ]
+
+    def claim_next_queued_job(
+        self,
+        *,
+        started_at: str,
+        worker_id: str,
+        lease_expires_at: str,
+    ) -> JobRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT job_id
+                FROM jobs
+                WHERE status = 'queued'
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            updated = connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'running',
+                    started_at = %s,
+                    claimed_by_worker_id = %s,
+                    lease_expires_at = %s,
+                    completed_at = NULL,
+                    error = NULL
+                WHERE job_id = %s
+                RETURNING
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json::text,
+                    result_payload_json::text,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                """,
+                (started_at, worker_id, lease_expires_at, row[0]),
+            ).fetchone()
+        if updated is None:
+            return None
+        return JobRecord(
+            job_id=updated[0],
+            created_at=updated[1],
+            job_type=updated[2],
+            status=updated[3],
+            request_payload=dict(json.loads(updated[4])),
+            result_payload=dict(json.loads(updated[5])),
+            error=updated[6],
+            started_at=updated[7],
+            completed_at=updated[8],
+            claimed_by_worker_id=updated[9],
+            lease_expires_at=updated[10],
+        )
+
+    def requeue_jobs_with_status(self, statuses: tuple[str, ...]) -> int:
+        if not statuses:
+            return 0
+        placeholders = ", ".join(["%s"] * len(statuses))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET status = 'queued',
+                    started_at = NULL,
+                    completed_at = NULL,
+                    error = NULL,
+                    claimed_by_worker_id = NULL,
+                    lease_expires_at = NULL
+                WHERE status IN ({placeholders})
+                """,
+                statuses,
+            )
+        return cursor.rowcount
+
+    def requeue_expired_leases(self, reference_timestamp: str) -> list[JobRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json::text,
+                    result_payload_json::text,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                FROM jobs
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < %s
+                ORDER BY lease_expires_at ASC
+                FOR UPDATE
+                """,
+                (reference_timestamp,),
+            ).fetchall()
+            if not rows:
+                return []
+            job_ids = [row[0] for row in rows]
+            placeholders = ", ".join(["%s"] * len(job_ids))
+            connection.execute(
+                f"""
+                UPDATE jobs
+                SET status = 'queued',
+                    started_at = NULL,
+                    error = NULL,
+                    claimed_by_worker_id = NULL,
+                    lease_expires_at = NULL
+                WHERE job_id IN ({placeholders})
+                """,
+                job_ids,
+            )
+        return [
+            JobRecord(
+                job_id=row[0],
+                created_at=row[1],
+                job_type=row[2],
+                status=row[3],
+                request_payload=dict(json.loads(row[4])),
+                result_payload=dict(json.loads(row[5])),
+                error=row[6],
+                started_at=row[7],
+                completed_at=row[8],
+                claimed_by_worker_id=row[9],
+                lease_expires_at=row[10],
+            )
+            for row in rows
+        ]
+
+    def renew_job_lease(self, *, job_id: str, worker_id: str, lease_expires_at: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET lease_expires_at = %s
+                WHERE job_id = %s
+                  AND status = 'running'
+                  AND claimed_by_worker_id = %s
+                """,
+                (lease_expires_at, job_id, worker_id),
+            )
+        return cursor.rowcount > 0
+
+    def count_jobs_with_status(self, status: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM jobs
+                WHERE status = %s
+                """,
+                (status,),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
 
     def claim_next_queued_job(
         self,
@@ -1091,6 +1072,17 @@ class _ControlPlaneDatabase:
         assert row is not None
         return int(row["count"])
 
+    def delete_job(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM jobs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+        return cursor.rowcount > 0
+
     def upsert_worker(self, record: WorkerRecord) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -1187,6 +1179,20 @@ class _ControlPlaneDatabase:
             )
             for row in rows
         ]
+
+    def count_workers_seen_since(self, threshold_timestamp: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM workers
+                WHERE status = 'running'
+                  AND last_heartbeat_at >= %s
+                """,
+                (threshold_timestamp,),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
 
     def count_workers_seen_since(self, threshold_timestamp: str) -> int:
         with self._connect() as connection:
@@ -2489,11 +2495,2085 @@ class _ControlPlaneDatabase:
             )
 
 
+class _PostgresControlPlaneDatabase:
+    def __init__(self, settings: WorkspaceSettings, *, raw_url: str) -> None:
+        self.settings = settings
+        self.config = resolve_database_config(
+            root_dir=self.settings.root_dir,
+            default_path=self.settings.database_path,
+            raw_url=raw_url,
+            supported_backends=("postgres",),
+        )
+        self._initialize()
+
+    def _psycopg(self):
+        try:
+            return import_module("psycopg")
+        except ModuleNotFoundError as exc:
+            raise ValueError("psycopg is required for the Postgres runtime control-plane path.") from exc
+
+    def _connect(self):
+        psycopg = self._psycopg()
+        return psycopg.connect(self.config.url)
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(postgres_control_plane_schema_script())
+            self._initialize_schema_metadata(connection)
+
+    def _initialize_schema_metadata(self, connection) -> None:
+        connection.execute(
+            """
+            INSERT INTO control_plane_schema_metadata (metadata_key, metadata_value)
+            VALUES (%s, %s)
+            ON CONFLICT (metadata_key) DO NOTHING
+            """,
+            ("schema_version", str(CONTROL_PLANE_SCHEMA_VERSION)),
+        )
+        connection.execute(
+            """
+            INSERT INTO control_plane_schema_migrations (
+                migration_id,
+                schema_version,
+                applied_at,
+                description
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (migration_id) DO NOTHING
+            """,
+            (
+                CONTROL_PLANE_SCHEMA_MIGRATION_ID,
+                CONTROL_PLANE_SCHEMA_VERSION,
+                _utc_now(),
+                CONTROL_PLANE_SCHEMA_MIGRATION_DESCRIPTION,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE control_plane_schema_metadata
+            SET metadata_value = %s
+            WHERE metadata_key = 'schema_version'
+              AND CAST(metadata_value AS INTEGER) < %s
+            """,
+            (str(CONTROL_PLANE_SCHEMA_VERSION), CONTROL_PLANE_SCHEMA_VERSION),
+        )
+
+    def _read_schema_version(self, connection) -> int:
+        row = connection.execute(
+            """
+            SELECT metadata_value
+            FROM control_plane_schema_metadata
+            WHERE metadata_key = 'schema_version'
+            """
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _read_metadata(self, connection, key: str) -> str | None:
+        row = connection.execute(
+            """
+            SELECT metadata_value
+            FROM control_plane_schema_metadata
+            WHERE metadata_key = %s
+            """,
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0])
+
+    def _upsert_metadata(self, connection, key: str, value: str) -> None:
+        connection.execute(
+            """
+            INSERT INTO control_plane_schema_metadata (metadata_key, metadata_value)
+            VALUES (%s, %s)
+            ON CONFLICT (metadata_key)
+            DO UPDATE SET metadata_value = EXCLUDED.metadata_value
+            """,
+            (key, value),
+        )
+
+    def status(self) -> dict[str, object]:
+        ready = False
+        writable = False
+        schema_version = 0
+        expected_schema_version = CONTROL_PLANE_SCHEMA_VERSION
+        schema_ready = False
+        try:
+            with self._connect() as connection:
+                ready = bool(connection.execute("SELECT 1").fetchone()[0])
+                query_only_row = connection.execute("SHOW transaction_read_only").fetchone()
+                writable = bool(query_only_row is not None and str(query_only_row[0]).lower() == "off")
+                schema_version = self._read_schema_version(connection)
+                schema_ready = schema_version == expected_schema_version
+        except Exception:
+            ready = False
+            writable = False
+            schema_version = 0
+            schema_ready = False
+
+        runtime_support = build_database_runtime_support(self.config, supported_backends=("postgres",)).to_dict()
+        return {
+            "backend": self.config.backend,
+            "url": self.config.url,
+            "redacted_url": self.config.redacted_url,
+            "path": "",
+            "ready": ready,
+            "writable": writable,
+            "schema_version": schema_version,
+            "expected_schema_version": expected_schema_version,
+            "schema_ready": schema_ready,
+            "pending_migration_count": max(0, expected_schema_version - schema_version),
+            **runtime_support,
+        }
+
+    def schema_status(self) -> dict[str, object]:
+        with self._connect() as connection:
+            version = self._read_schema_version(connection)
+            rows = connection.execute(
+                """
+                SELECT migration_id, schema_version, applied_at, description
+                FROM control_plane_schema_migrations
+                ORDER BY applied_at ASC, migration_id ASC
+                """
+            ).fetchall()
+        return {
+            "schema_version": version,
+            "expected_schema_version": CONTROL_PLANE_SCHEMA_VERSION,
+            "schema_ready": version == CONTROL_PLANE_SCHEMA_VERSION,
+            "pending_migration_count": max(0, CONTROL_PLANE_SCHEMA_VERSION - version),
+            "migrations": [
+                {
+                    "migration_id": row[0],
+                    "schema_version": row[1],
+                    "applied_at": row[2],
+                    "description": row[3],
+                }
+                for row in rows
+            ],
+        }
+
+    def schema_contract(self) -> dict[str, object]:
+        return control_plane_schema_contract()
+
+    def migrate_schema(self) -> dict[str, object]:
+        self._initialize()
+        return self.schema_status()
+
+    def maintenance_mode_status(self) -> dict[str, object]:
+        with self._connect() as connection:
+            active = self._read_metadata(connection, "maintenance_mode_active") == "1"
+            changed_at = self._read_metadata(connection, "maintenance_mode_changed_at")
+            changed_by = self._read_metadata(connection, "maintenance_mode_changed_by")
+            reason = self._read_metadata(connection, "maintenance_mode_reason")
+        return {
+            "active": active,
+            "changed_at": changed_at,
+            "changed_by": changed_by,
+            "reason": reason,
+        }
+
+    def set_maintenance_mode(self, *, active: bool, changed_by: str, reason: str | None) -> dict[str, object]:
+        with self._connect() as connection:
+            self._upsert_metadata(connection, "maintenance_mode_active", "1" if active else "0")
+            self._upsert_metadata(connection, "maintenance_mode_changed_at", _utc_now())
+            self._upsert_metadata(connection, "maintenance_mode_changed_by", changed_by)
+            self._upsert_metadata(connection, "maintenance_mode_reason", reason or "")
+        return self.maintenance_mode_status()
+
+    def append_control_plane_maintenance_event(self, record: ControlPlaneMaintenanceEventRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_maintenance_events (
+                    event_id,
+                    recorded_at,
+                    event_type,
+                    changed_by,
+                    reason,
+                    details_json
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                (
+                    record.event_id,
+                    record.recorded_at,
+                    record.event_type,
+                    record.changed_by,
+                    record.reason,
+                    _json_dumps(record.details),
+                ),
+            )
+
+    def upsert_snapshot(self, record: SnapshotRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO snapshots (
+                    snapshot_id,
+                    created_at,
+                    repo_path,
+                    node_count,
+                    edge_count,
+                    snapshot_path
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (snapshot_id) DO UPDATE SET
+                    created_at = EXCLUDED.created_at,
+                    repo_path = EXCLUDED.repo_path,
+                    node_count = EXCLUDED.node_count,
+                    edge_count = EXCLUDED.edge_count,
+                    snapshot_path = EXCLUDED.snapshot_path
+                """,
+                (
+                    record.snapshot_id,
+                    record.created_at,
+                    record.repo_path,
+                    record.node_count,
+                    record.edge_count,
+                    record.snapshot_path,
+                ),
+            )
+
+    def fetch_snapshot(self, snapshot_id: str) -> SnapshotRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot_id, created_at, repo_path, node_count, edge_count, snapshot_path
+                FROM snapshots
+                WHERE snapshot_id = %s
+                """,
+                (snapshot_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SnapshotRecord(
+            snapshot_id=row[0],
+            created_at=row[1],
+            repo_path=row[2],
+            node_count=row[3],
+            edge_count=row[4],
+            snapshot_path=row[5],
+        )
+
+    def list_snapshots(self) -> list[SnapshotRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT snapshot_id, created_at, repo_path, node_count, edge_count, snapshot_path
+                FROM snapshots
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [
+            SnapshotRecord(
+                snapshot_id=row[0],
+                created_at=row[1],
+                repo_path=row[2],
+                node_count=row[3],
+                edge_count=row[4],
+                snapshot_path=row[5],
+            )
+            for row in rows
+        ]
+
+    def upsert_audit(self, record: AuditRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO audits (
+                    audit_id,
+                    created_at,
+                    snapshot_id,
+                    snapshot_path,
+                    alert_count,
+                    report_paths_json,
+                    alerts_json,
+                    events_json,
+                    sessions_json,
+                    explanation_json
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)
+                ON CONFLICT (audit_id) DO UPDATE SET
+                    created_at = EXCLUDED.created_at,
+                    snapshot_id = EXCLUDED.snapshot_id,
+                    snapshot_path = EXCLUDED.snapshot_path,
+                    alert_count = EXCLUDED.alert_count,
+                    report_paths_json = EXCLUDED.report_paths_json,
+                    alerts_json = EXCLUDED.alerts_json,
+                    events_json = EXCLUDED.events_json,
+                    sessions_json = EXCLUDED.sessions_json,
+                    explanation_json = EXCLUDED.explanation_json
+                """,
+                (
+                    record.audit_id,
+                    record.created_at,
+                    record.snapshot_id,
+                    record.snapshot_path,
+                    record.alert_count,
+                    _json_dumps(record.report_paths),
+                    _json_dumps(record.alerts),
+                    _json_dumps(record.events),
+                    _json_dumps(record.sessions),
+                    _json_dumps(record.explanation),
+                ),
+            )
+
+    def fetch_audit(self, audit_id: str) -> AuditRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    audit_id,
+                    created_at,
+                    snapshot_id,
+                    snapshot_path,
+                    alert_count,
+                    report_paths_json::text,
+                    alerts_json::text,
+                    events_json::text,
+                    sessions_json::text,
+                    explanation_json::text
+                FROM audits
+                WHERE audit_id = %s
+                """,
+                (audit_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AuditRecord(
+            audit_id=row[0],
+            created_at=row[1],
+            snapshot_id=row[2],
+            snapshot_path=row[3],
+            alert_count=row[4],
+            report_paths=list(json.loads(row[5])),
+            alerts=list(json.loads(row[6])),
+            events=list(json.loads(row[7])),
+            sessions=list(json.loads(row[8])),
+            explanation=dict(json.loads(row[9])),
+        )
+
+    def list_audits(self) -> list[AuditRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    audit_id,
+                    created_at,
+                    snapshot_id,
+                    snapshot_path,
+                    alert_count,
+                    report_paths_json::text,
+                    alerts_json::text,
+                    events_json::text,
+                    sessions_json::text,
+                    explanation_json::text
+                FROM audits
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [
+            AuditRecord(
+                audit_id=row[0],
+                created_at=row[1],
+                snapshot_id=row[2],
+                snapshot_path=row[3],
+                alert_count=row[4],
+                report_paths=list(json.loads(row[5])),
+                alerts=list(json.loads(row[6])),
+                events=list(json.loads(row[7])),
+                sessions=list(json.loads(row[8])),
+                explanation=dict(json.loads(row[9])),
+            )
+            for row in rows
+        ]
+
+    def upsert_job(self, record: JobRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO jobs (
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json,
+                    result_payload_json,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s)
+                ON CONFLICT (job_id) DO UPDATE SET
+                    created_at = EXCLUDED.created_at,
+                    job_type = EXCLUDED.job_type,
+                    status = EXCLUDED.status,
+                    request_payload_json = EXCLUDED.request_payload_json,
+                    result_payload_json = EXCLUDED.result_payload_json,
+                    error = EXCLUDED.error,
+                    started_at = EXCLUDED.started_at,
+                    completed_at = EXCLUDED.completed_at,
+                    claimed_by_worker_id = EXCLUDED.claimed_by_worker_id,
+                    lease_expires_at = EXCLUDED.lease_expires_at
+                """,
+                (
+                    record.job_id,
+                    record.created_at,
+                    record.job_type,
+                    record.status,
+                    _json_dumps(record.request_payload),
+                    _json_dumps(record.result_payload),
+                    record.error,
+                    record.started_at,
+                    record.completed_at,
+                    record.claimed_by_worker_id,
+                    record.lease_expires_at,
+                ),
+            )
+
+    def fetch_job(self, job_id: str) -> JobRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json::text,
+                    result_payload_json::text,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                FROM jobs
+                WHERE job_id = %s
+                """,
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return JobRecord(
+            job_id=row[0],
+            created_at=row[1],
+            job_type=row[2],
+            status=row[3],
+            request_payload=dict(json.loads(row[4])),
+            result_payload=dict(json.loads(row[5])),
+            error=row[6],
+            started_at=row[7],
+            completed_at=row[8],
+            claimed_by_worker_id=row[9],
+            lease_expires_at=row[10],
+        )
+
+    def list_jobs(self) -> list[JobRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json::text,
+                    result_payload_json::text,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                FROM jobs
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [
+            JobRecord(
+                job_id=row[0],
+                created_at=row[1],
+                job_type=row[2],
+                status=row[3],
+                request_payload=dict(json.loads(row[4])),
+                result_payload=dict(json.loads(row[5])),
+                error=row[6],
+                started_at=row[7],
+                completed_at=row[8],
+                claimed_by_worker_id=row[9],
+                lease_expires_at=row[10],
+            )
+            for row in rows
+        ]
+
+    def claim_next_queued_job(
+        self,
+        *,
+        started_at: str,
+        worker_id: str,
+        lease_expires_at: str,
+    ) -> JobRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT job_id
+                FROM jobs
+                WHERE status = 'queued'
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            updated = connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'running',
+                    started_at = %s,
+                    claimed_by_worker_id = %s,
+                    lease_expires_at = %s,
+                    completed_at = NULL,
+                    error = NULL
+                WHERE job_id = %s
+                RETURNING
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json::text,
+                    result_payload_json::text,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                """,
+                (started_at, worker_id, lease_expires_at, row[0]),
+            ).fetchone()
+        if updated is None:
+            return None
+        return JobRecord(
+            job_id=updated[0],
+            created_at=updated[1],
+            job_type=updated[2],
+            status=updated[3],
+            request_payload=dict(json.loads(updated[4])),
+            result_payload=dict(json.loads(updated[5])),
+            error=updated[6],
+            started_at=updated[7],
+            completed_at=updated[8],
+            claimed_by_worker_id=updated[9],
+            lease_expires_at=updated[10],
+        )
+
+    def requeue_jobs_with_status(self, statuses: tuple[str, ...]) -> int:
+        if not statuses:
+            return 0
+        placeholders = ", ".join(["%s"] * len(statuses))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET status = 'queued',
+                    started_at = NULL,
+                    completed_at = NULL,
+                    error = NULL,
+                    claimed_by_worker_id = NULL,
+                    lease_expires_at = NULL
+                WHERE status IN ({placeholders})
+                """,
+                statuses,
+            )
+        return cursor.rowcount
+
+    def requeue_expired_leases(self, reference_timestamp: str) -> list[JobRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    job_id,
+                    created_at,
+                    job_type,
+                    status,
+                    request_payload_json::text,
+                    result_payload_json::text,
+                    error,
+                    started_at,
+                    completed_at,
+                    claimed_by_worker_id,
+                    lease_expires_at
+                FROM jobs
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < %s
+                ORDER BY lease_expires_at ASC
+                FOR UPDATE
+                """,
+                (reference_timestamp,),
+            ).fetchall()
+            if not rows:
+                return []
+            job_ids = [row[0] for row in rows]
+            placeholders = ", ".join(["%s"] * len(job_ids))
+            connection.execute(
+                f"""
+                UPDATE jobs
+                SET status = 'queued',
+                    started_at = NULL,
+                    error = NULL,
+                    claimed_by_worker_id = NULL,
+                    lease_expires_at = NULL
+                WHERE job_id IN ({placeholders})
+                """,
+                job_ids,
+            )
+        return [
+            JobRecord(
+                job_id=row[0],
+                created_at=row[1],
+                job_type=row[2],
+                status=row[3],
+                request_payload=dict(json.loads(row[4])),
+                result_payload=dict(json.loads(row[5])),
+                error=row[6],
+                started_at=row[7],
+                completed_at=row[8],
+                claimed_by_worker_id=row[9],
+                lease_expires_at=row[10],
+            )
+            for row in rows
+        ]
+
+    def renew_job_lease(self, *, job_id: str, worker_id: str, lease_expires_at: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET lease_expires_at = %s
+                WHERE job_id = %s
+                  AND status = 'running'
+                  AND claimed_by_worker_id = %s
+                """,
+                (lease_expires_at, job_id, worker_id),
+            )
+        return cursor.rowcount > 0
+
+    def count_jobs_with_status(self, status: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM jobs
+                WHERE status = %s
+                """,
+                (status,),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def upsert_worker(self, record: WorkerRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO workers (
+                    worker_id,
+                    mode,
+                    status,
+                    started_at,
+                    last_heartbeat_at,
+                    host_name,
+                    process_id,
+                    current_job_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (worker_id) DO UPDATE SET
+                    mode = EXCLUDED.mode,
+                    status = EXCLUDED.status,
+                    started_at = EXCLUDED.started_at,
+                    last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+                    host_name = EXCLUDED.host_name,
+                    process_id = EXCLUDED.process_id,
+                    current_job_id = EXCLUDED.current_job_id
+                """,
+                (
+                    record.worker_id,
+                    record.mode,
+                    record.status,
+                    record.started_at,
+                    record.last_heartbeat_at,
+                    record.host_name,
+                    record.process_id,
+                    record.current_job_id,
+                ),
+            )
+
+    def fetch_worker(self, worker_id: str) -> WorkerRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    worker_id,
+                    mode,
+                    status,
+                    started_at,
+                    last_heartbeat_at,
+                    host_name,
+                    process_id,
+                    current_job_id
+                FROM workers
+                WHERE worker_id = %s
+                """,
+                (worker_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return WorkerRecord(
+            worker_id=row[0],
+            mode=row[1],
+            status=row[2],
+            started_at=row[3],
+            last_heartbeat_at=row[4],
+            host_name=row[5],
+            process_id=row[6],
+            current_job_id=row[7],
+        )
+
+    def list_workers(self) -> list[WorkerRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    worker_id,
+                    mode,
+                    status,
+                    started_at,
+                    last_heartbeat_at,
+                    host_name,
+                    process_id,
+                    current_job_id
+                FROM workers
+                ORDER BY last_heartbeat_at DESC
+                """
+            ).fetchall()
+        return [
+            WorkerRecord(
+                worker_id=row[0],
+                mode=row[1],
+                status=row[2],
+                started_at=row[3],
+                last_heartbeat_at=row[4],
+                host_name=row[5],
+                process_id=row[6],
+                current_job_id=row[7],
+            )
+            for row in rows
+        ]
+
+    def count_workers_seen_since(self, threshold_timestamp: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM workers
+                WHERE status = 'running'
+                  AND last_heartbeat_at >= %s
+                """,
+                (threshold_timestamp,),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def delete_job(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM jobs
+                WHERE job_id = %s
+                """,
+                (job_id,),
+            )
+        return cursor.rowcount > 0
+
+    def append_worker_heartbeat(self, record: WorkerHeartbeatRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO worker_heartbeats (
+                    heartbeat_id,
+                    worker_id,
+                    recorded_at,
+                    status,
+                    current_job_id
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (heartbeat_id) DO NOTHING
+                """,
+                (
+                    record.heartbeat_id,
+                    record.worker_id,
+                    record.recorded_at,
+                    record.status,
+                    record.current_job_id,
+                ),
+            )
+
+    def list_worker_heartbeats(self, worker_id: str | None = None) -> list[WorkerHeartbeatRecord]:
+        if worker_id is None:
+            sql = """
+                SELECT heartbeat_id, worker_id, recorded_at, status, current_job_id
+                FROM worker_heartbeats
+                ORDER BY recorded_at DESC
+            """
+            params: tuple[object, ...] = ()
+        else:
+            sql = """
+                SELECT heartbeat_id, worker_id, recorded_at, status, current_job_id
+                FROM worker_heartbeats
+                WHERE worker_id = %s
+                ORDER BY recorded_at DESC
+            """
+            params = (worker_id,)
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [
+            WorkerHeartbeatRecord(
+                heartbeat_id=row[0],
+                worker_id=row[1],
+                recorded_at=row[2],
+                status=row[3],
+                current_job_id=row[4],
+            )
+            for row in rows
+        ]
+
+    def append_job_lease_event(self, record: JobLeaseEventRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO job_lease_events (
+                    event_id,
+                    job_id,
+                    worker_id,
+                    event_type,
+                    recorded_at,
+                    details_json
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                (
+                    record.event_id,
+                    record.job_id,
+                    record.worker_id,
+                    record.event_type,
+                    record.recorded_at,
+                    _json_dumps(record.details),
+                ),
+            )
+
+    def list_job_lease_events(self, job_id: str | None = None) -> list[JobLeaseEventRecord]:
+        if job_id is None:
+            sql = """
+                SELECT event_id, job_id, worker_id, event_type, recorded_at, details_json::text
+                FROM job_lease_events
+                ORDER BY recorded_at DESC
+            """
+            params: tuple[object, ...] = ()
+        else:
+            sql = """
+                SELECT event_id, job_id, worker_id, event_type, recorded_at, details_json::text
+                FROM job_lease_events
+                WHERE job_id = %s
+                ORDER BY recorded_at DESC
+            """
+            params = (job_id,)
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [
+            JobLeaseEventRecord(
+                event_id=row[0],
+                job_id=row[1],
+                worker_id=row[2],
+                event_type=row[3],
+                recorded_at=row[4],
+                details=dict(json.loads(row[5])),
+            )
+            for row in rows
+        ]
+
+    def prune_worker_heartbeats_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM worker_heartbeats
+                WHERE recorded_at < %s
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def prune_job_lease_events_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM job_lease_events
+                WHERE recorded_at < %s
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def compact_worker_heartbeats_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    substr(recorded_at, 1, 10) AS day_bucket,
+                    worker_id,
+                    status,
+                    current_job_id,
+                    COUNT(*) AS event_count
+                FROM worker_heartbeats
+                WHERE recorded_at < %s
+                GROUP BY substr(recorded_at, 1, 10), worker_id, status, current_job_id
+                """,
+                (cutoff_timestamp,),
+            ).fetchall()
+            if not rows:
+                return 0
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO worker_heartbeat_rollups (
+                        day_bucket,
+                        worker_id,
+                        status,
+                        current_job_id,
+                        event_count
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (day_bucket, worker_id, status, current_job_id)
+                    DO UPDATE SET event_count = worker_heartbeat_rollups.event_count + EXCLUDED.event_count
+                    """,
+                    (row[0], row[1], row[2], row[3], row[4]),
+                )
+            cursor = connection.execute(
+                """
+                DELETE FROM worker_heartbeats
+                WHERE recorded_at < %s
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def compact_job_lease_events_before(self, cutoff_timestamp: str) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    substr(recorded_at, 1, 10) AS day_bucket,
+                    job_id,
+                    worker_id,
+                    event_type,
+                    COUNT(*) AS event_count
+                FROM job_lease_events
+                WHERE recorded_at < %s
+                GROUP BY substr(recorded_at, 1, 10), job_id, worker_id, event_type
+                """,
+                (cutoff_timestamp,),
+            ).fetchall()
+            if not rows:
+                return 0
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO job_lease_event_rollups (
+                        day_bucket,
+                        job_id,
+                        worker_id,
+                        event_type,
+                        event_count
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (day_bucket, job_id, worker_id, event_type)
+                    DO UPDATE SET event_count = job_lease_event_rollups.event_count + EXCLUDED.event_count
+                    """,
+                    (row[0], row[1], row[2], row[3], row[4]),
+                )
+            cursor = connection.execute(
+                """
+                DELETE FROM job_lease_events
+                WHERE recorded_at < %s
+                """,
+                (cutoff_timestamp,),
+            )
+        return cursor.rowcount
+
+    def list_worker_heartbeat_rollups(self, worker_id: str | None = None) -> list[WorkerHeartbeatRollupRecord]:
+        if worker_id is None:
+            sql = """
+                SELECT day_bucket, worker_id, status, current_job_id, event_count
+                FROM worker_heartbeat_rollups
+                ORDER BY day_bucket DESC, worker_id ASC
+            """
+            params: tuple[object, ...] = ()
+        else:
+            sql = """
+                SELECT day_bucket, worker_id, status, current_job_id, event_count
+                FROM worker_heartbeat_rollups
+                WHERE worker_id = %s
+                ORDER BY day_bucket DESC, worker_id ASC
+            """
+            params = (worker_id,)
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [
+            WorkerHeartbeatRollupRecord(
+                day_bucket=row[0],
+                worker_id=row[1],
+                status=row[2],
+                current_job_id=row[3],
+                event_count=row[4],
+            )
+            for row in rows
+        ]
+
+    def upsert_worker_heartbeat_rollup(self, record: WorkerHeartbeatRollupRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO worker_heartbeat_rollups (
+                    day_bucket,
+                    worker_id,
+                    status,
+                    current_job_id,
+                    event_count
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (day_bucket, worker_id, status, current_job_id)
+                DO UPDATE SET event_count = EXCLUDED.event_count
+                """,
+                (
+                    record.day_bucket,
+                    record.worker_id,
+                    record.status,
+                    record.current_job_id,
+                    record.event_count,
+                ),
+            )
+
+    def list_job_lease_event_rollups(self, job_id: str | None = None) -> list[JobLeaseEventRollupRecord]:
+        if job_id is None:
+            sql = """
+                SELECT day_bucket, job_id, worker_id, event_type, event_count
+                FROM job_lease_event_rollups
+                ORDER BY day_bucket DESC, job_id ASC
+            """
+            params: tuple[object, ...] = ()
+        else:
+            sql = """
+                SELECT day_bucket, job_id, worker_id, event_type, event_count
+                FROM job_lease_event_rollups
+                WHERE job_id = %s
+                ORDER BY day_bucket DESC, job_id ASC
+            """
+            params = (job_id,)
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [
+            JobLeaseEventRollupRecord(
+                day_bucket=row[0],
+                job_id=row[1],
+                worker_id=row[2],
+                event_type=row[3],
+                event_count=row[4],
+            )
+            for row in rows
+        ]
+
+    def upsert_job_lease_event_rollup(self, record: JobLeaseEventRollupRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO job_lease_event_rollups (
+                    day_bucket,
+                    job_id,
+                    worker_id,
+                    event_type,
+                    event_count
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (day_bucket, job_id, worker_id, event_type)
+                DO UPDATE SET event_count = EXCLUDED.event_count
+                """,
+                (
+                    record.day_bucket,
+                    record.job_id,
+                    record.worker_id,
+                    record.event_type,
+                    record.event_count,
+                ),
+            )
+
+    def list_control_plane_maintenance_events(
+        self,
+        limit: int | None = None,
+    ) -> list[ControlPlaneMaintenanceEventRecord]:
+        sql = """
+            SELECT event_id, recorded_at, event_type, changed_by, reason, details_json::text
+            FROM control_plane_maintenance_events
+            ORDER BY recorded_at DESC
+        """
+        params: tuple[object, ...] = ()
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (limit,)
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [
+            ControlPlaneMaintenanceEventRecord(
+                event_id=row[0],
+                recorded_at=row[1],
+                event_type=row[2],
+                changed_by=row[3],
+                reason=row[4],
+                details=json.loads(row[5]) if isinstance(row[5], str) else dict(row[5] or {}),
+            )
+            for row in rows
+        ]
+
+    def insert_control_plane_alert(self, record: ControlPlaneAlertRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_alerts (
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json,
+                    delivery_state,
+                    payload_json,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s, %s, %s)
+                ON CONFLICT (alert_id) DO NOTHING
+                """,
+                (
+                    record.alert_id,
+                    record.created_at,
+                    record.alert_key,
+                    record.status,
+                    record.severity,
+                    record.summary,
+                    _json_dumps(record.finding_codes),
+                    record.delivery_state,
+                    _json_dumps(record.payload),
+                    record.error,
+                    record.acknowledged_at,
+                    record.acknowledged_by,
+                    record.acknowledgement_note,
+                ),
+            )
+
+    def list_control_plane_alerts(self, limit: int | None = None) -> list[ControlPlaneAlertRecord]:
+        sql = """
+            SELECT
+                alert_id,
+                created_at,
+                alert_key,
+                status,
+                severity,
+                summary,
+                finding_codes_json::text,
+                delivery_state,
+                payload_json::text,
+                error,
+                acknowledged_at,
+                acknowledged_by,
+                acknowledgement_note
+            FROM control_plane_alerts
+            ORDER BY created_at DESC
+        """
+        params: tuple[object, ...] = ()
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (limit,)
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [self._row_to_control_plane_alert(row) for row in rows]
+
+    def fetch_control_plane_alert(self, alert_id: str) -> ControlPlaneAlertRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json::text,
+                    delivery_state,
+                    payload_json::text,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                FROM control_plane_alerts
+                WHERE alert_id = %s
+                """,
+                (alert_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_control_plane_alert(row)
+
+    def fetch_latest_control_plane_alert(self) -> ControlPlaneAlertRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json::text,
+                    delivery_state,
+                    payload_json::text,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                FROM control_plane_alerts
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_control_plane_alert(row)
+
+    def fetch_latest_control_plane_alert_by_key(self, alert_key: str) -> ControlPlaneAlertRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    alert_id,
+                    created_at,
+                    alert_key,
+                    status,
+                    severity,
+                    summary,
+                    finding_codes_json::text,
+                    delivery_state,
+                    payload_json::text,
+                    error,
+                    acknowledged_at,
+                    acknowledged_by,
+                    acknowledgement_note
+                FROM control_plane_alerts
+                WHERE alert_key = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (alert_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_control_plane_alert(row)
+
+    def acknowledge_control_plane_alert(
+        self,
+        *,
+        alert_id: str,
+        acknowledged_at: str,
+        acknowledged_by: str,
+        acknowledgement_note: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_alerts
+                SET acknowledged_at = %s,
+                    acknowledged_by = %s,
+                    acknowledgement_note = %s
+                WHERE alert_id = %s
+                """,
+                (acknowledged_at, acknowledged_by, acknowledgement_note, alert_id),
+            )
+        return cursor.rowcount > 0
+
+    def insert_control_plane_alert_silence(self, record: ControlPlaneAlertSilenceRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_alert_silences (
+                    silence_id,
+                    created_at,
+                    created_by,
+                    reason,
+                    match_alert_key,
+                    match_finding_code,
+                    starts_at,
+                    expires_at,
+                    cancelled_at,
+                    cancelled_by
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (silence_id) DO NOTHING
+                """,
+                (
+                    record.silence_id,
+                    record.created_at,
+                    record.created_by,
+                    record.reason,
+                    record.match_alert_key,
+                    record.match_finding_code,
+                    record.starts_at,
+                    record.expires_at,
+                    record.cancelled_at,
+                    record.cancelled_by,
+                ),
+            )
+
+    def list_control_plane_alert_silences(self) -> list[ControlPlaneAlertSilenceRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    silence_id,
+                    created_at,
+                    created_by,
+                    reason,
+                    match_alert_key,
+                    match_finding_code,
+                    starts_at,
+                    expires_at,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_alert_silences
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [self._row_to_control_plane_alert_silence(row) for row in rows]
+
+    def fetch_control_plane_alert_silence(self, silence_id: str) -> ControlPlaneAlertSilenceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    silence_id,
+                    created_at,
+                    created_by,
+                    reason,
+                    match_alert_key,
+                    match_finding_code,
+                    starts_at,
+                    expires_at,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_alert_silences
+                WHERE silence_id = %s
+                """,
+                (silence_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_control_plane_alert_silence(row)
+
+    def cancel_control_plane_alert_silence(
+        self,
+        *,
+        silence_id: str,
+        cancelled_at: str,
+        cancelled_by: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_alert_silences
+                SET cancelled_at = %s,
+                    cancelled_by = %s
+                WHERE silence_id = %s
+                  AND cancelled_at IS NULL
+                """,
+                (cancelled_at, cancelled_by, silence_id),
+            )
+        return cursor.rowcount > 0
+
+    def insert_control_plane_oncall_schedule(self, record: ControlPlaneOnCallScheduleRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_oncall_schedules (
+                    schedule_id,
+                    created_at,
+                    created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    approved_by,
+                    approved_by_team,
+                    approved_by_role,
+                    approved_at,
+                    approval_note,
+                    team_name,
+                    timezone_name,
+                    weekdays_json,
+                    start_time,
+                    end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
+                    webhook_url,
+                    escalation_webhook_url,
+                    cancelled_at,
+                    cancelled_by
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (schedule_id) DO NOTHING
+                """,
+                (
+                    record.schedule_id,
+                    record.created_at,
+                    record.created_by,
+                    record.environment_name,
+                    record.created_by_team,
+                    record.created_by_role,
+                    record.change_reason,
+                    record.approved_by,
+                    record.approved_by_team,
+                    record.approved_by_role,
+                    record.approved_at,
+                    record.approval_note,
+                    record.team_name,
+                    record.timezone_name,
+                    _json_dumps(record.weekdays),
+                    record.start_time,
+                    record.end_time,
+                    record.priority,
+                    record.rotation_name,
+                    record.effective_start_date,
+                    record.effective_end_date,
+                    record.webhook_url,
+                    record.escalation_webhook_url,
+                    record.cancelled_at,
+                    record.cancelled_by,
+                ),
+            )
+
+    def list_control_plane_oncall_schedules(self) -> list[ControlPlaneOnCallScheduleRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    schedule_id,
+                    created_at,
+                    created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    approved_by,
+                    approved_by_team,
+                    approved_by_role,
+                    approved_at,
+                    approval_note,
+                    team_name,
+                    timezone_name,
+                    weekdays_json::text,
+                    start_time,
+                    end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
+                    webhook_url,
+                    escalation_webhook_url,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_oncall_schedules
+                ORDER BY priority DESC, created_at DESC
+                """
+            ).fetchall()
+        return [self._row_to_control_plane_oncall_schedule(row) for row in rows]
+
+    def fetch_control_plane_oncall_schedule(self, schedule_id: str) -> ControlPlaneOnCallScheduleRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    schedule_id,
+                    created_at,
+                    created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    approved_by,
+                    approved_by_team,
+                    approved_by_role,
+                    approved_at,
+                    approval_note,
+                    team_name,
+                    timezone_name,
+                    weekdays_json::text,
+                    start_time,
+                    end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
+                    webhook_url,
+                    escalation_webhook_url,
+                    cancelled_at,
+                    cancelled_by
+                FROM control_plane_oncall_schedules
+                WHERE schedule_id = %s
+                """,
+                (schedule_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_control_plane_oncall_schedule(row)
+
+    def cancel_control_plane_oncall_schedule(
+        self,
+        *,
+        schedule_id: str,
+        cancelled_at: str,
+        cancelled_by: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_oncall_schedules
+                SET cancelled_at = %s,
+                    cancelled_by = %s
+                WHERE schedule_id = %s
+                  AND cancelled_at IS NULL
+                """,
+                (cancelled_at, cancelled_by, schedule_id),
+            )
+        return cursor.rowcount > 0
+
+    def insert_control_plane_oncall_change_request(
+        self,
+        record: ControlPlaneOnCallChangeRequestRecord,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO control_plane_oncall_change_requests (
+                    request_id,
+                    created_at,
+                    created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    status,
+                    review_required,
+                    review_reasons_json,
+                    team_name,
+                    timezone_name,
+                    weekdays_json,
+                    start_time,
+                    end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
+                    webhook_url,
+                    escalation_webhook_url,
+                    assigned_to,
+                    assigned_to_team,
+                    assigned_at,
+                    assigned_by,
+                    assignment_note,
+                    decision_at,
+                    decided_by,
+                    decided_by_team,
+                    decided_by_role,
+                    decision_note,
+                    applied_schedule_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (request_id) DO NOTHING
+                """,
+                (
+                    record.request_id,
+                    record.created_at,
+                    record.created_by,
+                    record.environment_name,
+                    record.created_by_team,
+                    record.created_by_role,
+                    record.change_reason,
+                    record.status,
+                    record.review_required,
+                    _json_dumps(record.review_reasons),
+                    record.team_name,
+                    record.timezone_name,
+                    _json_dumps(record.weekdays),
+                    record.start_time,
+                    record.end_time,
+                    record.priority,
+                    record.rotation_name,
+                    record.effective_start_date,
+                    record.effective_end_date,
+                    record.webhook_url,
+                    record.escalation_webhook_url,
+                    record.assigned_to,
+                    record.assigned_to_team,
+                    record.assigned_at,
+                    record.assigned_by,
+                    record.assignment_note,
+                    record.decision_at,
+                    record.decided_by,
+                    record.decided_by_team,
+                    record.decided_by_role,
+                    record.decision_note,
+                    record.applied_schedule_id,
+                ),
+            )
+
+    def list_control_plane_oncall_change_requests(
+        self,
+        *,
+        status: str | None = None,
+    ) -> list[ControlPlaneOnCallChangeRequestRecord]:
+        sql = """
+            SELECT
+                request_id,
+                created_at,
+                created_by,
+                environment_name,
+                created_by_team,
+                created_by_role,
+                change_reason,
+                status,
+                review_required,
+                review_reasons_json::text,
+                team_name,
+                timezone_name,
+                weekdays_json::text,
+                start_time,
+                end_time,
+                priority,
+                rotation_name,
+                effective_start_date,
+                effective_end_date,
+                webhook_url,
+                escalation_webhook_url,
+                assigned_to,
+                assigned_to_team,
+                assigned_at,
+                assigned_by,
+                assignment_note,
+                decision_at,
+                decided_by,
+                decided_by_team,
+                decided_by_role,
+                decision_note,
+                applied_schedule_id
+            FROM control_plane_oncall_change_requests
+        """
+        params: tuple[object, ...] = ()
+        if status is not None:
+            sql += " WHERE status = %s"
+            params = (status,)
+        sql += " ORDER BY created_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [self._row_to_control_plane_oncall_change_request(row) for row in rows]
+
+    def fetch_control_plane_oncall_change_request(
+        self,
+        request_id: str,
+    ) -> ControlPlaneOnCallChangeRequestRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    request_id,
+                    created_at,
+                    created_by,
+                    environment_name,
+                    created_by_team,
+                    created_by_role,
+                    change_reason,
+                    status,
+                    review_required,
+                    review_reasons_json::text,
+                    team_name,
+                    timezone_name,
+                    weekdays_json::text,
+                    start_time,
+                    end_time,
+                    priority,
+                    rotation_name,
+                    effective_start_date,
+                    effective_end_date,
+                    webhook_url,
+                    escalation_webhook_url,
+                    assigned_to,
+                    assigned_to_team,
+                    assigned_at,
+                    assigned_by,
+                    assignment_note,
+                    decision_at,
+                    decided_by,
+                    decided_by_team,
+                    decided_by_role,
+                    decision_note,
+                    applied_schedule_id
+                FROM control_plane_oncall_change_requests
+                WHERE request_id = %s
+                """,
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_control_plane_oncall_change_request(row)
+
+    def update_control_plane_oncall_change_request_decision(
+        self,
+        *,
+        request_id: str,
+        status: str,
+        decision_at: str,
+        decided_by: str,
+        decided_by_team: str | None,
+        decided_by_role: str | None,
+        decision_note: str | None,
+        applied_schedule_id: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_oncall_change_requests
+                SET status = %s,
+                    assigned_to = NULL,
+                    assigned_to_team = NULL,
+                    assigned_at = NULL,
+                    assigned_by = NULL,
+                    assignment_note = NULL,
+                    decision_at = %s,
+                    decided_by = %s,
+                    decided_by_team = %s,
+                    decided_by_role = %s,
+                    decision_note = %s,
+                    applied_schedule_id = %s
+                WHERE request_id = %s
+                """,
+                (
+                    status,
+                    decision_at,
+                    decided_by,
+                    decided_by_team,
+                    decided_by_role,
+                    decision_note,
+                    applied_schedule_id,
+                    request_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def update_control_plane_oncall_change_request_assignment(
+        self,
+        *,
+        request_id: str,
+        assigned_to: str,
+        assigned_to_team: str | None,
+        assigned_at: str,
+        assigned_by: str,
+        assignment_note: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE control_plane_oncall_change_requests
+                SET assigned_to = %s,
+                    assigned_to_team = %s,
+                    assigned_at = %s,
+                    assigned_by = %s,
+                    assignment_note = %s
+                WHERE request_id = %s
+                """,
+                (
+                    assigned_to,
+                    assigned_to_team,
+                    assigned_at,
+                    assigned_by,
+                    assignment_note,
+                    request_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def clear_all_records(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM control_plane_oncall_change_requests;
+                DELETE FROM control_plane_oncall_schedules;
+                DELETE FROM control_plane_alert_silences;
+                DELETE FROM control_plane_alerts;
+                DELETE FROM control_plane_maintenance_events;
+                DELETE FROM job_lease_event_rollups;
+                DELETE FROM job_lease_events;
+                DELETE FROM worker_heartbeat_rollups;
+                DELETE FROM worker_heartbeats;
+                DELETE FROM workers;
+                DELETE FROM jobs;
+                DELETE FROM audits;
+                DELETE FROM snapshots;
+                """
+            )
+
+    def _row_to_control_plane_alert(self, row) -> ControlPlaneAlertRecord:
+        return ControlPlaneAlertRecord(
+            alert_id=row[0],
+            created_at=row[1],
+            alert_key=row[2],
+            status=row[3],
+            severity=row[4],
+            summary=row[5],
+            finding_codes=list(json.loads(row[6])),
+            delivery_state=row[7],
+            payload=dict(json.loads(row[8])),
+            error=row[9],
+            acknowledged_at=row[10],
+            acknowledged_by=row[11],
+            acknowledgement_note=row[12],
+        )
+
+    def _row_to_control_plane_alert_silence(self, row) -> ControlPlaneAlertSilenceRecord:
+        return ControlPlaneAlertSilenceRecord(
+            silence_id=row[0],
+            created_at=row[1],
+            created_by=row[2],
+            reason=row[3],
+            match_alert_key=row[4],
+            match_finding_code=row[5],
+            starts_at=row[6],
+            expires_at=row[7],
+            cancelled_at=row[8],
+            cancelled_by=row[9],
+        )
+
+    def _row_to_control_plane_oncall_schedule(self, row) -> ControlPlaneOnCallScheduleRecord:
+        return ControlPlaneOnCallScheduleRecord(
+            schedule_id=row[0],
+            created_at=row[1],
+            created_by=row[2],
+            environment_name=row[3],
+            created_by_team=row[4],
+            created_by_role=row[5],
+            change_reason=row[6],
+            approved_by=row[7],
+            approved_by_team=row[8],
+            approved_by_role=row[9],
+            approved_at=row[10],
+            approval_note=row[11],
+            team_name=row[12],
+            timezone_name=row[13],
+            weekdays=list(json.loads(row[14])),
+            start_time=row[15],
+            end_time=row[16],
+            priority=row[17],
+            rotation_name=row[18],
+            effective_start_date=row[19],
+            effective_end_date=row[20],
+            webhook_url=row[21],
+            escalation_webhook_url=row[22],
+            cancelled_at=row[23],
+            cancelled_by=row[24],
+        )
+
+    def _row_to_control_plane_oncall_change_request(
+        self,
+        row,
+    ) -> ControlPlaneOnCallChangeRequestRecord:
+        return ControlPlaneOnCallChangeRequestRecord(
+            request_id=row[0],
+            created_at=row[1],
+            created_by=row[2],
+            environment_name=row[3],
+            created_by_team=row[4],
+            created_by_role=row[5],
+            change_reason=row[6],
+            status=row[7],
+            review_required=bool(row[8]),
+            review_reasons=list(json.loads(row[9])),
+            team_name=row[10],
+            timezone_name=row[11],
+            weekdays=list(json.loads(row[12])),
+            start_time=row[13],
+            end_time=row[14],
+            priority=row[15],
+            rotation_name=row[16],
+            effective_start_date=row[17],
+            effective_end_date=row[18],
+            webhook_url=row[19],
+            escalation_webhook_url=row[20],
+            assigned_to=row[21],
+            assigned_to_team=row[22],
+            assigned_at=row[23],
+            assigned_by=row[24],
+            assignment_note=row[25],
+            decision_at=row[26],
+            decided_by=row[27],
+            decided_by_team=row[28],
+            decided_by_role=row[29],
+            decision_note=row[30],
+            applied_schedule_id=row[31],
+        )
+
+
+def build_control_plane_database_for_url(
+    settings: WorkspaceSettings,
+    *,
+    raw_url: str,
+):
+    config = resolve_database_config(
+        root_dir=settings.root_dir,
+        default_path=settings.database_path,
+        raw_url=raw_url,
+        supported_backends=("sqlite", "postgres"),
+    )
+    if config.backend == "sqlite":
+        return _ControlPlaneDatabase(settings)
+    return _PostgresControlPlaneDatabase(settings, raw_url=raw_url)
+
+
+def build_job_repository(
+    settings: WorkspaceSettings,
+    *,
+    runtime_support_inspector=build_database_runtime_support,
+    database_builder=build_control_plane_database_for_url,
+) -> "JobRepository":
+    target_url = settings.postgres_runtime_jobs_database_url or settings.database_url
+    if not settings.enable_postgres_runtime_jobs:
+        return JobRepository(settings)
+
+    config = resolve_database_config(
+        root_dir=settings.root_dir,
+        default_path=settings.database_path,
+        raw_url=target_url,
+        supported_backends=("sqlite", "postgres"),
+    )
+    support = runtime_support_inspector(config, supported_backends=("postgres",)) if runtime_support_inspector is build_database_runtime_support else runtime_support_inspector(
+        root_dir=settings.root_dir,
+        default_path=settings.database_path,
+        raw_url=target_url,
+        supported_backends=("postgres",),
+    )
+    runtime_available = bool(getattr(support, "runtime_available", False))
+    if not runtime_available:
+        blockers = list(getattr(support, "blockers", []))
+        raise ValueError(
+            "Postgres runtime job repository was enabled but is not activatable: "
+            + ", ".join(blockers or ["unknown_runtime_blocker"])
+        )
+    return JobRepository(settings, database=database_builder(settings, raw_url=target_url))
+
+
+@dataclass(slots=True)
+class ControlPlaneRuntimeBundle:
+    snapshot_repository: "SnapshotRepository"
+    audit_repository: "AuditRepository"
+    job_repository: "JobRepository"
+    snapshot_repository_backend: str
+    audit_repository_backend: str
+    job_repository_backend: str
+    repository_layout: str
+    mixed_backends: bool
+
+
+def _build_postgres_runtime_database(
+    settings: WorkspaceSettings,
+    *,
+    target_url: str,
+    runtime_support_inspector,
+    database_builder,
+):
+    config = resolve_database_config(
+        root_dir=settings.root_dir,
+        default_path=settings.database_path,
+        raw_url=target_url,
+        supported_backends=("sqlite", "postgres"),
+    )
+    support = runtime_support_inspector(config, supported_backends=("postgres",)) if runtime_support_inspector is build_database_runtime_support else runtime_support_inspector(
+        root_dir=settings.root_dir,
+        default_path=settings.database_path,
+        raw_url=target_url,
+        supported_backends=("postgres",),
+    )
+    runtime_available = bool(getattr(support, "runtime_available", False))
+    if not runtime_available:
+        blockers = list(getattr(support, "blockers", []))
+        raise ValueError(
+            "Postgres runtime control-plane repositories were enabled but are not activatable: "
+            + ", ".join(blockers or ["unknown_runtime_blocker"])
+        )
+    return database_builder(settings, raw_url=target_url)
+
+
+def build_control_plane_runtime_bundle(
+    settings: WorkspaceSettings,
+    *,
+    graph: IntentGraph | None = None,
+    runtime_support_inspector=build_database_runtime_support,
+    database_builder=build_control_plane_database_for_url,
+) -> ControlPlaneRuntimeBundle:
+    if settings.enable_postgres_runtime_snapshots_audits:
+        primary_database = _build_postgres_runtime_database(
+            settings,
+            target_url=settings.postgres_runtime_snapshots_audits_database_url or settings.database_url,
+            runtime_support_inspector=runtime_support_inspector,
+            database_builder=database_builder,
+        )
+    else:
+        primary_database = _ControlPlaneDatabase(settings)
+    snapshot_repository = SnapshotRepository(settings, graph=graph, database=primary_database)
+    audit_repository = AuditRepository(settings, database=primary_database)
+
+    if settings.enable_postgres_runtime_jobs:
+        job_repository = build_job_repository(
+            settings,
+            runtime_support_inspector=runtime_support_inspector,
+            database_builder=database_builder,
+        )
+    else:
+        job_repository = JobRepository(settings, database=primary_database)
+
+    snapshot_backend = str(snapshot_repository.database.config.backend)
+    audit_backend = str(audit_repository.database.config.backend)
+    job_backend = str(job_repository.database.config.backend)
+    backends = {snapshot_backend, audit_backend, job_backend}
+    mixed_backends = len(backends) > 1
+
+    return ControlPlaneRuntimeBundle(
+        snapshot_repository=snapshot_repository,
+        audit_repository=audit_repository,
+        job_repository=job_repository,
+        snapshot_repository_backend=snapshot_backend,
+        audit_repository_backend=audit_backend,
+        job_repository_backend=job_backend,
+        repository_layout="mixed" if mixed_backends else "shared",
+        mixed_backends=mixed_backends,
+    )
+
+
 class SnapshotRepository:
-    def __init__(self, settings: WorkspaceSettings, graph: IntentGraph | None = None) -> None:
+    def __init__(self, settings: WorkspaceSettings, graph: IntentGraph | None = None, database=None) -> None:
         self.settings = settings
         self.graph = graph or IntentGraph()
-        self.database = _ControlPlaneDatabase(settings)
+        self.database = database or _ControlPlaneDatabase(settings)
 
     def save(self, snapshot: IntentGraphSnapshot, repo_path: str, snapshot_id: str | None = None) -> SnapshotRecord:
         self.settings.snapshots_dir.mkdir(parents=True, exist_ok=True)
@@ -2526,11 +4606,14 @@ class SnapshotRepository:
     def list(self) -> list[SnapshotRecord]:
         return self.database.list_snapshots()
 
+    def delete(self, snapshot_id: str) -> bool:
+        return self.database.delete_snapshot(snapshot_id)
+
 
 class AuditRepository:
-    def __init__(self, settings: WorkspaceSettings) -> None:
+    def __init__(self, settings: WorkspaceSettings, database=None) -> None:
         self.settings = settings
-        self.database = _ControlPlaneDatabase(settings)
+        self.database = database or _ControlPlaneDatabase(settings)
 
     def save(self, record: AuditRecord) -> AuditRecord:
         self.settings.audits_dir.mkdir(parents=True, exist_ok=True)
@@ -2577,11 +4660,14 @@ class AuditRepository:
     def list(self) -> list[AuditRecord]:
         return self.database.list_audits()
 
+    def delete(self, audit_id: str) -> bool:
+        return self.database.delete_audit(audit_id)
+
 
 class JobRepository:
-    def __init__(self, settings: WorkspaceSettings) -> None:
+    def __init__(self, settings: WorkspaceSettings, database=None) -> None:
         self.settings = settings
-        self.database = _ControlPlaneDatabase(settings)
+        self.database = database or _ControlPlaneDatabase(settings)
 
     def save(self, record: JobRecord) -> JobRecord:
         self.database.upsert_job(record)
@@ -2606,11 +4692,17 @@ class JobRepository:
     def list(self) -> list[JobRecord]:
         return self.database.list_jobs()
 
+    def delete(self, job_id: str) -> bool:
+        return self.database.delete_job(job_id)
+
     def database_status(self) -> dict[str, object]:
         return self.database.status()
 
     def schema_status(self) -> dict[str, object]:
         return self.database.schema_status()
+
+    def schema_contract(self) -> dict[str, object]:
+        return self.database.schema_contract()
 
     def migrate_schema(self) -> dict[str, object]:
         return self.database.migrate_schema()

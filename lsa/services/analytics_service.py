@@ -5,6 +5,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from lsa.services.control_plane_runtime_validation_service import ControlPlaneRuntimeValidationService
+from lsa.services.runtime_validation_policy import (
+    RuntimeValidationPolicy,
+    load_runtime_validation_policy_bundle,
+)
 from lsa.storage.files import JobRepository
 from lsa.storage.models import ControlPlaneOnCallChangeRequestRecord, ControlPlaneOnCallScheduleRecord
 
@@ -232,6 +237,112 @@ class OnCallAnalyticsSummary:
 
 
 @dataclass(slots=True)
+class RuntimeValidationAnalyticsSummary:
+    generated_at: str
+    environment_name: str
+    status: str
+    severity: str
+    cadence_status: str
+    policy_source: str
+    due_soon_age_hours: float
+    warning_age_hours: float
+    critical_age_hours: float
+    reminder_interval_seconds: float | None = None
+    escalation_interval_seconds: float | None = None
+    latest_rehearsal_event_id: str | None = None
+    latest_rehearsal_recorded_at: str | None = None
+    latest_rehearsal_changed_by: str | None = None
+    latest_rehearsal_status: str | None = None
+    latest_expected_backend: str | None = None
+    latest_expected_repository_layout: str | None = None
+    latest_database_backend: str | None = None
+    latest_repository_layout: str | None = None
+    latest_mixed_backends: bool | None = None
+    latest_checks: dict[str, bool] = field(default_factory=dict)
+    age_hours: float | None = None
+    next_due_at: str | None = None
+    due_in_hours: float | None = None
+    blockers: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "generated_at": self.generated_at,
+            "environment_name": self.environment_name,
+            "status": self.status,
+            "severity": self.severity,
+            "cadence_status": self.cadence_status,
+            "policy_source": self.policy_source,
+            "due_soon_age_hours": self.due_soon_age_hours,
+            "warning_age_hours": self.warning_age_hours,
+            "critical_age_hours": self.critical_age_hours,
+            "reminder_interval_seconds": self.reminder_interval_seconds,
+            "escalation_interval_seconds": self.escalation_interval_seconds,
+            "latest_rehearsal_event_id": self.latest_rehearsal_event_id,
+            "latest_rehearsal_recorded_at": self.latest_rehearsal_recorded_at,
+            "latest_rehearsal_changed_by": self.latest_rehearsal_changed_by,
+            "latest_rehearsal_status": self.latest_rehearsal_status,
+            "latest_expected_backend": self.latest_expected_backend,
+            "latest_expected_repository_layout": self.latest_expected_repository_layout,
+            "latest_database_backend": self.latest_database_backend,
+            "latest_repository_layout": self.latest_repository_layout,
+            "latest_mixed_backends": self.latest_mixed_backends,
+            "latest_checks": dict(self.latest_checks),
+            "age_hours": self.age_hours,
+            "next_due_at": self.next_due_at,
+            "due_in_hours": self.due_in_hours,
+            "blockers": list(self.blockers),
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationReviewSample:
+    review_id: str
+    opened_at: str
+    status: str
+    age_hours: float
+    owner_team: str | None = None
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    policy_source: str = "defaults"
+    summary: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "review_id": self.review_id,
+            "opened_at": self.opened_at,
+            "status": self.status,
+            "age_hours": self.age_hours,
+            "owner_team": self.owner_team,
+            "assigned_to": self.assigned_to,
+            "assigned_to_team": self.assigned_to_team,
+            "policy_source": self.policy_source,
+            "summary": self.summary,
+        }
+
+
+@dataclass(slots=True)
+class RuntimeValidationReviewAnalyticsSummary:
+    active_review_count: int
+    assigned_review_count: int
+    unassigned_review_count: int
+    stale_review_count: int
+    stale_unassigned_review_count: int
+    oldest_review_age_hours: float | None = None
+    review_samples: list[RuntimeValidationReviewSample] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "active_review_count": self.active_review_count,
+            "assigned_review_count": self.assigned_review_count,
+            "unassigned_review_count": self.unassigned_review_count,
+            "stale_review_count": self.stale_review_count,
+            "stale_unassigned_review_count": self.stale_unassigned_review_count,
+            "oldest_review_age_hours": self.oldest_review_age_hours,
+            "review_samples": [item.to_dict() for item in self.review_samples],
+        }
+
+
+@dataclass(slots=True)
 class ControlPlaneAlertThresholds:
     queue_warning_threshold: int = 5
     queue_critical_threshold: int = 20
@@ -247,6 +358,11 @@ class ControlPlaneAlertThresholds:
     oncall_pending_review_warning_threshold: int = 1
     oncall_pending_review_critical_threshold: int = 3
     oncall_pending_review_sla_hours: float = 24.0
+    runtime_validation_review_warning_threshold: int = 1
+    runtime_validation_review_critical_threshold: int = 3
+    runtime_rehearsal_due_soon_age_hours: float = 18.0
+    runtime_rehearsal_warning_age_hours: float = 24.0
+    runtime_rehearsal_critical_age_hours: float = 72.0
 
     def to_dict(self) -> dict:
         return {
@@ -264,6 +380,11 @@ class ControlPlaneAlertThresholds:
             "oncall_pending_review_warning_threshold": self.oncall_pending_review_warning_threshold,
             "oncall_pending_review_critical_threshold": self.oncall_pending_review_critical_threshold,
             "oncall_pending_review_sla_hours": self.oncall_pending_review_sla_hours,
+            "runtime_validation_review_warning_threshold": self.runtime_validation_review_warning_threshold,
+            "runtime_validation_review_critical_threshold": self.runtime_validation_review_critical_threshold,
+            "runtime_rehearsal_due_soon_age_hours": self.runtime_rehearsal_due_soon_age_hours,
+            "runtime_rehearsal_warning_age_hours": self.runtime_rehearsal_warning_age_hours,
+            "runtime_rehearsal_critical_age_hours": self.runtime_rehearsal_critical_age_hours,
         }
 
 
@@ -314,6 +435,8 @@ class ControlPlaneAnalyticsReport:
     leases: LeaseAnalyticsSummary
     jobs: JobAnalyticsSummary
     oncall: OnCallAnalyticsSummary
+    runtime_validation: RuntimeValidationAnalyticsSummary
+    runtime_validation_reviews: RuntimeValidationReviewAnalyticsSummary
     evaluation: ControlPlaneEvaluation
 
     def to_dict(self) -> dict:
@@ -327,6 +450,8 @@ class ControlPlaneAnalyticsReport:
             "leases": self.leases.to_dict(),
             "jobs": self.jobs.to_dict(),
             "oncall": self.oncall.to_dict(),
+            "runtime_validation": self.runtime_validation.to_dict(),
+            "runtime_validation_reviews": self.runtime_validation_reviews.to_dict(),
             "evaluation": self.evaluation.to_dict(),
         }
 
@@ -337,6 +462,9 @@ class AnalyticsService:
     default_environment_name: str = "default"
     heartbeat_timeout_seconds: float = 5.0
     default_thresholds: ControlPlaneAlertThresholds = field(default_factory=ControlPlaneAlertThresholds)
+    runtime_validation_policy_path: str | None = None
+    runtime_validation_reminder_interval_seconds: float = 900.0
+    runtime_validation_escalation_interval_seconds: float = 1800.0
 
     def build_control_plane_analytics(
         self,
@@ -380,17 +508,25 @@ class AnalyticsService:
             day_buckets=day_buckets,
             day_bucket_set=day_bucket_set,
         )
-        effective_thresholds = thresholds or self.default_thresholds
+        effective_thresholds = self._effective_thresholds(thresholds)
         oncall_summary = self._build_oncall_summary(
             now=now,
             pending_review_sla_hours=effective_thresholds.oncall_pending_review_sla_hours,
         )
+        runtime_validation_summary = self._build_runtime_validation_summary(
+            due_soon_age_hours=effective_thresholds.runtime_rehearsal_due_soon_age_hours,
+            warning_age_hours=effective_thresholds.runtime_rehearsal_warning_age_hours,
+            critical_age_hours=effective_thresholds.runtime_rehearsal_critical_age_hours,
+        )
+        runtime_validation_review_summary = self._build_runtime_validation_review_summary(now=now)
         evaluation = self._build_evaluation(
             queue=queue,
             workers=worker_summary,
             leases=lease_summary,
             jobs=job_summary,
             oncall=oncall_summary,
+            runtime_validation=runtime_validation_summary,
+            runtime_validation_reviews=runtime_validation_review_summary,
             thresholds=effective_thresholds,
         )
 
@@ -404,7 +540,168 @@ class AnalyticsService:
             leases=lease_summary,
             jobs=job_summary,
             oncall=oncall_summary,
+            runtime_validation=runtime_validation_summary,
+            runtime_validation_reviews=runtime_validation_review_summary,
             evaluation=evaluation,
+        )
+
+    def _effective_thresholds(
+        self,
+        thresholds: ControlPlaneAlertThresholds | None,
+    ) -> ControlPlaneAlertThresholds:
+        effective = thresholds or self.default_thresholds
+        if thresholds is not None:
+            return effective
+        bundle = load_runtime_validation_policy_bundle(self.runtime_validation_policy_path)
+        runtime_policy = bundle.resolve(
+            environment_name=self.default_environment_name,
+            fallback=RuntimeValidationPolicy(
+                due_soon_age_hours=effective.runtime_rehearsal_due_soon_age_hours,
+                warning_age_hours=effective.runtime_rehearsal_warning_age_hours,
+                critical_age_hours=effective.runtime_rehearsal_critical_age_hours,
+                reminder_interval_seconds=self.runtime_validation_reminder_interval_seconds,
+                escalation_interval_seconds=self.runtime_validation_escalation_interval_seconds,
+            ),
+        )
+        payload = effective.to_dict()
+        payload["runtime_rehearsal_due_soon_age_hours"] = (
+            runtime_policy.due_soon_age_hours or effective.runtime_rehearsal_due_soon_age_hours
+        )
+        payload["runtime_rehearsal_warning_age_hours"] = (
+            runtime_policy.warning_age_hours or effective.runtime_rehearsal_warning_age_hours
+        )
+        payload["runtime_rehearsal_critical_age_hours"] = (
+            runtime_policy.critical_age_hours or effective.runtime_rehearsal_critical_age_hours
+        )
+        return ControlPlaneAlertThresholds(**payload)
+
+    def _build_runtime_validation_summary(
+        self,
+        *,
+        due_soon_age_hours: float,
+        warning_age_hours: float,
+        critical_age_hours: float,
+    ) -> RuntimeValidationAnalyticsSummary:
+        bundle = load_runtime_validation_policy_bundle(self.runtime_validation_policy_path)
+        effective_policy = bundle.resolve(
+            environment_name=self.default_environment_name,
+            fallback=RuntimeValidationPolicy(
+                due_soon_age_hours=due_soon_age_hours,
+                warning_age_hours=warning_age_hours,
+                critical_age_hours=critical_age_hours,
+                reminder_interval_seconds=self.runtime_validation_reminder_interval_seconds,
+                escalation_interval_seconds=self.runtime_validation_escalation_interval_seconds,
+            ),
+        )
+        summary = ControlPlaneRuntimeValidationService(
+            job_repository=self.job_repository,
+            environment_name=self.default_environment_name,
+            due_soon_age_hours=effective_policy.due_soon_age_hours or due_soon_age_hours,
+            warning_age_hours=effective_policy.warning_age_hours or warning_age_hours,
+            critical_age_hours=effective_policy.critical_age_hours or critical_age_hours,
+            policy_source=bundle.source_for(environment_name=self.default_environment_name),
+            reminder_interval_seconds=effective_policy.reminder_interval_seconds,
+            escalation_interval_seconds=effective_policy.escalation_interval_seconds,
+        ).build_summary()
+        return RuntimeValidationAnalyticsSummary(
+            generated_at=summary.generated_at,
+            environment_name=summary.environment_name,
+            status=summary.status,
+            severity=summary.severity,
+            cadence_status=summary.cadence_status,
+            policy_source=summary.policy_source,
+            due_soon_age_hours=summary.due_soon_age_hours,
+            warning_age_hours=summary.warning_age_hours,
+            critical_age_hours=summary.critical_age_hours,
+            reminder_interval_seconds=summary.reminder_interval_seconds,
+            escalation_interval_seconds=summary.escalation_interval_seconds,
+            latest_rehearsal_event_id=summary.latest_rehearsal_event_id,
+            latest_rehearsal_recorded_at=summary.latest_rehearsal_recorded_at,
+            latest_rehearsal_changed_by=summary.latest_rehearsal_changed_by,
+            latest_rehearsal_status=summary.latest_rehearsal_status,
+            latest_expected_backend=summary.latest_expected_backend,
+            latest_expected_repository_layout=summary.latest_expected_repository_layout,
+            latest_database_backend=summary.latest_database_backend,
+            latest_repository_layout=summary.latest_repository_layout,
+            latest_mixed_backends=summary.latest_mixed_backends,
+            latest_checks={} if summary.latest_checks is None else dict(summary.latest_checks),
+            age_hours=summary.age_hours,
+            next_due_at=summary.next_due_at,
+            due_in_hours=summary.due_in_hours,
+            blockers=[] if summary.blockers is None else list(summary.blockers),
+        )
+
+    def _build_runtime_validation_review_summary(
+        self,
+        *,
+        now: datetime,
+    ) -> RuntimeValidationReviewAnalyticsSummary:
+        reviews = self._list_active_runtime_validation_reviews()
+        if not reviews:
+            return RuntimeValidationReviewAnalyticsSummary(
+                active_review_count=0,
+                assigned_review_count=0,
+                unassigned_review_count=0,
+                stale_review_count=0,
+                stale_unassigned_review_count=0,
+                oldest_review_age_hours=None,
+                review_samples=[],
+            )
+
+        policy_bundle = load_runtime_validation_policy_bundle(self.runtime_validation_policy_path)
+        fallback_policy = RuntimeValidationPolicy(
+            reminder_interval_seconds=self.runtime_validation_reminder_interval_seconds,
+            escalation_interval_seconds=self.runtime_validation_escalation_interval_seconds,
+        )
+        review_samples: list[RuntimeValidationReviewSample] = []
+        stale_review_count = 0
+        stale_unassigned_review_count = 0
+        oldest_review_age_hours = 0.0
+        assigned_review_count = 0
+        unassigned_review_count = 0
+
+        for review in reviews:
+            age_hours = max((now - datetime.fromisoformat(str(review["opened_at"]))).total_seconds() / 3600.0, 0.0)
+            oldest_review_age_hours = max(oldest_review_age_hours, age_hours)
+            if review.get("assigned_to"):
+                assigned_review_count += 1
+            else:
+                unassigned_review_count += 1
+            effective_policy = policy_bundle.resolve(
+                environment_name=str(review["environment_name"]),
+                fallback=fallback_policy,
+            )
+            escalation_seconds = (
+                effective_policy.escalation_interval_seconds or self.runtime_validation_escalation_interval_seconds
+            )
+            is_stale = age_hours * 3600.0 >= escalation_seconds
+            if is_stale:
+                stale_review_count += 1
+                if not review.get("assigned_to"):
+                    stale_unassigned_review_count += 1
+            review_samples.append(
+                RuntimeValidationReviewSample(
+                    review_id=str(review["review_id"]),
+                    opened_at=str(review["opened_at"]),
+                    status=str(review["status"]),
+                    age_hours=round(age_hours, 2),
+                    owner_team=_optional_str(review.get("owner_team")),
+                    assigned_to=_optional_str(review.get("assigned_to")),
+                    assigned_to_team=_optional_str(review.get("assigned_to_team")),
+                    policy_source=str(review.get("policy_source", "defaults")),
+                    summary=_optional_str(review.get("summary")),
+                )
+            )
+
+        review_samples.sort(key=lambda item: item.age_hours, reverse=True)
+        return RuntimeValidationReviewAnalyticsSummary(
+            active_review_count=len(reviews),
+            assigned_review_count=assigned_review_count,
+            unassigned_review_count=unassigned_review_count,
+            stale_review_count=stale_review_count,
+            stale_unassigned_review_count=stale_unassigned_review_count,
+            oldest_review_age_hours=round(oldest_review_age_hours, 2) if reviews else None,
+            review_samples=review_samples[:3],
         )
 
     def _build_queue_summary(self, jobs: list) -> QueueAnalyticsSummary:
@@ -747,6 +1044,8 @@ class AnalyticsService:
         leases: LeaseAnalyticsSummary,
         jobs: JobAnalyticsSummary,
         oncall: OnCallAnalyticsSummary,
+        runtime_validation: RuntimeValidationAnalyticsSummary,
+        runtime_validation_reviews: RuntimeValidationReviewAnalyticsSummary,
         thresholds: ControlPlaneAlertThresholds,
     ) -> ControlPlaneEvaluation:
         findings: list[ControlPlaneFinding] = []
@@ -846,6 +1145,107 @@ class AnalyticsService:
                 )
             )
 
+        if runtime_validation.status == "missing":
+            findings.append(
+                ControlPlaneFinding(
+                    severity="critical",
+                    code="runtime_rehearsal_missing",
+                    metric="runtime_validation.latest_rehearsal_recorded_at",
+                    summary="No control-plane runtime rehearsal evidence exists for the active environment.",
+                    observed_value=0.0,
+                    threshold_value=1.0,
+                    context={"environment_name": self.default_environment_name},
+                )
+            )
+        elif runtime_validation.status == "failed":
+            findings.append(
+                ControlPlaneFinding(
+                    severity="critical",
+                    code="runtime_rehearsal_failed",
+                    metric="runtime_validation.latest_rehearsal_status",
+                    summary="The latest control-plane runtime rehearsal did not pass.",
+                    observed_value=0.0,
+                    threshold_value=1.0,
+                    context={
+                        "latest_rehearsal_event_id": runtime_validation.latest_rehearsal_event_id,
+                        "latest_rehearsal_status": runtime_validation.latest_rehearsal_status,
+                        "latest_checks": runtime_validation.latest_checks,
+                    },
+                )
+            )
+        elif runtime_validation.cadence_status == "due_soon" and runtime_validation.age_hours is not None:
+            findings.append(
+                ControlPlaneFinding(
+                    severity="warning",
+                    code="runtime_rehearsal_due_soon",
+                    metric="runtime_validation.due_in_hours",
+                    summary="The latest control-plane runtime rehearsal is approaching its warning threshold.",
+                    observed_value=runtime_validation.age_hours,
+                    threshold_value=thresholds.runtime_rehearsal_warning_age_hours,
+                    context={
+                        "due_soon_age_hours": thresholds.runtime_rehearsal_due_soon_age_hours,
+                        "latest_rehearsal_event_id": runtime_validation.latest_rehearsal_event_id,
+                        "latest_rehearsal_recorded_at": runtime_validation.latest_rehearsal_recorded_at,
+                        "next_due_at": runtime_validation.next_due_at,
+                        "due_in_hours": runtime_validation.due_in_hours,
+                    },
+                )
+            )
+        elif runtime_validation.age_hours is not None:
+            findings.extend(
+                self._threshold_findings(
+                    observed_value=runtime_validation.age_hours,
+                    warning_threshold=thresholds.runtime_rehearsal_warning_age_hours,
+                    critical_threshold=thresholds.runtime_rehearsal_critical_age_hours,
+                    code="runtime_rehearsal_age",
+                    metric="runtime_validation.age_hours",
+                    warning_summary="The latest control-plane runtime rehearsal is older than the configured warning threshold.",
+                    critical_summary="The latest control-plane runtime rehearsal is older than the configured critical threshold.",
+                    context={
+                        "latest_rehearsal_event_id": runtime_validation.latest_rehearsal_event_id,
+                        "latest_rehearsal_recorded_at": runtime_validation.latest_rehearsal_recorded_at,
+                        "latest_expected_backend": runtime_validation.latest_expected_backend,
+                        "latest_repository_layout": runtime_validation.latest_repository_layout,
+                    },
+                )
+            )
+
+        if runtime_validation_reviews.stale_review_count > 0:
+            findings.extend(
+                self._threshold_findings(
+                    observed_value=runtime_validation_reviews.stale_review_count,
+                    warning_threshold=thresholds.runtime_validation_review_warning_threshold,
+                    critical_threshold=thresholds.runtime_validation_review_critical_threshold,
+                    code="runtime_validation_reviews_stale",
+                    metric="runtime_validation_reviews.stale_review_count",
+                    warning_summary="Runtime-validation reviews are older than their policy escalation interval.",
+                    critical_summary="Too many runtime-validation reviews are older than their policy escalation interval.",
+                    context={
+                        "sample_reviews": [item.to_dict() for item in runtime_validation_reviews.review_samples],
+                    },
+                )
+            )
+
+        if runtime_validation_reviews.stale_unassigned_review_count > 0:
+            findings.extend(
+                self._threshold_findings(
+                    observed_value=runtime_validation_reviews.stale_unassigned_review_count,
+                    warning_threshold=thresholds.runtime_validation_review_warning_threshold,
+                    critical_threshold=thresholds.runtime_validation_review_critical_threshold,
+                    code="runtime_validation_reviews_unassigned_stale",
+                    metric="runtime_validation_reviews.stale_unassigned_review_count",
+                    warning_summary="Unassigned runtime-validation reviews are older than their policy escalation interval.",
+                    critical_summary="Too many unassigned runtime-validation reviews are older than their policy escalation interval.",
+                    context={
+                        "sample_reviews": [
+                            item.to_dict()
+                            for item in runtime_validation_reviews.review_samples
+                            if item.assigned_to is None
+                        ],
+                    },
+                )
+            )
+
         status = "healthy"
         if any(item.severity == "critical" for item in findings):
             status = "critical"
@@ -886,6 +1286,46 @@ class AnalyticsService:
                 context={} if context is None else dict(context),
             )
         ]
+
+    def _list_active_runtime_validation_reviews(self) -> list[dict]:
+        reviews: dict[str, dict] = {}
+        for record in reversed(self.job_repository.list_control_plane_maintenance_events(limit=2000)):
+            details = dict(record.details)
+            if record.event_type == "runtime_validation_review_opened":
+                review_id = str(details.get("review_id", ""))
+                if not review_id:
+                    continue
+                reviews[review_id] = {
+                    "review_id": review_id,
+                    "opened_at": str(details.get("opened_at", record.recorded_at)),
+                    "environment_name": str(details.get("environment_name", self.default_environment_name)),
+                    "status": "pending_review",
+                    "summary": _optional_str(details.get("summary")),
+                    "owner_team": _optional_str(details.get("owner_team")),
+                    "assigned_to": None,
+                    "assigned_to_team": None,
+                    "policy_source": str(details.get("policy_source", "defaults")),
+                }
+            elif record.event_type == "runtime_validation_review_assigned":
+                review_id = str(details.get("review_id", ""))
+                if review_id not in reviews:
+                    continue
+                reviews[review_id]["status"] = "assigned"
+                reviews[review_id]["assigned_to"] = _optional_str(details.get("assigned_to"))
+                reviews[review_id]["assigned_to_team"] = _optional_str(details.get("assigned_to_team"))
+            elif record.event_type == "runtime_validation_review_resolved":
+                review_id = str(details.get("review_id", ""))
+                if review_id not in reviews:
+                    continue
+                reviews[review_id]["status"] = "resolved"
+
+        active = [
+            review
+            for review in reviews.values()
+            if review["environment_name"] == self.default_environment_name and review["status"] != "resolved"
+        ]
+        active.sort(key=lambda item: str(item["opened_at"]), reverse=True)
+        return active
 
     def _schedule_is_active_at(self, record: ControlPlaneOnCallScheduleRecord, reference_timestamp: datetime) -> bool:
         try:
@@ -947,3 +1387,10 @@ class AnalyticsService:
     def _ambiguity_key(self, record: ControlPlaneOnCallScheduleRecord) -> tuple[int, int, int]:
         specificity, window_span_days = self._route_specificity(record)
         return (record.priority, specificity, window_span_days)
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import json
 import tempfile
@@ -11,7 +11,12 @@ from lsa.api import main as api_main
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
 from lsa.services.metrics_service import ControlPlaneMetricsService
-from lsa.storage.models import JobLeaseEventRecord, WorkerHeartbeatRecord
+from lsa.services.control_plane_cutover_service import ControlPlaneCutoverService
+from lsa.services.control_plane_maintenance_service import ControlPlaneMaintenanceService
+from lsa.services.control_plane_runtime_validation_review_service import (
+    ControlPlaneRuntimeValidationReviewService,
+)
+from lsa.storage.models import ControlPlaneMaintenanceEventRecord, JobLeaseEventRecord, WorkerHeartbeatRecord
 
 
 class ApiTests(unittest.TestCase):
@@ -116,12 +121,32 @@ class ApiTests(unittest.TestCase):
                 control_plane_alert_interval_seconds=api_main.settings.control_plane_alert_interval_seconds,
                 control_plane_alerts_enabled=api_main.settings.control_plane_alerts_enabled,
             )
+            api_main.runtime_validation_review_service = ControlPlaneRuntimeValidationReviewService(
+                settings=api_main.settings,
+                job_service=api_main.job_service,
+                job_repository=api_main.job_repository,
+            )
+            api_main.job_service.runtime_validation_review_service = api_main.runtime_validation_review_service
+            api_main.control_plane_alert_service.runtime_validation_review_service = (
+                api_main.runtime_validation_review_service
+            )
             api_main.metrics_service = ControlPlaneMetricsService(
                 job_repository=api_main.job_repository,
                 job_service=api_main.job_service,
                 analytics_service=api_main.analytics_service,
                 environment_name=api_main.settings.environment_name,
                 worker_mode="embedded",
+            )
+            api_main.control_plane_maintenance_service = ControlPlaneMaintenanceService(
+                settings=api_main.settings,
+                job_repository=api_main.job_repository,
+                job_service=api_main.job_service,
+                backup_service=api_main.control_plane_backup_service,
+                worker_mode="embedded",
+            )
+            api_main.control_plane_cutover_service = ControlPlaneCutoverService(
+                settings=api_main.settings,
+                maintenance_service=api_main.control_plane_maintenance_service,
             )
             auth_headers = {"X-API-Key": "test-key"}
             with TestClient(api_main.app) as client:
@@ -134,6 +159,20 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(health_payload["worker_mode"], "embedded")
                 self.assertEqual(health_payload["database_backend"], "sqlite")
                 self.assertEqual(health_payload["database_url"], api_main.settings.database_url)
+                self.assertEqual(health_payload["snapshot_repository_backend"], "sqlite")
+                self.assertEqual(health_payload["audit_repository_backend"], "sqlite")
+                self.assertEqual(health_payload["job_repository_backend"], "sqlite")
+                self.assertEqual(health_payload["control_plane_repository_layout"], "shared")
+                self.assertFalse(health_payload["control_plane_mixed_backends"])
+                self.assertFalse(health_payload["snapshots_audits_repository_runtime_enabled"])
+                self.assertFalse(health_payload["snapshots_audits_repository_runtime_active"])
+                self.assertFalse(health_payload["job_repository_runtime_enabled"])
+                self.assertFalse(health_payload["job_repository_runtime_active"])
+                self.assertTrue(health_payload["database_runtime_supported"])
+                self.assertEqual(health_payload["database_runtime_driver"], "sqlite3")
+                self.assertTrue(health_payload["database_runtime_dependency_installed"])
+                self.assertTrue(health_payload["database_runtime_available"])
+                self.assertEqual(health_payload["database_runtime_blockers"], [])
                 self.assertTrue(health_payload["database_ready"])
                 self.assertTrue(health_payload["database_writable"])
                 self.assertEqual(health_payload["database_schema_version"], 1)
@@ -165,6 +204,157 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(maintenance_status_response.status_code, 200)
                 self.assertFalse(maintenance_status_response.json()["active"])
 
+                preflight_response = client.get("/maintenance/control-plane-preflight", headers=auth_headers)
+                self.assertEqual(preflight_response.status_code, 200)
+                self.assertTrue(preflight_response.json()["can_execute"])
+                self.assertEqual(preflight_response.json()["database_backend"], "sqlite")
+
+                runtime_smoke_response = client.post(
+                    "/maintenance/control-plane-runtime-smoke",
+                    json={"changed_by": "operator-a", "reason": "api smoke", "cleanup": True},
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_smoke_response.status_code, 200)
+                runtime_smoke_payload = runtime_smoke_response.json()
+                self.assertEqual(runtime_smoke_payload["repository_layout"], "shared")
+                self.assertTrue(runtime_smoke_payload["snapshot_round_trip_ok"])
+                self.assertTrue(runtime_smoke_payload["audit_round_trip_ok"])
+                self.assertTrue(runtime_smoke_payload["job_round_trip_ok"])
+                self.assertTrue(runtime_smoke_payload["cleanup_completed"])
+
+                runtime_rehearsal_response = client.post(
+                    "/maintenance/control-plane-runtime-rehearsal",
+                    json={
+                        "changed_by": "operator-a",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "reason": "api rehearsal",
+                        "cleanup": True,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_rehearsal_response.status_code, 200)
+                runtime_rehearsal_payload = runtime_rehearsal_response.json()
+                self.assertEqual(runtime_rehearsal_payload["status"], "passed")
+                self.assertEqual(runtime_rehearsal_payload["database_backend"], "sqlite")
+                self.assertEqual(runtime_rehearsal_payload["repository_layout"], "shared")
+                self.assertFalse(runtime_rehearsal_payload["snapshots_audits_repository_runtime_active"])
+                self.assertFalse(runtime_rehearsal_payload["job_repository_runtime_active"])
+                self.assertTrue(all(runtime_rehearsal_payload["checks"].values()))
+                self.assertTrue(runtime_rehearsal_payload["smoke"]["cleanup_completed"])
+
+                runtime_validation_response = client.get(
+                    "/maintenance/control-plane-runtime-validation",
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_validation_response.status_code, 200)
+                runtime_validation_payload = runtime_validation_response.json()
+                self.assertEqual(runtime_validation_payload["status"], "passed")
+                self.assertEqual(runtime_validation_payload["latest_rehearsal_status"], "passed")
+                self.assertEqual(runtime_validation_payload["latest_expected_backend"], "sqlite")
+                self.assertIsNotNone(runtime_validation_payload["latest_rehearsal_event_id"])
+
+                runtime_review_process_response = client.post(
+                    "/maintenance/control-plane-runtime-validation-reviews/process",
+                    json={"changed_by": "system", "reason": "review sweep", "force": False},
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_review_process_response.status_code, 200)
+                initial_review_payload = runtime_review_process_response.json()
+                self.assertEqual(len(initial_review_payload), 1)
+                self.assertEqual(initial_review_payload[0]["status"], "resolved")
+                self.assertEqual(initial_review_payload[0]["trigger_status"], "missing")
+                self.assertEqual(
+                    initial_review_payload[0]["resolution_reason"],
+                    "runtime_proof_restored",
+                )
+
+                api_main.settings.analytics_runtime_rehearsal_due_soon_age_hours = 0
+                api_main.job_repository.append_control_plane_maintenance_event(
+                    ControlPlaneMaintenanceEventRecord(
+                        event_id="runtime-review-due-soon",
+                        recorded_at=datetime.now(UTC).isoformat(),
+                        event_type="control_plane_runtime_rehearsal_executed",
+                        changed_by="operator-a",
+                        details={
+                            "environment_name": api_main.settings.environment_name,
+                            "status": "passed",
+                            "expected_backend": "sqlite",
+                            "expected_repository_layout": "shared",
+                            "database_backend": "sqlite",
+                            "repository_layout": "shared",
+                            "mixed_backends": False,
+                            "checks": {"smoke_job_round_trip_ok": True},
+                        },
+                    )
+                )
+                runtime_review_process_response = client.post(
+                    "/maintenance/control-plane-runtime-validation-reviews/process",
+                    json={"changed_by": "system", "reason": "review sweep", "force": False},
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_review_process_response.status_code, 200)
+                review_payload = runtime_review_process_response.json()
+                self.assertEqual(len(review_payload), 1)
+                self.assertEqual(review_payload[0]["trigger_cadence_status"], "due_soon")
+                review_id = review_payload[0]["review_id"]
+
+                runtime_review_assign_response = client.post(
+                    f"/maintenance/control-plane-runtime-validation-reviews/{review_id}/assign",
+                    json={
+                        "assigned_to": "reviewer-prod",
+                        "assigned_to_team": "platform",
+                        "assigned_by": "system",
+                        "assignment_note": "Own the refresh",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_review_assign_response.status_code, 200)
+                self.assertEqual(runtime_review_assign_response.json()["assigned_to"], "reviewer-prod")
+                api_main.settings.control_plane_alert_reminder_interval_seconds = 0.0
+                api_main.settings.control_plane_alert_escalation_interval_seconds = 3600.0
+                runtime_review_alert_emit = client.post(
+                    "/maintenance/emit-control-plane-alerts",
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_review_alert_emit.status_code, 200)
+                self.assertGreaterEqual(runtime_review_alert_emit.json()["emitted_count"], 1)
+                runtime_review_alerts = [
+                    record
+                    for record in runtime_review_alert_emit.json()["alerts"]
+                    if record["payload"].get("alert_family") == "runtime_validation_review"
+                ]
+                self.assertEqual(len(runtime_review_alerts), 1)
+                self.assertEqual(runtime_review_alerts[0]["status"], "degraded")
+
+                cutover_preflight_response = client.get(
+                    "/maintenance/control-plane-cutover-preflight",
+                    params={"target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod"},
+                    headers=auth_headers,
+                )
+                self.assertEqual(cutover_preflight_response.status_code, 200)
+                self.assertTrue(cutover_preflight_response.json()["can_prepare"])
+                self.assertEqual(cutover_preflight_response.json()["target"]["backend"], "postgres")
+
+                runtime_backend_response = client.get(
+                    "/maintenance/control-plane-runtime-backend",
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_backend_response.status_code, 200)
+                self.assertEqual(runtime_backend_response.json()["backend"], "sqlite")
+                self.assertTrue(runtime_backend_response.json()["runtime_available"])
+
+                inspect_runtime_backend_response = client.post(
+                    "/maintenance/control-plane-runtime-backend/inspect",
+                    json={"database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod"},
+                    headers=auth_headers,
+                )
+                self.assertEqual(inspect_runtime_backend_response.status_code, 200)
+                inspect_runtime_payload = inspect_runtime_backend_response.json()
+                self.assertEqual(inspect_runtime_payload["backend"], "postgres")
+                self.assertFalse(inspect_runtime_payload["runtime_available"])
+                self.assertIn("unsupported_runtime_backend:postgres", inspect_runtime_payload["runtime_blockers"])
+
                 enable_maintenance_response = client.post(
                     "/maintenance/mode/enable",
                     json={"changed_by": "operator-a", "reason": "backup"},
@@ -192,6 +382,217 @@ class ApiTests(unittest.TestCase):
                 )
                 self.assertEqual(disable_maintenance_response.status_code, 200)
                 self.assertFalse(disable_maintenance_response.json()["active"])
+
+                with api_main.job_repository.database._connect() as connection:  # noqa: SLF001
+                    connection.execute(
+                        """
+                        UPDATE control_plane_schema_metadata
+                        SET metadata_value = '0'
+                        WHERE metadata_key = 'schema_version'
+                        """
+                    )
+
+                runbook_response = client.post(
+                    "/maintenance/control-plane-runbook",
+                    json={
+                        "output_path": str(Path(tmpdir) / "data" / "backups" / "api-runbook.json"),
+                        "changed_by": "operator-a",
+                        "reason": "api runbook",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(runbook_response.status_code, 200)
+                runbook_payload = runbook_response.json()
+                self.assertTrue(runbook_payload["schema_status"]["schema_ready"])
+                self.assertFalse(runbook_payload["maintenance_final"]["active"])
+                self.assertIn("backup_exported", runbook_payload["steps"])
+
+                cutover_bundle_response = client.post(
+                    "/maintenance/control-plane-cutover-bundle",
+                    json={
+                        "output_path": str(Path(tmpdir) / "data" / "backups" / "cutover-bundle.json"),
+                        "target_database_url": "postgres://lsa:secret@db.example.com/lsa_prod",
+                        "changed_by": "operator-a",
+                        "reason": "api cutover",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(cutover_bundle_response.status_code, 200)
+                cutover_bundle_payload = cutover_bundle_response.json()
+                self.assertEqual(cutover_bundle_payload["target"]["backend"], "postgres")
+                self.assertTrue(cutover_bundle_payload["maintenance_workflow"]["schema_status"]["schema_ready"])
+                self.assertIsNotNone(cutover_bundle_payload["postgres_bootstrap_package"])
+
+                bootstrap_inspection_response = client.post(
+                    "/maintenance/postgres-bootstrap-package/inspect",
+                    json={
+                        "package_dir": cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(bootstrap_inspection_response.status_code, 200)
+                self.assertTrue(bootstrap_inspection_response.json()["valid"])
+
+                bootstrap_manifest = json.loads(
+                    Path(cutover_bundle_payload["postgres_bootstrap_package"]["manifest_path"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                payload_path = Path(tmpdir) / "pg-payload.json"
+                payload_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": str(bootstrap_manifest["schema_status"]["schema_version"]),
+                            "maintenance_mode_active": "0",
+                            "table_presence": {
+                                name: True for name in bootstrap_manifest["schema_contract"]["table_names"]
+                            },
+                            "row_counts": dict(bootstrap_manifest["table_counts"]),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                fake_psql = Path(tmpdir) / "fake-psql.sh"
+                fake_psql.write_text(
+                    "#!/usr/bin/env sh\n"
+                    "set -eu\n"
+                    f"cat {payload_path}\n",
+                    encoding="utf-8",
+                )
+                fake_psql.chmod(0o755)
+
+                target_inspection_response = client.post(
+                    "/maintenance/postgres-target/inspect",
+                    json={
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "psql_executable": str(fake_psql),
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(target_inspection_response.status_code, 200)
+                self.assertTrue(target_inspection_response.json()["reachable"])
+                self.assertTrue(target_inspection_response.json()["schema_ready"])
+
+                bootstrap_plan_response = client.post(
+                    "/maintenance/postgres-bootstrap-package/plan",
+                    json={
+                        "package_dir": cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "psql_executable": "/definitely/missing/psql",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(bootstrap_plan_response.status_code, 200)
+                self.assertIn("psql_not_found", bootstrap_plan_response.json()["blockers"])
+
+                bootstrap_execute_response = client.post(
+                    "/maintenance/postgres-bootstrap-package/execute",
+                    json={
+                        "package_dir": cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "psql_executable": "/definitely/missing/psql",
+                        "dry_run": True,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(bootstrap_execute_response.status_code, 200)
+                self.assertTrue(bootstrap_execute_response.json()["dry_run"])
+
+                bootstrap_verify_target_response = client.post(
+                    "/maintenance/postgres-bootstrap-package/verify-target",
+                    json={
+                        "package_dir": cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "psql_executable": str(fake_psql),
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(bootstrap_verify_target_response.status_code, 200)
+                self.assertTrue(bootstrap_verify_target_response.json()["valid"])
+                self.assertTrue(bootstrap_verify_target_response.json()["schema_contract_match"])
+
+                rehearsal_response = client.post(
+                    "/maintenance/postgres-cutover-rehearsal",
+                    json={
+                        "package_dir": cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "changed_by": "operator-a",
+                        "reason": "api rehearsal",
+                        "psql_executable": str(fake_psql),
+                        "apply_to_target": False,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(rehearsal_response.status_code, 200)
+                self.assertTrue(rehearsal_response.json()["valid"])
+                self.assertFalse(rehearsal_response.json()["apply_to_target"])
+
+                readiness_response = client.post(
+                    "/maintenance/control-plane-cutover-readiness",
+                    json={
+                        "package_dir": cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "rehearsal_max_age_hours": 24.0,
+                        "require_apply_rehearsal": False,
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(readiness_response.status_code, 200)
+                self.assertTrue(readiness_response.json()["ready"])
+
+                cutover_decision_response = client.post(
+                    "/maintenance/control-plane-cutover-decision",
+                    json={
+                        "package_dir": cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "changed_by": "operator-a",
+                        "requested_decision": "approve",
+                        "reason": "api approval",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(cutover_decision_response.status_code, 200)
+                cutover_decision_payload = cutover_decision_response.json()
+                self.assertTrue(cutover_decision_payload["approved"])
+                self.assertEqual(cutover_decision_payload["final_decision"], "approved")
+                self.assertEqual(cutover_decision_payload["maintenance_event"]["event_type"], "postgres_cutover_promoted")
+
+                shadow_target_settings = api_main.resolve_workspace_settings(str(Path(tmpdir) / "shadow-target"))
+                shadow_target_repo = api_main.JobRepository(shadow_target_settings)
+                api_main._postgres_runtime_shadow_service = lambda: api_main.PostgresRuntimeShadowService(  # type: ignore[assignment]
+                    settings=api_main.settings,
+                    source_job_repository=api_main.job_repository,
+                    target_repository_factory=lambda _: shadow_target_repo,
+                    runtime_support_inspector=lambda **_: type(
+                        "Support",
+                        (),
+                        {
+                            "backend": "postgres",
+                            "url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                            "redacted_url": "postgresql://lsa:***@db.example.com:5432/lsa_prod",
+                            "runtime_supported": True,
+                            "runtime_driver": "psycopg",
+                            "runtime_dependency_installed": True,
+                            "runtime_available": True,
+                            "blockers": [],
+                        },
+                    )(),
+                )
+                runtime_shadow_response = client.post(
+                    "/maintenance/postgres-runtime-shadow-sync",
+                    json={
+                        "target_database_url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "changed_by": "operator-a",
+                        "reason": "api shadow sync",
+                    },
+                    headers=auth_headers,
+                )
+                self.assertEqual(runtime_shadow_response.status_code, 200)
+                runtime_shadow_payload = runtime_shadow_response.json()
+                self.assertGreaterEqual(runtime_shadow_payload["target_event_count"], 1)
+                self.assertGreaterEqual(runtime_shadow_payload["synced_event_count"], 1)
+                self.assertGreaterEqual(runtime_shadow_payload["target_worker_count"], 1)
+                self.assertFalse(runtime_shadow_payload["maintenance_mode"]["active"])
 
                 ingest_response = client.post(
                     "/ingest",
@@ -290,7 +691,7 @@ class ApiTests(unittest.TestCase):
                 api_main.job_repository.reset_control_plane()
                 import_backup_response = client.post(
                     "/maintenance/import-control-plane-backup",
-                    json={"input_path": str(backup_path), "replace_existing": False},
+                    json={"input_path": str(backup_path), "replace_existing": True},
                     headers=auth_headers,
                 )
                 self.assertEqual(import_backup_response.status_code, 200)
@@ -305,6 +706,19 @@ class ApiTests(unittest.TestCase):
                 self.assertTrue(schema_response.json()["schema_ready"])
                 self.assertEqual(schema_response.json()["pending_migration_count"], 0)
                 self.assertEqual(len(schema_response.json()["migrations"]), 1)
+
+                schema_contract_response = client.get(
+                    "/maintenance/control-plane-schema/contract",
+                    headers=auth_headers,
+                )
+                self.assertEqual(schema_contract_response.status_code, 200)
+                self.assertEqual(schema_contract_response.json()["schema_version"], 1)
+                self.assertIn("sqlite", schema_contract_response.json()["runtime_supported_backends"])
+                self.assertIn("postgres", schema_contract_response.json()["bootstrap_supported_backends"])
+                self.assertIn(
+                    "control_plane_oncall_change_requests",
+                    schema_contract_response.json()["table_names"],
+                )
 
                 with api_main.job_repository.database._connect() as connection:
                     connection.execute(

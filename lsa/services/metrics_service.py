@@ -75,6 +75,7 @@ class ControlPlaneMetricsService:
         lines.extend(self._job_lines(analytics))
         lines.extend(self._oncall_lines(analytics))
         lines.extend(self._evaluation_lines(analytics))
+        lines.extend(self._runtime_validation_lines(analytics))
         lines.extend(self._alert_lines())
         lines.extend(self._maintenance_event_lines())
 
@@ -157,6 +158,41 @@ class ControlPlaneMetricsService:
                     {"severity": finding.severity, "code": finding.code},
                 )
             )
+        return lines
+
+    def _runtime_validation_lines(self, analytics: ControlPlaneAnalyticsReport) -> list[str]:
+        summary = analytics.runtime_validation
+        status_values = {
+            "passed": 1 if summary.status == "passed" else 0,
+            "warning": 1 if summary.status == "warning" else 0,
+            "critical": 1 if summary.status == "critical" else 0,
+            "missing": 1 if summary.status == "missing" else 0,
+            "failed": 1 if summary.status == "failed" else 0,
+        }
+        cadence_values = {
+            "fresh": 1 if summary.cadence_status == "fresh" else 0,
+            "due_soon": 1 if summary.cadence_status == "due_soon" else 0,
+            "aging": 1 if summary.cadence_status == "aging" else 0,
+            "overdue": 1 if summary.cadence_status == "overdue" else 0,
+            "missing": 1 if summary.cadence_status == "missing" else 0,
+            "failed": 1 if summary.cadence_status == "failed" else 0,
+        }
+        lines = [
+            self._line("runtime_rehearsal_status", value, {"status": status})
+            for status, value in status_values.items()
+        ]
+        lines.extend(
+            self._line("runtime_rehearsal_cadence_status", value, {"status": status})
+            for status, value in cadence_values.items()
+        )
+        if summary.age_hours is not None:
+            lines.append(self._line("runtime_rehearsal_age_hours", summary.age_hours))
+        if summary.due_in_hours is not None:
+            lines.append(self._line("runtime_rehearsal_due_in_hours", summary.due_in_hours))
+        if summary.latest_rehearsal_recorded_at is not None:
+            lines.append(self._line("runtime_rehearsal_present", 1))
+        else:
+            lines.append(self._line("runtime_rehearsal_present", 0))
         return lines
 
     def _alert_lines(self) -> list[str]:

@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from lsa.services.analytics_service import AnalyticsService
 from lsa.services.oncall_policy import load_oncall_policy_bundle
+from lsa.services.runtime_validation_policy import RuntimeValidationPolicy, load_runtime_validation_policy_bundle
 from lsa.storage.files import JobRepository
 from lsa.storage.models import (
     ControlPlaneAlertRecord,
@@ -34,28 +35,38 @@ class ControlPlaneAlertService:
     reminder_interval_seconds: float = 900.0
     escalation_interval_seconds: float = 1800.0
     policy_path: str | None = None
+    runtime_validation_policy_path: str | None = None
     required_approver_roles: tuple[str, ...] = ("manager", "director", "admin")
     allow_self_approval: bool = False
     sink_path: str | None = None
     webhook_url: str | None = None
     escalation_webhook_url: str | None = None
+    runtime_validation_review_service: object | None = None
+
+    _RUNTIME_VALIDATION_ALERT_KEY_PREFIX = "control-plane-runtime-validation:"
+    _RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX = "control-plane-runtime-validation-review:"
 
     def emit_alerts(self, *, force: bool = False) -> list[ControlPlaneAlertRecord]:
         report = self.analytics_service.build_control_plane_analytics(days=self.window_days)
-        latest = self.job_repository.latest_control_plane_alert()
-        candidate = self._candidate_alert(report.to_dict(), latest)
-        if candidate is None:
-            return []
-        if not force and self._is_deduped(candidate.alert_key):
-            return []
-        matching_silences = self._matching_active_silences(candidate)
-        if matching_silences:
-            suppressed = self._suppress(candidate, matching_silences)
-            self.job_repository.append_control_plane_alert(suppressed)
-            return [suppressed]
-        delivered = self._deliver(candidate)
-        self.job_repository.append_control_plane_alert(delivered)
-        return [delivered]
+        report_payload = report.to_dict()
+        emitted: list[ControlPlaneAlertRecord] = []
+        candidates = [
+            self._runtime_validation_candidate(
+                report_payload,
+                self._latest_alert_with_prefix(self._RUNTIME_VALIDATION_ALERT_KEY_PREFIX),
+            ),
+            self._runtime_validation_review_candidate(
+                self._latest_alert_with_prefix(self._RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX),
+            ),
+            self._candidate_alert(report_payload, self.job_repository.latest_control_plane_alert()),
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            emitted_candidate = self._emit_candidate(candidate, force=force)
+            if emitted_candidate is not None:
+                emitted.append(emitted_candidate)
+        return emitted
 
     def list_alerts(self, limit: int | None = None) -> list[ControlPlaneAlertRecord]:
         return self.job_repository.list_control_plane_alerts(limit)
@@ -477,25 +488,23 @@ class ControlPlaneAlertService:
         }
 
     def process_follow_ups(self, *, force: bool = False) -> list[ControlPlaneAlertRecord]:
-        active_alert = self._active_incident_alert()
-        if active_alert is None:
-            return []
-        root_alert = self._root_incident_for_record(active_alert)
-        if root_alert.acknowledged_at is not None:
-            return []
-        if self._matching_active_silences(root_alert):
-            return []
-
-        lifecycle_event = self._next_follow_up_event(root_alert=root_alert, force=force)
-        if lifecycle_event is None:
-            return []
-        follow_up = self._build_follow_up_alert(root_alert=root_alert, lifecycle_event=lifecycle_event)
-        delivered = self._deliver(
-            follow_up,
-            webhook_url_override=self.escalation_webhook_url if lifecycle_event == "escalation" else None,
-        )
-        self.job_repository.append_control_plane_alert(delivered)
-        return [delivered]
+        emitted: list[ControlPlaneAlertRecord] = []
+        for active_alert in (
+            self._active_incident_alert(
+                exclude_prefixes=(
+                    self._RUNTIME_VALIDATION_ALERT_KEY_PREFIX,
+                    self._RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX,
+                )
+            ),
+            self._active_incident_alert(include_prefix=self._RUNTIME_VALIDATION_ALERT_KEY_PREFIX),
+            self._active_incident_alert(include_prefix=self._RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX),
+        ):
+            if active_alert is None:
+                continue
+            delivered = self._process_follow_up_for_alert(active_alert=active_alert, force=force)
+            if delivered is not None:
+                emitted.append(delivered)
+        return emitted
 
     def _candidate_alert(self, report: dict, latest: ControlPlaneAlertRecord | None) -> ControlPlaneAlertRecord | None:
         evaluation = report["evaluation"]
@@ -531,6 +540,136 @@ class ControlPlaneAlertService:
             error=None,
         )
 
+    def _runtime_validation_candidate(
+        self,
+        report: dict,
+        latest: ControlPlaneAlertRecord | None,
+    ) -> ControlPlaneAlertRecord | None:
+        runtime_validation = dict(report.get("runtime_validation", {}))
+        status = str(runtime_validation.get("status", "missing"))
+        cadence_status = str(runtime_validation.get("cadence_status", "missing"))
+        latest_rehearsal_status = runtime_validation.get("latest_rehearsal_status")
+
+        if status == "missing":
+            finding_codes = ["runtime_rehearsal_missing"]
+            alert_status = "critical"
+            severity = "critical"
+            summary = "No control-plane runtime rehearsal evidence exists for the active environment."
+        elif status == "failed":
+            finding_codes = ["runtime_rehearsal_failed"]
+            alert_status = "critical"
+            severity = "critical"
+            summary = "The latest control-plane runtime rehearsal did not pass."
+        elif cadence_status == "due_soon":
+            finding_codes = ["runtime_rehearsal_due_soon"]
+            alert_status = "degraded"
+            severity = "warning"
+            summary = "Control-plane runtime proof is approaching its warning threshold."
+        elif status == "warning" or cadence_status == "aging":
+            finding_codes = ["runtime_rehearsal_age"]
+            alert_status = "degraded"
+            severity = "warning"
+            summary = "Control-plane runtime proof is older than the configured warning threshold."
+        elif status == "critical" or cadence_status == "overdue":
+            finding_codes = ["runtime_rehearsal_age"]
+            alert_status = "critical"
+            severity = "critical"
+            summary = "Control-plane runtime proof is older than the configured critical threshold."
+        else:
+            if latest is None or latest.status == "healthy" or self._lifecycle_event(latest) == "recovery":
+                return None
+            finding_codes = []
+            alert_status = "healthy"
+            severity = "info"
+            summary = "Control-plane runtime proof returned to a fresh state."
+
+        if alert_status == "healthy":
+            alert_key = f"{self._RUNTIME_VALIDATION_ALERT_KEY_PREFIX}healthy:recovered"
+            lifecycle_event = "recovery"
+        else:
+            alert_key = f"{self._RUNTIME_VALIDATION_ALERT_KEY_PREFIX}{alert_status}:{','.join(sorted(finding_codes))}"
+            lifecycle_event = "incident"
+
+        return ControlPlaneAlertRecord(
+            alert_id=uuid4().hex[:16],
+            created_at=_utc_now(),
+            alert_key=alert_key,
+            status=alert_status,
+            severity=severity,
+            summary=summary,
+            finding_codes=sorted(finding_codes),
+            delivery_state="skipped",
+            payload={
+                "report": report,
+                "runtime_validation": runtime_validation,
+                "runtime_validation_status": status,
+                "runtime_validation_cadence_status": cadence_status,
+                "latest_rehearsal_status": latest_rehearsal_status,
+                "alert_family": "runtime_validation",
+                "lifecycle_event": lifecycle_event,
+                "source_alert_id": None,
+            },
+            error=None,
+        )
+
+    def _runtime_validation_review_candidate(
+        self,
+        latest: ControlPlaneAlertRecord | None,
+    ) -> ControlPlaneAlertRecord | None:
+        if self.runtime_validation_review_service is None:
+            return None
+        state = self.runtime_validation_review_service.build_alert_state(force=False)
+        if state is None:
+            if latest is None or latest.status == "healthy" or self._lifecycle_event(latest) == "recovery":
+                return None
+            review_payload = dict(latest.payload.get("runtime_validation_review", {}))
+            return ControlPlaneAlertRecord(
+                alert_id=uuid4().hex[:16],
+                created_at=_utc_now(),
+                alert_key=f"{self._RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX}healthy:recovered",
+                status="healthy",
+                severity="info",
+                summary="Runtime-proof review queue returned to a healthy state.",
+                finding_codes=[],
+                delivery_state="skipped",
+                payload={
+                    "runtime_validation_review": review_payload,
+                    "alert_family": "runtime_validation_review",
+                    "policy_source": latest.payload.get("policy_source"),
+                    "reminder_interval_seconds": latest.payload.get("reminder_interval_seconds"),
+                    "escalation_interval_seconds": latest.payload.get("escalation_interval_seconds"),
+                    "review_age_seconds": 0.0,
+                    "lifecycle_event": "recovery",
+                    "source_alert_id": None,
+                },
+                error=None,
+            )
+
+        return ControlPlaneAlertRecord(
+            alert_id=uuid4().hex[:16],
+            created_at=_utc_now(),
+            alert_key=(
+                f"{self._RUNTIME_VALIDATION_REVIEW_ALERT_KEY_PREFIX}"
+                f"{state.status}:{state.review.review_id}:{','.join(sorted(state.finding_codes))}"
+            ),
+            status=state.status,
+            severity=state.severity,
+            summary=state.summary,
+            finding_codes=sorted(state.finding_codes),
+            delivery_state="skipped",
+            payload={
+                "runtime_validation_review": state.review.to_dict(),
+                "alert_family": "runtime_validation_review",
+                "policy_source": state.policy_source,
+                "reminder_interval_seconds": state.reminder_interval_seconds,
+                "escalation_interval_seconds": state.escalation_interval_seconds,
+                "review_age_seconds": state.age_seconds,
+                "lifecycle_event": "incident",
+                "source_alert_id": None,
+            },
+            error=None,
+        )
+
     def _summary_for_status(self, status: str, findings: list[dict]) -> str:
         if not findings:
             return f"Control-plane evaluation entered {status} state."
@@ -546,6 +685,23 @@ class ControlPlaneAlertService:
         not_before = datetime.now(UTC) - timedelta(seconds=self.dedup_window_seconds)
         return datetime.fromisoformat(latest.created_at) >= not_before
 
+    def _emit_candidate(
+        self,
+        candidate: ControlPlaneAlertRecord,
+        *,
+        force: bool,
+    ) -> ControlPlaneAlertRecord | None:
+        if not force and self._is_deduped(candidate.alert_key):
+            return None
+        matching_silences = self._matching_active_silences(candidate)
+        if matching_silences:
+            suppressed = self._suppress(candidate, matching_silences)
+            self.job_repository.append_control_plane_alert(suppressed)
+            return suppressed
+        delivered = self._deliver(candidate)
+        self.job_repository.append_control_plane_alert(delivered)
+        return delivered
+
     def _matching_active_silences(self, record: ControlPlaneAlertRecord) -> list[ControlPlaneAlertSilenceRecord]:
         if record.status == "healthy":
             return []
@@ -560,16 +716,29 @@ class ControlPlaneAlertService:
             matches.append(silence)
         return matches
 
-    def _active_incident_alert(self) -> ControlPlaneAlertRecord | None:
-        records = self.job_repository.list_control_plane_alerts()
-        if not records:
-            return None
-        latest = records[0]
-        if latest.status == "healthy" or self._lifecycle_event(latest) == "recovery":
-            return None
-        if latest.delivery_state not in {"delivered", "partial"}:
-            return None
-        return latest
+    def _active_incident_alert(
+        self,
+        *,
+        include_prefix: str | None = None,
+        exclude_prefixes: tuple[str, ...] = (),
+    ) -> ControlPlaneAlertRecord | None:
+        for record in self.job_repository.list_control_plane_alerts():
+            if include_prefix is not None and not record.alert_key.startswith(include_prefix):
+                continue
+            if exclude_prefixes and any(record.alert_key.startswith(prefix) for prefix in exclude_prefixes):
+                continue
+            if record.status == "healthy" or self._lifecycle_event(record) == "recovery":
+                return None
+            if record.delivery_state not in {"delivered", "partial"}:
+                return None
+            return record
+        return None
+
+    def _latest_alert_with_prefix(self, prefix: str) -> ControlPlaneAlertRecord | None:
+        for record in self.job_repository.list_control_plane_alerts():
+            if record.alert_key.startswith(prefix):
+                return record
+        return None
 
     def _root_incident_for_record(self, record: ControlPlaneAlertRecord) -> ControlPlaneAlertRecord:
         source_alert_id = self._source_alert_id(record)
@@ -578,8 +747,9 @@ class ControlPlaneAlertService:
         return record
 
     def _next_follow_up_event(self, *, root_alert: ControlPlaneAlertRecord, force: bool) -> str | None:
+        reminder_interval_seconds, escalation_interval_seconds = self._follow_up_intervals_for_alert(root_alert)
         if force:
-            if self.escalation_interval_seconds <= self.reminder_interval_seconds:
+            if escalation_interval_seconds <= reminder_interval_seconds:
                 return "escalation"
             return "reminder"
 
@@ -588,20 +758,67 @@ class ControlPlaneAlertService:
         latest_escalation = self._latest_follow_up(root_alert.alert_id, "escalation")
         latest_reminder = self._latest_follow_up(root_alert.alert_id, "reminder")
 
-        if age_seconds >= self.escalation_interval_seconds:
+        if age_seconds >= escalation_interval_seconds:
             if latest_escalation is None:
                 return "escalation"
             last_escalation_age = (datetime.now(UTC) - datetime.fromisoformat(latest_escalation.created_at)).total_seconds()
-            if last_escalation_age >= self.escalation_interval_seconds:
+            if last_escalation_age >= escalation_interval_seconds:
                 return "escalation"
 
-        if age_seconds >= self.reminder_interval_seconds:
+        if age_seconds >= reminder_interval_seconds:
             if latest_reminder is None:
                 return "reminder"
             last_reminder_age = (datetime.now(UTC) - datetime.fromisoformat(latest_reminder.created_at)).total_seconds()
-            if last_reminder_age >= self.reminder_interval_seconds:
+            if last_reminder_age >= reminder_interval_seconds:
                 return "reminder"
         return None
+
+    def _follow_up_intervals_for_alert(self, record: ControlPlaneAlertRecord) -> tuple[float, float]:
+        alert_family = str(record.payload.get("alert_family"))
+        if alert_family == "runtime_validation_review":
+            return (
+                _optional_float(record.payload.get("reminder_interval_seconds")) or self.reminder_interval_seconds,
+                _optional_float(record.payload.get("escalation_interval_seconds")) or self.escalation_interval_seconds,
+            )
+        if alert_family != "runtime_validation":
+            return (self.reminder_interval_seconds, self.escalation_interval_seconds)
+        runtime_validation = dict(record.payload.get("runtime_validation", {}))
+        environment_name = runtime_validation.get("environment_name") or self.default_environment_name
+        bundle = load_runtime_validation_policy_bundle(self.runtime_validation_policy_path)
+        policy = bundle.resolve(
+            environment_name=str(environment_name),
+            fallback=RuntimeValidationPolicy(
+                reminder_interval_seconds=self.reminder_interval_seconds,
+                escalation_interval_seconds=self.escalation_interval_seconds,
+            ),
+        )
+        return (
+            policy.reminder_interval_seconds or self.reminder_interval_seconds,
+            policy.escalation_interval_seconds or self.escalation_interval_seconds,
+        )
+
+    def _process_follow_up_for_alert(
+        self,
+        *,
+        active_alert: ControlPlaneAlertRecord,
+        force: bool,
+    ) -> ControlPlaneAlertRecord | None:
+        root_alert = self._root_incident_for_record(active_alert)
+        if root_alert.acknowledged_at is not None:
+            return None
+        if self._matching_active_silences(root_alert):
+            return None
+
+        lifecycle_event = self._next_follow_up_event(root_alert=root_alert, force=force)
+        if lifecycle_event is None:
+            return None
+        follow_up = self._build_follow_up_alert(root_alert=root_alert, lifecycle_event=lifecycle_event)
+        delivered = self._deliver(
+            follow_up,
+            webhook_url_override=self.escalation_webhook_url if lifecycle_event == "escalation" else None,
+        )
+        self.job_repository.append_control_plane_alert(delivered)
+        return delivered
 
     def _latest_follow_up(self, source_alert_id: str, lifecycle_event: str) -> ControlPlaneAlertRecord | None:
         for record in self.job_repository.list_control_plane_alerts():
@@ -626,6 +843,12 @@ class ControlPlaneAlertService:
             delivery_state="skipped",
             payload={
                 "report": dict(root_alert.payload.get("report", {})),
+                "alert_family": root_alert.payload.get("alert_family"),
+                "runtime_validation": dict(root_alert.payload.get("runtime_validation", {})),
+                "runtime_validation_review": dict(root_alert.payload.get("runtime_validation_review", {})),
+                "policy_source": root_alert.payload.get("policy_source"),
+                "reminder_interval_seconds": root_alert.payload.get("reminder_interval_seconds"),
+                "escalation_interval_seconds": root_alert.payload.get("escalation_interval_seconds"),
                 "lifecycle_event": lifecycle_event,
                 "source_alert_id": root_alert.alert_id,
             },
@@ -1109,3 +1332,12 @@ class ControlPlaneAlertService:
                     raise ValueError(
                         "approved_by_team does not match the owner_team required by the on-call governance policy."
                     )
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

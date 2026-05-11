@@ -6,6 +6,7 @@ from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertTh
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import JobRepository
 from lsa.storage.models import (
+    ControlPlaneMaintenanceEventRecord,
     ControlPlaneOnCallChangeRequestRecord,
     ControlPlaneOnCallScheduleRecord,
     JobLeaseEventRecord,
@@ -157,6 +158,25 @@ class AnalyticsServiceTests(unittest.TestCase):
                 )
             )
 
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current",
+                    recorded_at=current_timestamp,
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+
             report = service.build_control_plane_analytics(days=7)
             payload = report.to_dict()
 
@@ -192,6 +212,7 @@ class AnalyticsServiceTests(unittest.TestCase):
             self.assertEqual(payload["jobs"]["completed_count"], 1)
             self.assertEqual(payload["jobs"]["failed_count"], 1)
             self.assertEqual(payload["jobs"]["success_rate"], 0.5)
+            self.assertEqual(payload["runtime_validation"]["status"], "passed")
             self.assertEqual(payload["evaluation"]["status"], "degraded")
             finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
             self.assertIn("stale_workers", finding_codes)
@@ -290,6 +311,24 @@ class AnalyticsServiceTests(unittest.TestCase):
                     completed_at=current_timestamp,
                 )
             )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current",
+                    recorded_at=current_timestamp,
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
 
             payload = service.build_control_plane_analytics(days=7).to_dict()
             self.assertEqual(payload["evaluation"]["status"], "critical")
@@ -312,6 +351,7 @@ class AnalyticsServiceTests(unittest.TestCase):
                     oncall_conflict_critical_threshold=2,
                 ),
             )
+            now = datetime.now(UTC)
 
             repo.append_control_plane_oncall_schedule(
                 ControlPlaneOnCallScheduleRecord(
@@ -339,6 +379,24 @@ class AnalyticsServiceTests(unittest.TestCase):
                     end_time="23:59",
                     priority=100,
                     rotation_name="primary-b",
+                )
+            )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current",
+                    recorded_at=now.isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
                 )
             )
 
@@ -436,6 +494,24 @@ class AnalyticsServiceTests(unittest.TestCase):
                     rotation_name="primary-d",
                 )
             )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current",
+                    recorded_at=datetime.now(UTC).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": "prod",
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
 
             payload = service.build_control_plane_analytics(days=7).to_dict()
             self.assertEqual(payload["oncall"]["total_schedules"], 1)
@@ -446,6 +522,145 @@ class AnalyticsServiceTests(unittest.TestCase):
             self.assertEqual(payload["oncall"]["pending_review_samples"][0]["assigned_to"], "reviewer-prod")
             finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
             self.assertIn("oncall_pending_reviews_stale", finding_codes)
+
+    def test_control_plane_analytics_flags_stale_runtime_rehearsal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            service = AnalyticsService(
+                job_repository=repo,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    runtime_rehearsal_due_soon_age_hours=18.0,
+                    runtime_rehearsal_warning_age_hours=1.0,
+                    runtime_rehearsal_critical_age_hours=2.0,
+                ),
+            )
+
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-stale",
+                    recorded_at=(datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+
+            payload = service.build_control_plane_analytics(days=7).to_dict()
+            self.assertEqual(payload["runtime_validation"]["status"], "critical")
+            finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
+            self.assertIn("runtime_rehearsal_age", finding_codes)
+
+    def test_control_plane_analytics_flags_runtime_rehearsal_due_soon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            service = AnalyticsService(
+                job_repository=repo,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    runtime_rehearsal_due_soon_age_hours=12.0,
+                    runtime_rehearsal_warning_age_hours=24.0,
+                    runtime_rehearsal_critical_age_hours=72.0,
+                ),
+            )
+
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-due-soon",
+                    recorded_at=(datetime.now(UTC) - timedelta(hours=18)).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+
+            payload = service.build_control_plane_analytics(days=7).to_dict()
+            self.assertEqual(payload["runtime_validation"]["status"], "passed")
+            self.assertEqual(payload["runtime_validation"]["cadence_status"], "due_soon")
+            finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
+            self.assertIn("runtime_rehearsal_due_soon", finding_codes)
+
+    def test_control_plane_analytics_flags_stale_runtime_validation_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            service = AnalyticsService(
+                job_repository=repo,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    runtime_validation_review_warning_threshold=1,
+                    runtime_validation_review_critical_threshold=2,
+                ),
+                runtime_validation_escalation_interval_seconds=60.0,
+            )
+
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-review-current",
+                    recorded_at=datetime.now(UTC).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-review-opened",
+                    recorded_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+                    event_type="runtime_validation_review_opened",
+                    changed_by="system",
+                    details={
+                        "review_id": "review-prod-analytics",
+                        "opened_at": (datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+                        "opened_by": "system",
+                        "environment_name": settings.environment_name,
+                        "evidence_key": "prod:evidence:due_soon",
+                        "trigger_status": "passed",
+                        "trigger_cadence_status": "due_soon",
+                        "summary": "Runtime proof is approaching its warning threshold and should be refreshed.",
+                        "owner_team": "platform",
+                        "policy_source": "defaults",
+                    },
+                )
+            )
+
+            payload = service.build_control_plane_analytics(days=7).to_dict()
+            self.assertEqual(payload["runtime_validation_reviews"]["active_review_count"], 1)
+            self.assertEqual(payload["runtime_validation_reviews"]["stale_review_count"], 1)
+            self.assertEqual(payload["runtime_validation_reviews"]["stale_unassigned_review_count"], 1)
+            self.assertEqual(payload["runtime_validation_reviews"]["review_samples"][0]["owner_team"], "platform")
+            finding_codes = {item["code"] for item in payload["evaluation"]["findings"]}
+            self.assertIn("runtime_validation_reviews_stale", finding_codes)
+            self.assertIn("runtime_validation_reviews_unassigned_stale", finding_codes)
 
 
 if __name__ == "__main__":

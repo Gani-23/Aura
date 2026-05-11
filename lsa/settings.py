@@ -14,6 +14,10 @@ class WorkspaceSettings:
     database_path: Path
     database_url: str
     database_backend: str
+    enable_postgres_runtime_snapshots_audits: bool
+    postgres_runtime_snapshots_audits_database_url: str | None
+    enable_postgres_runtime_jobs: bool
+    postgres_runtime_jobs_database_url: str | None
     sqlite_busy_timeout_ms: int
     environment_name: str
     api_key: str | None
@@ -36,6 +40,12 @@ class WorkspaceSettings:
     analytics_oncall_pending_review_warning_threshold: int
     analytics_oncall_pending_review_critical_threshold: int
     analytics_oncall_pending_review_sla_hours: float
+    analytics_runtime_rehearsal_due_soon_age_hours: float
+    analytics_runtime_rehearsal_warning_age_hours: float
+    analytics_runtime_rehearsal_critical_age_hours: float
+    runtime_validation_policy_path: Path
+    maintenance_runtime_validation_required: bool
+    cutover_runtime_validation_required: bool
     oncall_policy_path: Path
     oncall_approval_required_roles: tuple[str, ...]
     oncall_allow_self_approval: bool
@@ -69,6 +79,15 @@ def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceS
         database_path=database_config.sqlite_path,
         database_url=database_config.url,
         database_backend=database_config.backend,
+        enable_postgres_runtime_snapshots_audits=_env_flag(
+            "LSA_ENABLE_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS",
+            default=False,
+        ),
+        postgres_runtime_snapshots_audits_database_url=os.environ.get(
+            "LSA_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS_DATABASE_URL"
+        ),
+        enable_postgres_runtime_jobs=_env_flag("LSA_ENABLE_POSTGRES_RUNTIME_JOBS", default=False),
+        postgres_runtime_jobs_database_url=os.environ.get("LSA_POSTGRES_RUNTIME_JOBS_DATABASE_URL"),
         sqlite_busy_timeout_ms=_env_int("LSA_SQLITE_BUSY_TIMEOUT_MS", default=5000),
         environment_name=os.environ.get("LSA_ENVIRONMENT_NAME", "default").strip().lower() or "default",
         api_key=os.environ.get("LSA_API_KEY"),
@@ -111,6 +130,32 @@ def resolve_workspace_settings(base_dir: str | Path | None = None) -> WorkspaceS
         analytics_oncall_pending_review_sla_hours=_env_float(
             "LSA_ANALYTICS_ONCALL_PENDING_REVIEW_SLA_HOURS",
             default=24.0,
+        ),
+        analytics_runtime_rehearsal_due_soon_age_hours=_env_float(
+            "LSA_ANALYTICS_RUNTIME_REHEARSAL_DUE_SOON_AGE_HOURS",
+            default=18.0,
+        ),
+        analytics_runtime_rehearsal_warning_age_hours=_env_float(
+            "LSA_ANALYTICS_RUNTIME_REHEARSAL_WARNING_AGE_HOURS",
+            default=24.0,
+        ),
+        analytics_runtime_rehearsal_critical_age_hours=_env_float(
+            "LSA_ANALYTICS_RUNTIME_REHEARSAL_CRITICAL_AGE_HOURS",
+            default=72.0,
+        ),
+        runtime_validation_policy_path=Path(
+            os.environ.get(
+                "LSA_RUNTIME_VALIDATION_POLICY_PATH",
+                str(data_dir / "runtime_validation_policy.json"),
+            )
+        ),
+        maintenance_runtime_validation_required=_env_flag(
+            "LSA_MAINTENANCE_RUNTIME_VALIDATION_REQUIRED",
+            default=False,
+        ),
+        cutover_runtime_validation_required=_env_flag(
+            "LSA_CUTOVER_RUNTIME_VALIDATION_REQUIRED",
+            default=True,
         ),
         oncall_policy_path=Path(
             os.environ.get("LSA_ONCALL_POLICY_PATH", str(data_dir / "oncall_policy.json"))

@@ -37,6 +37,20 @@ class HealthResponse(BaseModel):
     database_backend: str
     database_url: str
     database_path: str
+    snapshot_repository_backend: str
+    audit_repository_backend: str
+    job_repository_backend: str
+    control_plane_repository_layout: str
+    control_plane_mixed_backends: bool
+    snapshots_audits_repository_runtime_enabled: bool
+    snapshots_audits_repository_runtime_active: bool
+    job_repository_runtime_enabled: bool
+    job_repository_runtime_active: bool
+    database_runtime_supported: bool
+    database_runtime_driver: str
+    database_runtime_dependency_installed: bool
+    database_runtime_available: bool
+    database_runtime_blockers: list[str]
     database_ready: bool
     database_writable: bool
     database_schema_version: int
@@ -279,6 +293,68 @@ class ControlPlaneSchemaStatusResponse(BaseModel):
     migrations: list[ControlPlaneSchemaMigrationPayload]
 
 
+class ControlPlaneSchemaContractResponse(BaseModel):
+    schema_version: int
+    migration_id: str
+    migration_description: str
+    runtime_supported_backends: list[str]
+    bootstrap_supported_backends: list[str]
+    table_names: list[str]
+
+
+class ControlPlaneRuntimeBackendResponse(BaseModel):
+    backend: str
+    url: str
+    redacted_url: str
+    runtime_supported: bool
+    runtime_driver: str
+    runtime_dependency_installed: bool
+    runtime_available: bool
+    runtime_blockers: list[str]
+
+
+class InspectControlPlaneRuntimeBackendRequest(BaseModel):
+    database_url: str
+
+
+class SyncPostgresRuntimeShadowRequest(BaseModel):
+    target_database_url: str
+    changed_by: str
+    reason: str | None = None
+
+
+class PostgresRuntimeShadowSyncResponse(BaseModel):
+    synced_at: str
+    environment_name: str
+    changed_by: str
+    reason: str | None = None
+    target_database_url: str
+    target_database_redacted_url: str
+    runtime_supported: bool
+    runtime_driver: str
+    runtime_dependency_installed: bool
+    runtime_available: bool
+    runtime_blockers: list[str]
+    source_event_count: int
+    target_event_count: int
+    synced_event_count: int
+    source_job_count: int
+    target_job_count: int
+    synced_job_count: int
+    source_worker_count: int
+    target_worker_count: int
+    synced_worker_count: int
+    source_worker_heartbeat_count: int
+    target_worker_heartbeat_count: int
+    synced_worker_heartbeat_count: int
+    source_job_lease_event_count: int
+    target_job_lease_event_count: int
+    synced_job_lease_event_count: int
+    maintenance_mode: dict[str, Any]
+    latest_target_event_id: str | None = None
+    warnings: list[str]
+
+
 class SetControlPlaneMaintenanceModeRequest(BaseModel):
     changed_by: str
     reason: str | None = None
@@ -289,6 +365,387 @@ class ControlPlaneMaintenanceModeResponse(BaseModel):
     changed_at: str | None = None
     changed_by: str | None = None
     reason: str | None = None
+
+
+class RunControlPlaneRuntimeSmokeRequest(BaseModel):
+    changed_by: str
+    reason: str | None = None
+    cleanup: bool = True
+
+
+class ControlPlaneRuntimeSmokeResponse(BaseModel):
+    smoke_id: str
+    executed_at: str
+    changed_by: str
+    reason: str | None = None
+    snapshot_repository_backend: str
+    audit_repository_backend: str
+    job_repository_backend: str
+    repository_layout: str
+    mixed_backends: bool
+    snapshot_id: str
+    audit_id: str
+    job_id: str
+    snapshot_path: str
+    report_path: str
+    snapshot_round_trip_ok: bool
+    audit_round_trip_ok: bool
+    job_round_trip_ok: bool
+    cleanup_requested: bool
+    cleanup_completed: bool
+    maintenance_event_id: str | None = None
+
+
+class RunControlPlaneRuntimeRehearsalRequest(BaseModel):
+    changed_by: str
+    expected_backend: str = "postgres"
+    expected_repository_layout: str = "shared"
+    reason: str | None = None
+    cleanup: bool = True
+
+
+class ControlPlaneRuntimeRehearsalResponse(BaseModel):
+    rehearsal_id: str
+    executed_at: str
+    changed_by: str
+    reason: str | None = None
+    environment_name: str
+    expected_backend: str
+    expected_repository_layout: str
+    database_backend: str
+    snapshot_repository_backend: str
+    audit_repository_backend: str
+    job_repository_backend: str
+    repository_layout: str
+    mixed_backends: bool
+    snapshots_audits_repository_runtime_enabled: bool
+    snapshots_audits_repository_runtime_active: bool
+    job_repository_runtime_enabled: bool
+    job_repository_runtime_active: bool
+    database_runtime_available: bool
+    database_runtime_blockers: list[str]
+    checks: dict[str, bool]
+    status: str
+    smoke: dict[str, Any]
+    maintenance_event_id: str | None = None
+
+
+class ControlPlaneMaintenancePreflightResponse(BaseModel):
+    generated_at: str
+    environment_name: str
+    worker_mode: str
+    maintenance_mode_active: bool
+    maintenance_mode_changed_at: str | None = None
+    maintenance_mode_changed_by: str | None = None
+    maintenance_mode_reason: str | None = None
+    database_backend: str
+    database_url: str
+    database_path: str
+    database_ready: bool
+    database_writable: bool
+    database_schema_version: int
+    database_expected_schema_version: int
+    database_schema_ready: bool
+    database_pending_migration_count: int
+    worker_running: bool
+    active_workers: int
+    queued_jobs: int
+    running_jobs: int
+    completed_jobs: int
+    failed_jobs: int
+    runtime_validation: ControlPlaneRuntimeValidationResponse
+    blockers: list[str]
+    warnings: list[str]
+    can_execute: bool
+
+
+class RunControlPlaneMaintenanceWorkflowRequest(BaseModel):
+    output_path: str
+    changed_by: str
+    reason: str | None = None
+    allow_running_jobs: bool = False
+    disable_maintenance_on_success: bool = True
+
+
+class RunControlPlaneMaintenanceWorkflowResponse(BaseModel):
+    started_at: str
+    completed_at: str
+    changed_by: str
+    reason: str | None = None
+    backup_path: str
+    disable_maintenance_on_success: bool
+    maintenance_enabled_by_workflow: bool
+    steps: list[str]
+    preflight: ControlPlaneMaintenancePreflightResponse
+    maintenance_before: ControlPlaneMaintenanceModeResponse
+    maintenance_after_enable: ControlPlaneMaintenanceModeResponse | None = None
+    maintenance_final: ControlPlaneMaintenanceModeResponse
+    backup: ControlPlaneBackupResponse
+    schema_status: ControlPlaneSchemaStatusResponse
+
+
+class ControlPlaneCutoverTargetResponse(BaseModel):
+    backend: str
+    url: str
+    redacted_url: str
+    runtime_supported: bool
+    host: str | None = None
+    port: int | None = None
+    database_name: str | None = None
+    username: str | None = None
+
+
+class PostgresBootstrapPackageResponse(BaseModel):
+    package_version: int
+    generated_from_cutover_bundle: str
+    generated_from_backup_bundle: str
+    output_dir: str
+    schema_sql_path: str
+    data_sql_path: str
+    manifest_path: str
+    artifact_root: str
+    snapshot_artifact_count: int
+    report_artifact_count: int
+    table_counts: dict[str, int]
+    file_checksums: dict[str, str]
+
+
+class InspectPostgresBootstrapPackageRequest(BaseModel):
+    package_dir: str
+
+
+class PostgresBootstrapPackageInspectionResponse(BaseModel):
+    package_version: int
+    manifest_path: str
+    output_dir: str
+    target_backend: str | None = None
+    file_checksums: dict[str, str]
+    files_present: list[str]
+    missing_files: list[str]
+    checksum_mismatches: list[str]
+    table_counts: dict[str, int]
+    artifact_counts: dict[str, int]
+    valid: bool
+
+
+class BuildPostgresBootstrapExecutionPlanRequest(BaseModel):
+    package_dir: str
+    target_database_url: str
+    artifact_target_root: str | None = None
+    psql_executable: str = "psql"
+
+
+class PostgresBootstrapExecutionPlanResponse(BaseModel):
+    package_dir: str
+    target_database_url: str
+    psql_executable: str
+    artifact_target_root: str | None = None
+    commands: list[list[str]]
+    copy_artifacts: bool
+    valid_package: bool
+    blockers: list[str]
+    executable: bool
+
+
+class ExecutePostgresBootstrapPackageRequest(BaseModel):
+    package_dir: str
+    target_database_url: str
+    artifact_target_root: str | None = None
+    psql_executable: str = "psql"
+    dry_run: bool = False
+
+
+class ExecutePostgresBootstrapPackageResponse(BaseModel):
+    package_dir: str
+    target_database_url: str
+    psql_executable: str
+    artifact_target_root: str | None = None
+    dry_run: bool
+    executed_commands: list[list[str]]
+    copied_artifacts: bool
+    verification_passed: bool
+
+
+class InspectPostgresTargetRequest(BaseModel):
+    target_database_url: str
+    psql_executable: str = "psql"
+
+
+class PostgresTargetInspectionResponse(BaseModel):
+    target: ControlPlaneCutoverTargetResponse
+    psql_executable: str
+    reachable: bool
+    schema_version: int | None = None
+    expected_schema_version: int
+    schema_ready: bool
+    maintenance_mode_active: bool | None = None
+    table_presence: dict[str, bool]
+    row_counts: dict[str, int | None]
+    blockers: list[str]
+    warnings: list[str]
+    inspectable: bool
+
+
+class VerifyPostgresBootstrapPackageRequest(BaseModel):
+    package_dir: str
+    target_database_url: str
+    psql_executable: str = "psql"
+
+
+class VerifyPostgresBootstrapPackageResponse(BaseModel):
+    package_dir: str
+    target_database_url: str
+    psql_executable: str
+    package_valid: bool
+    target_reachable: bool
+    schema_contract_match: bool
+    schema_version_match: bool
+    row_counts_match: bool
+    missing_tables: list[str]
+    row_count_mismatches: dict[str, dict[str, int | None]]
+    blockers: list[str]
+    package_inspection: PostgresBootstrapPackageInspectionResponse
+    target_inspection: PostgresTargetInspectionResponse
+    valid: bool
+
+
+class RunPostgresCutoverRehearsalRequest(BaseModel):
+    package_dir: str
+    target_database_url: str
+    changed_by: str
+    reason: str | None = None
+    psql_executable: str = "psql"
+    artifact_target_root: str | None = None
+    apply_to_target: bool = False
+
+
+class PostgresCutoverRehearsalResponse(BaseModel):
+    started_at: str
+    completed_at: str
+    changed_by: str
+    reason: str | None = None
+    package_dir: str
+    target_database_url: str
+    psql_executable: str
+    artifact_target_root: str | None = None
+    apply_to_target: bool
+    steps: list[str]
+    blockers: list[str]
+    warnings: list[str]
+    package_inspection: PostgresBootstrapPackageInspectionResponse
+    target_before: PostgresTargetInspectionResponse
+    execution_result: ExecutePostgresBootstrapPackageResponse | None = None
+    target_after: PostgresTargetInspectionResponse | None = None
+    verification: VerifyPostgresBootstrapPackageResponse | None = None
+    valid: bool
+
+
+class EvaluateControlPlaneCutoverReadinessRequest(BaseModel):
+    target_database_url: str
+    package_dir: str
+    rehearsal_max_age_hours: float = 24.0
+    require_apply_rehearsal: bool = False
+    require_runtime_validation: bool | None = None
+
+
+class ControlPlaneCutoverReadinessResponse(BaseModel):
+    evaluated_at: str
+    environment_name: str
+    target_database_url: str
+    target_database_redacted_url: str
+    package_dir: str
+    rehearsal_max_age_hours: float
+    require_apply_rehearsal: bool
+    require_runtime_validation: bool
+    latest_bundle_event: ControlPlaneMaintenanceEventPayload | None = None
+    latest_rehearsal_event: ControlPlaneMaintenanceEventPayload | None = None
+    runtime_validation: ControlPlaneRuntimeValidationResponse
+    package_inspection: PostgresBootstrapPackageInspectionResponse | None = None
+    blockers: list[str]
+    warnings: list[str]
+    ready: bool
+
+
+class DecideControlPlaneCutoverRequest(BaseModel):
+    target_database_url: str
+    package_dir: str
+    changed_by: str
+    requested_decision: str = "approve"
+    reason: str | None = None
+    decision_note: str | None = None
+    rehearsal_max_age_hours: float = 24.0
+    require_apply_rehearsal: bool = False
+    require_runtime_validation: bool | None = None
+    allow_override: bool = False
+
+    @model_validator(mode="after")
+    def validate_requested_decision(self) -> "DecideControlPlaneCutoverRequest":
+        if self.requested_decision not in {"approve", "reject"}:
+            raise ValueError("requested_decision must be 'approve' or 'reject'.")
+        if self.requested_decision != "approve" and self.allow_override:
+            raise ValueError("allow_override is only supported when requested_decision='approve'.")
+        if self.allow_override and not self.decision_note:
+            raise ValueError("decision_note is required when allow_override is enabled.")
+        return self
+
+
+class ControlPlaneCutoverPromotionResponse(BaseModel):
+    decided_at: str
+    environment_name: str
+    requested_decision: str
+    final_decision: str
+    approved: bool
+    changed_by: str
+    reason: str | None = None
+    decision_note: str | None = None
+    package_dir: str
+    target_database_url: str
+    target_database_redacted_url: str
+    rehearsal_max_age_hours: float
+    require_apply_rehearsal: bool
+    require_runtime_validation: bool
+    allow_override: bool
+    override_applied: bool
+    readiness: ControlPlaneCutoverReadinessResponse
+    blockers: list[str]
+    warnings: list[str]
+    maintenance_event: "ControlPlaneMaintenanceEventPayload"
+
+
+class ControlPlaneCutoverPreflightResponse(BaseModel):
+    generated_at: str
+    environment_name: str
+    source_database_backend: str
+    source_database_url: str
+    source_database_redacted_url: str
+    target: ControlPlaneCutoverTargetResponse
+    maintenance_preflight: ControlPlaneMaintenancePreflightResponse
+    blockers: list[str]
+    warnings: list[str]
+    can_prepare: bool
+
+
+class PrepareControlPlaneCutoverBundleRequest(BaseModel):
+    output_path: str
+    target_database_url: str
+    changed_by: str
+    reason: str | None = None
+    allow_running_jobs: bool = False
+    disable_maintenance_on_success: bool = True
+
+
+class PrepareControlPlaneCutoverBundleResponse(BaseModel):
+    bundle_version: int
+    generated_at: str
+    environment_name: str
+    source_database_backend: str
+    source_database_url: str
+    source_database_redacted_url: str
+    target: ControlPlaneCutoverTargetResponse
+    path: str
+    maintenance_workflow: RunControlPlaneMaintenanceWorkflowResponse
+    recommended_restore_order: list[str]
+    postgres_bootstrap_package: PostgresBootstrapPackageResponse | None = None
 
 
 class ControlPlaneMaintenanceEventPayload(BaseModel):
@@ -611,6 +1068,28 @@ class OnCallAnalyticsPayload(BaseModel):
     pending_review_samples: list[OnCallPendingReviewSamplePayload]
 
 
+class RuntimeValidationReviewSamplePayload(BaseModel):
+    review_id: str
+    opened_at: str
+    status: str
+    age_hours: float
+    owner_team: str | None = None
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    policy_source: str
+    summary: str | None = None
+
+
+class RuntimeValidationReviewAnalyticsPayload(BaseModel):
+    active_review_count: int
+    assigned_review_count: int
+    unassigned_review_count: int
+    stale_review_count: int
+    stale_unassigned_review_count: int
+    oldest_review_age_hours: float | None = None
+    review_samples: list[RuntimeValidationReviewSamplePayload]
+
+
 class ControlPlaneAlertThresholdsPayload(BaseModel):
     queue_warning_threshold: int
     queue_critical_threshold: int
@@ -626,6 +1105,11 @@ class ControlPlaneAlertThresholdsPayload(BaseModel):
     oncall_pending_review_warning_threshold: int
     oncall_pending_review_critical_threshold: int
     oncall_pending_review_sla_hours: float
+    runtime_validation_review_warning_threshold: int
+    runtime_validation_review_critical_threshold: int
+    runtime_rehearsal_due_soon_age_hours: float
+    runtime_rehearsal_warning_age_hours: float
+    runtime_rehearsal_critical_age_hours: float
 
 
 class ControlPlaneFindingPayload(BaseModel):
@@ -644,6 +1128,82 @@ class ControlPlaneEvaluationPayload(BaseModel):
     thresholds: ControlPlaneAlertThresholdsPayload
 
 
+class ControlPlaneRuntimeValidationResponse(BaseModel):
+    generated_at: str
+    environment_name: str
+    status: str
+    severity: str
+    cadence_status: str
+    policy_source: str
+    due_soon_age_hours: float
+    warning_age_hours: float
+    critical_age_hours: float
+    reminder_interval_seconds: float | None = None
+    escalation_interval_seconds: float | None = None
+    latest_rehearsal_event_id: str | None = None
+    latest_rehearsal_recorded_at: str | None = None
+    latest_rehearsal_changed_by: str | None = None
+    latest_rehearsal_reason: str | None = None
+    latest_rehearsal_status: str | None = None
+    latest_expected_backend: str | None = None
+    latest_expected_repository_layout: str | None = None
+    latest_database_backend: str | None = None
+    latest_repository_layout: str | None = None
+    latest_mixed_backends: bool | None = None
+    latest_checks: dict[str, bool] = Field(default_factory=dict)
+    age_hours: float | None = None
+    next_due_at: str | None = None
+    due_in_hours: float | None = None
+    blockers: list[str] = Field(default_factory=list)
+
+
+class ControlPlaneRuntimeValidationReviewPayload(BaseModel):
+    review_id: str
+    opened_at: str
+    opened_by: str
+    environment_name: str
+    status: str
+    evidence_key: str
+    trigger_status: str
+    trigger_cadence_status: str
+    summary: str
+    latest_rehearsal_event_id: str | None = None
+    latest_rehearsal_recorded_at: str | None = None
+    due_in_hours: float | None = None
+    next_due_at: str | None = None
+    owner_team: str | None = None
+    allowed_assignee_teams: list[str] | None = None
+    assigned_to: str | None = None
+    assigned_to_team: str | None = None
+    assigned_at: str | None = None
+    assigned_by: str | None = None
+    assignment_note: str | None = None
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+    resolution_reason: str | None = None
+    policy_source: str
+
+
+class ProcessRuntimeValidationReviewsRequest(BaseModel):
+    changed_by: str = "system"
+    reason: str | None = None
+    force: bool = False
+
+
+class AssignRuntimeValidationReviewRequest(BaseModel):
+    assigned_to: str
+    assigned_to_team: str | None = None
+    assigned_by: str
+    assignment_note: str | None = None
+
+
+class ResolveRuntimeValidationReviewRequest(BaseModel):
+    resolved_by: str
+    resolution_note: str | None = None
+    resolution_reason: str = "manual_resolution"
+
+
 class ControlPlaneAnalyticsResponse(BaseModel):
     generated_at: str
     window_days: int
@@ -654,4 +1214,6 @@ class ControlPlaneAnalyticsResponse(BaseModel):
     leases: LeaseAnalyticsPayload
     jobs: JobAnalyticsPayload
     oncall: OnCallAnalyticsPayload
+    runtime_validation: ControlPlaneRuntimeValidationResponse
+    runtime_validation_reviews: RuntimeValidationReviewAnalyticsPayload
     evaluation: ControlPlaneEvaluationPayload

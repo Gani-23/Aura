@@ -60,6 +60,33 @@
 - Add an idempotent schema migration/repair command so deployment tooling can reconcile older control-plane databases to the expected version automatically.
 - Expose Prometheus-style control-plane metrics so queue, worker, schema, and alert health can be scraped continuously instead of only inspected through health or analytics endpoints.
 - Add a first-class maintenance mode so operators can pause mutating API flows and worker execution safely during backup, schema, or cutover work.
+- Add a guarded maintenance preflight and runbook workflow so backup, schema repair, and maintenance windows execute through one audited operator path instead of manual sequencing.
+- Add an audited database cutover preparation path so SQLite-backed control-plane state can be packaged and validated against a future Postgres target before the runtime backend actually changes.
+- Generate a Postgres bootstrap package from the cutover bundle so the future backend transition already has schema SQL, data SQL, and extracted artifacts to import.
+- Add bootstrap-package integrity inspection so Postgres handoff artifacts can be verified for missing files and checksum drift before a live cutover.
+- Consolidate the SQLite runtime schema and Postgres bootstrap schema behind one shared control-plane schema contract so cutover artifacts cannot drift from the live model silently.
+- Add live Postgres target inspection and package-to-target verification so operators can rehearse and validate real cutovers against schema version, table presence, and row-count expectations.
+- Add an audited Postgres cutover rehearsal workflow so dry runs and apply-and-verify rehearsals are captured as first-class maintenance events instead of ad hoc operator steps.
+- Add an explicit cutover promotion decision gate so approvals, rejections, automatic blocks, and governed overrides are all recorded against the same readiness evidence.
+- Add a self-applying bootstrap path with verification SQL so the Postgres handoff package is operational, not only descriptive.
+- Add execution planning and dry-run package application so Postgres bootstrap handoffs can be rehearsed before a real target database is attached.
+- Add runtime-backend activation inspection so operators can see whether a future Postgres runtime path is actually supported in the current build and environment before attempting cutover.
+- Add a first Postgres shadow-sync slice for control-plane maintenance metadata and maintenance events so the runtime backend transition can start incrementally instead of all at once.
+- Add a feature-gated live Postgres-backed job repository activation path so one real control-plane surface can move beyond shadow sync without changing the default SQLite posture.
+- Extend that Postgres-backed job slice into real queue lifecycle semantics so claim, lease renewal, stale-job recovery, and worker-visibility counts no longer depend on the SQLite runtime path.
+- Extend that Postgres-backed runtime slice into control-plane alerting and on-call governance state so worker analytics and operator workflows can survive the backend transition too.
+- Add a shared control-plane runtime bundle so API and CLI bootstrap can describe `shared` versus `mixed` backend layouts consistently while the transition is still partial.
+- Add a feature-gated Postgres-backed snapshot/audit metadata path so the runtime bundle can advance from “jobs only” to a fuller shared-backend control-plane layout.
+- Add a concrete Docker Compose Postgres profile so the staged runtime bundle can be exercised in a real multi-service deployment shape instead of only through local feature flags.
+- Add a cleanup-safe control-plane runtime smoke workflow so operators can verify the currently enabled backend layout with real repository operations before or after a deployment.
+- Add a first-class control-plane runtime rehearsal workflow so operators can assert an expected backend/layout against the live service and persist that result as audited evidence.
+- Turn runtime rehearsal evidence into a continuous control-plane validation signal so missing or stale backend proof shows up in analytics, metrics, and operator workflows.
+- Make runtime-validation evidence part of maintenance and cutover gate decisions so risky operator flows can require fresh backend proof instead of only displaying it.
+- Add an explicit runtime-proof cadence model with due-soon and overdue states so operators are warned before runtime evidence falls out of policy.
+- Add a dedicated runtime-proof alert family and follow-up chain so cadence reminders and escalations survive alongside broader control-plane incidents instead of competing with them.
+- Add environment-aware runtime-proof policy bundles so freshness thresholds and follow-up timers can differ safely across `prod`, `staging`, and future tenant scopes.
+- Add an owned runtime-proof review queue so environments approaching proof expiry open assignable operational work before the proof becomes stale.
+- Escalate stale runtime-proof reviews through dedicated alert incidents so unowned or unresolved review work inherits on-call routing, acknowledgement, and follow-up policy.
 - Add drift thresholds for new hosts, latency shifts, and novel exception classes.
 - Capture repeatable demo traces for the first live proof point.
 

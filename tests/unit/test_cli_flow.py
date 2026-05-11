@@ -9,9 +9,13 @@ import unittest
 from lsa.cli import main as cli_main
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
+from lsa.services.control_plane_runtime_validation_review_service import (
+    ControlPlaneRuntimeValidationReviewService,
+)
 from lsa.services.metrics_service import ControlPlaneMetricsService
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.models import JobLeaseEventRecord, JobRecord, WorkerHeartbeatRecord, WorkerRecord
+from lsa.storage.models import ControlPlaneMaintenanceEventRecord
 
 
 class CliFlowTests(unittest.TestCase):
@@ -270,6 +274,104 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["pending_migration_count"], 0)
             self.assertEqual(len(payload["migrations"]), 1)
 
+            contract_sink = StringIO()
+            with redirect_stdout(contract_sink):
+                self.assertEqual(cli_main.run_control_plane_schema_contract(), 0)
+            contract_payload = json.loads(contract_sink.getvalue())
+            self.assertEqual(contract_payload["schema_version"], 1)
+            self.assertIn("sqlite", contract_payload["runtime_supported_backends"])
+            self.assertIn("postgres", contract_payload["bootstrap_supported_backends"])
+            self.assertIn("control_plane_oncall_change_requests", contract_payload["table_names"])
+
+            runtime_backend_sink = StringIO()
+            with redirect_stdout(runtime_backend_sink):
+                self.assertEqual(cli_main.run_control_plane_runtime_backend(), 0)
+            runtime_backend_payload = json.loads(runtime_backend_sink.getvalue())
+            self.assertEqual(runtime_backend_payload["backend"], "sqlite")
+            self.assertTrue(runtime_backend_payload["runtime_available"])
+
+            runtime_smoke_sink = StringIO()
+            cli_main.snapshot_repository = cli_main.SnapshotRepository(cli_main.settings, graph=cli_main.graph)
+            cli_main.audit_repository = cli_main.AuditRepository(cli_main.settings)
+            cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
+            cli_main.audit_service = cli_main.AuditService(
+                graph=cli_main.graph,
+                snapshot_repository=cli_main.snapshot_repository,
+                audit_repository=cli_main.audit_repository,
+                drift_comparator=cli_main.DriftComparator(),
+                remediation_client=cli_main.RuleBasedLLMClient(),
+                settings=cli_main.settings,
+            )
+            cli_main.trace_collection_service = cli_main.TraceCollectionService(settings=cli_main.settings)
+            cli_main.job_service = cli_main.JobService(
+                job_repository=cli_main.job_repository,
+                audit_service=cli_main.audit_service,
+                trace_collection_service=cli_main.trace_collection_service,
+                worker_mode="standalone",
+                heartbeat_timeout_seconds=cli_main.settings.worker_heartbeat_timeout_seconds,
+                worker_history_retention_days=cli_main.settings.worker_history_retention_days,
+                job_lease_history_retention_days=cli_main.settings.job_lease_history_retention_days,
+                history_prune_interval_seconds=cli_main.settings.history_prune_interval_seconds,
+                control_plane_alert_service=None,
+                control_plane_alerts_enabled=False,
+            )
+            with redirect_stdout(runtime_smoke_sink):
+                self.assertEqual(
+                    cli_main.run_control_plane_runtime_smoke(
+                        changed_by="operator-a",
+                        reason="cli smoke",
+                        cleanup=True,
+                    ),
+                    0,
+                )
+            runtime_smoke_payload = json.loads(runtime_smoke_sink.getvalue())
+            self.assertEqual(runtime_smoke_payload["repository_layout"], "shared")
+            self.assertTrue(runtime_smoke_payload["cleanup_completed"])
+            self.assertEqual(cli_main.snapshot_repository.list(), [])
+            self.assertEqual(cli_main.audit_repository.list(), [])
+            self.assertEqual(cli_main.job_repository.list(), [])
+
+            runtime_rehearsal_sink = StringIO()
+            with redirect_stdout(runtime_rehearsal_sink):
+                self.assertEqual(
+                    cli_main.run_control_plane_runtime_rehearsal(
+                        changed_by="operator-a",
+                        expected_backend="sqlite",
+                        expected_repository_layout="shared",
+                        reason="cli rehearsal",
+                        cleanup=True,
+                    ),
+                    0,
+                )
+            runtime_rehearsal_payload = json.loads(runtime_rehearsal_sink.getvalue())
+            self.assertEqual(runtime_rehearsal_payload["status"], "passed")
+            self.assertEqual(runtime_rehearsal_payload["database_backend"], "sqlite")
+            self.assertFalse(runtime_rehearsal_payload["snapshots_audits_repository_runtime_active"])
+            self.assertFalse(runtime_rehearsal_payload["job_repository_runtime_active"])
+            self.assertTrue(all(runtime_rehearsal_payload["checks"].values()))
+            self.assertTrue(runtime_rehearsal_payload["smoke"]["cleanup_completed"])
+
+            runtime_validation_sink = StringIO()
+            with redirect_stdout(runtime_validation_sink):
+                self.assertEqual(cli_main.run_control_plane_runtime_validation(), 0)
+            runtime_validation_payload = json.loads(runtime_validation_sink.getvalue())
+            self.assertEqual(runtime_validation_payload["status"], "passed")
+            self.assertEqual(runtime_validation_payload["latest_rehearsal_status"], "passed")
+            self.assertEqual(runtime_validation_payload["latest_expected_backend"], "sqlite")
+
+            inspect_runtime_backend_sink = StringIO()
+            with redirect_stdout(inspect_runtime_backend_sink):
+                self.assertEqual(
+                    cli_main.run_inspect_control_plane_runtime_backend(
+                        database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod"
+                    ),
+                    0,
+                )
+            inspect_runtime_backend_payload = json.loads(inspect_runtime_backend_sink.getvalue())
+            self.assertEqual(inspect_runtime_backend_payload["backend"], "postgres")
+            self.assertFalse(inspect_runtime_backend_payload["runtime_available"])
+            self.assertIn("unsupported_runtime_backend:postgres", inspect_runtime_backend_payload["runtime_blockers"])
+
             with cli_main.job_repository.database._connect() as connection:
                 connection.execute(
                     """
@@ -348,6 +450,23 @@ class CliFlowTests(unittest.TestCase):
                 worker_mode="standalone",
                 heartbeat_timeout_seconds=cli_main.settings.worker_heartbeat_timeout_seconds,
             )
+            cli_main.control_plane_backup_service = cli_main.ControlPlaneBackupService(
+                settings=cli_main.settings,
+                snapshot_repository=cli_main.snapshot_repository,
+                audit_repository=cli_main.audit_repository,
+                job_repository=cli_main.job_repository,
+            )
+            cli_main.control_plane_maintenance_service = cli_main.ControlPlaneMaintenanceService(
+                settings=cli_main.settings,
+                job_repository=cli_main.job_repository,
+                job_service=cli_main.job_service,
+                backup_service=cli_main.control_plane_backup_service,
+                worker_mode="standalone",
+            )
+            cli_main.control_plane_cutover_service = cli_main.ControlPlaneCutoverService(
+                settings=cli_main.settings,
+                maintenance_service=cli_main.control_plane_maintenance_service,
+            )
 
             status_sink = StringIO()
             with redirect_stdout(status_sink):
@@ -375,6 +494,292 @@ class CliFlowTests(unittest.TestCase):
                     0,
                 )
             self.assertFalse(json.loads(disable_sink.getvalue())["active"])
+
+    def test_control_plane_preflight_and_runbook_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.snapshot_repository = cli_main.SnapshotRepository(cli_main.settings, graph=cli_main.graph)
+            cli_main.audit_repository = cli_main.AuditRepository(cli_main.settings)
+            cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
+            cli_main.control_plane_backup_service = cli_main.ControlPlaneBackupService(
+                settings=cli_main.settings,
+                snapshot_repository=cli_main.snapshot_repository,
+                audit_repository=cli_main.audit_repository,
+                job_repository=cli_main.job_repository,
+            )
+            cli_main.job_service = cli_main.JobService(
+                job_repository=cli_main.job_repository,
+                audit_service=cli_main.audit_service,
+                trace_collection_service=cli_main.trace_collection_service,
+                worker_mode="standalone",
+                heartbeat_timeout_seconds=cli_main.settings.worker_heartbeat_timeout_seconds,
+            )
+            cli_main.control_plane_maintenance_service = cli_main.ControlPlaneMaintenanceService(
+                settings=cli_main.settings,
+                job_repository=cli_main.job_repository,
+                job_service=cli_main.job_service,
+                backup_service=cli_main.control_plane_backup_service,
+                worker_mode="standalone",
+            )
+            cli_main.control_plane_cutover_service = cli_main.ControlPlaneCutoverService(
+                settings=cli_main.settings,
+                maintenance_service=cli_main.control_plane_maintenance_service,
+            )
+
+            preflight_sink = StringIO()
+            with redirect_stdout(preflight_sink):
+                self.assertEqual(cli_main.run_control_plane_preflight(), 0)
+            self.assertTrue(json.loads(preflight_sink.getvalue())["can_execute"])
+
+            cutover_preflight_sink = StringIO()
+            with redirect_stdout(cutover_preflight_sink):
+                self.assertEqual(
+                    cli_main.run_control_plane_cutover_preflight(
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod"
+                    ),
+                    0,
+                )
+            self.assertEqual(json.loads(cutover_preflight_sink.getvalue())["target"]["backend"], "postgres")
+
+            with cli_main.job_repository.database._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE control_plane_schema_metadata
+                    SET metadata_value = '0'
+                    WHERE metadata_key = 'schema_version'
+                    """
+                )
+
+            runbook_path = Path(tmpdir) / "data" / "backups" / "cli-runbook.json"
+            runbook_sink = StringIO()
+            with redirect_stdout(runbook_sink):
+                self.assertEqual(
+                    cli_main.run_control_plane_maintenance_workflow(
+                        output_path=str(runbook_path),
+                        changed_by="operator-a",
+                        reason="cli runbook",
+                        allow_running_jobs=False,
+                        keep_maintenance_enabled=False,
+                    ),
+                    0,
+                )
+            runbook_payload = json.loads(runbook_sink.getvalue())
+            self.assertTrue(runbook_payload["schema_status"]["schema_ready"])
+            self.assertFalse(runbook_payload["maintenance_final"]["active"])
+            self.assertTrue(runbook_path.exists())
+
+            runtime_rehearsal_sink = StringIO()
+            with redirect_stdout(runtime_rehearsal_sink):
+                self.assertEqual(
+                    cli_main.run_control_plane_runtime_rehearsal(
+                        changed_by="operator-a",
+                        expected_backend="sqlite",
+                        expected_repository_layout="shared",
+                        reason="cli runtime proof",
+                        cleanup=True,
+                    ),
+                    0,
+                )
+            self.assertEqual(json.loads(runtime_rehearsal_sink.getvalue())["status"], "passed")
+
+            cutover_bundle_path = Path(tmpdir) / "data" / "backups" / "cutover-bundle.json"
+            cutover_bundle_sink = StringIO()
+            with redirect_stdout(cutover_bundle_sink):
+                self.assertEqual(
+                    cli_main.run_prepare_control_plane_cutover_bundle(
+                        output_path=str(cutover_bundle_path),
+                        target_database_url="postgres://lsa:secret@db.example.com/lsa_prod",
+                        changed_by="operator-a",
+                        reason="cli cutover",
+                        allow_running_jobs=False,
+                        keep_maintenance_enabled=False,
+                    ),
+                    0,
+                )
+            cutover_bundle_payload = json.loads(cutover_bundle_sink.getvalue())
+            self.assertEqual(cutover_bundle_payload["target"]["backend"], "postgres")
+            self.assertIsNotNone(cutover_bundle_payload["postgres_bootstrap_package"])
+            self.assertTrue(cutover_bundle_path.exists())
+
+            inspect_sink = StringIO()
+            with redirect_stdout(inspect_sink):
+                self.assertEqual(
+                    cli_main.run_inspect_postgres_bootstrap_package(
+                        package_dir=cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"]
+                    ),
+                    0,
+                )
+            self.assertTrue(json.loads(inspect_sink.getvalue())["valid"])
+
+            bootstrap_manifest = json.loads(
+                Path(cutover_bundle_payload["postgres_bootstrap_package"]["manifest_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            payload_path = Path(tmpdir) / "pg-payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": str(bootstrap_manifest["schema_status"]["schema_version"]),
+                        "maintenance_mode_active": "0",
+                        "table_presence": {
+                            name: True for name in bootstrap_manifest["schema_contract"]["table_names"]
+                        },
+                        "row_counts": dict(bootstrap_manifest["table_counts"]),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_psql = Path(tmpdir) / "fake-psql.sh"
+            fake_psql.write_text(
+                "#!/usr/bin/env sh\n"
+                "set -eu\n"
+                f"cat {payload_path}\n",
+                encoding="utf-8",
+            )
+            fake_psql.chmod(0o755)
+
+            inspect_target_sink = StringIO()
+            with redirect_stdout(inspect_target_sink):
+                self.assertEqual(
+                    cli_main.run_inspect_postgres_target(
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        psql_executable=str(fake_psql),
+                    ),
+                    0,
+                )
+            self.assertTrue(json.loads(inspect_target_sink.getvalue())["reachable"])
+
+            plan_sink = StringIO()
+            with redirect_stdout(plan_sink):
+                self.assertEqual(
+                    cli_main.run_plan_postgres_bootstrap_execution(
+                        package_dir=cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        artifact_target_root=None,
+                        psql_executable="/definitely/missing/psql",
+                    ),
+                    0,
+                )
+            self.assertIn("psql_not_found", json.loads(plan_sink.getvalue())["blockers"])
+
+            execute_sink = StringIO()
+            with redirect_stdout(execute_sink):
+                self.assertEqual(
+                    cli_main.run_execute_postgres_bootstrap_package(
+                        package_dir=cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        artifact_target_root=None,
+                        psql_executable="/definitely/missing/psql",
+                        dry_run=True,
+                    ),
+                    0,
+                )
+            self.assertTrue(json.loads(execute_sink.getvalue())["dry_run"])
+
+            verify_sink = StringIO()
+            with redirect_stdout(verify_sink):
+                self.assertEqual(
+                    cli_main.run_verify_postgres_bootstrap_package(
+                        package_dir=cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        psql_executable=str(fake_psql),
+                    ),
+                    0,
+                )
+            verify_payload = json.loads(verify_sink.getvalue())
+            self.assertTrue(verify_payload["valid"])
+            self.assertTrue(verify_payload["schema_contract_match"])
+
+            rehearsal_sink = StringIO()
+            with redirect_stdout(rehearsal_sink):
+                self.assertEqual(
+                    cli_main.run_postgres_cutover_rehearsal(
+                        package_dir=cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        changed_by="operator-a",
+                        reason="cli rehearsal",
+                        psql_executable=str(fake_psql),
+                        artifact_target_root=None,
+                        apply_to_target=False,
+                    ),
+                    0,
+                )
+            rehearsal_payload = json.loads(rehearsal_sink.getvalue())
+            self.assertTrue(rehearsal_payload["valid"])
+            self.assertFalse(rehearsal_payload["apply_to_target"])
+
+            readiness_sink = StringIO()
+            with redirect_stdout(readiness_sink):
+                self.assertEqual(
+                    cli_main.run_evaluate_control_plane_cutover_readiness(
+                        package_dir=cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        rehearsal_max_age_hours=24.0,
+                        require_apply_rehearsal=False,
+                    ),
+                    0,
+                )
+            readiness_payload = json.loads(readiness_sink.getvalue())
+            self.assertTrue(readiness_payload["ready"])
+
+            decision_sink = StringIO()
+            with redirect_stdout(decision_sink):
+                self.assertEqual(
+                    cli_main.run_decide_control_plane_cutover(
+                        package_dir=cutover_bundle_payload["postgres_bootstrap_package"]["output_dir"],
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        changed_by="operator-a",
+                        requested_decision="approve",
+                        reason="cli approval",
+                        decision_note=None,
+                        rehearsal_max_age_hours=24.0,
+                        require_apply_rehearsal=False,
+                        allow_override=False,
+                    ),
+                    0,
+                )
+            decision_payload = json.loads(decision_sink.getvalue())
+            self.assertTrue(decision_payload["approved"])
+            self.assertEqual(decision_payload["final_decision"], "approved")
+            self.assertEqual(decision_payload["maintenance_event"]["event_type"], "postgres_cutover_promoted")
+
+            shadow_target_settings = resolve_workspace_settings(str(Path(tmpdir) / "shadow-target"))
+            shadow_target_repo = cli_main.JobRepository(shadow_target_settings)
+            cli_main._postgres_runtime_shadow_service = lambda: cli_main.PostgresRuntimeShadowService(  # type: ignore[assignment]
+                settings=cli_main.settings,
+                source_job_repository=cli_main.job_repository,
+                target_repository_factory=lambda _: shadow_target_repo,
+                runtime_support_inspector=lambda **_: type(
+                    "Support",
+                    (),
+                    {
+                        "backend": "postgres",
+                        "url": "postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        "redacted_url": "postgresql://lsa:***@db.example.com:5432/lsa_prod",
+                        "runtime_supported": True,
+                        "runtime_driver": "psycopg",
+                        "runtime_dependency_installed": True,
+                        "runtime_available": True,
+                        "blockers": [],
+                    },
+                )(),
+            )
+            shadow_sink = StringIO()
+            with redirect_stdout(shadow_sink):
+                self.assertEqual(
+                    cli_main.run_sync_postgres_runtime_shadow(
+                        target_database_url="postgresql://lsa:secret@db.example.com:5432/lsa_prod",
+                        changed_by="operator-a",
+                        reason="cli shadow sync",
+                    ),
+                    0,
+                )
+            shadow_payload = json.loads(shadow_sink.getvalue())
+            self.assertGreaterEqual(shadow_payload["target_event_count"], 1)
+            self.assertGreaterEqual(shadow_payload["synced_event_count"], 1)
+            self.assertEqual(shadow_payload["target_job_count"], shadow_payload["source_job_count"])
+            self.assertFalse(shadow_payload["maintenance_mode"]["active"])
 
     def test_prune_history_removes_old_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -456,6 +861,7 @@ class CliFlowTests(unittest.TestCase):
             cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
             cli_main.analytics_service = AnalyticsService(
                 job_repository=cli_main.job_repository,
+                default_environment_name=cli_main.settings.environment_name,
                 heartbeat_timeout_seconds=60,
                 default_thresholds=ControlPlaneAlertThresholds(
                     queue_warning_threshold=1,
@@ -537,6 +943,24 @@ class CliFlowTests(unittest.TestCase):
                     lease_expires_at=(now + timedelta(minutes=5)).isoformat(),
                 )
             )
+            cli_main.job_repository.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-cli",
+                    recorded_at=current_timestamp,
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": "prod",
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
 
             analytics_sink = StringIO()
             with redirect_stdout(analytics_sink):
@@ -558,6 +982,7 @@ class CliFlowTests(unittest.TestCase):
             cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
             cli_main.analytics_service = AnalyticsService(
                 job_repository=cli_main.job_repository,
+                default_environment_name=cli_main.settings.environment_name,
                 heartbeat_timeout_seconds=5,
                 default_thresholds=ControlPlaneAlertThresholds(
                     queue_warning_threshold=1,
@@ -610,6 +1035,24 @@ class CliFlowTests(unittest.TestCase):
                     status="queued",
                 )
             )
+            cli_main.job_repository.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-cli-alert",
+                    recorded_at=now,
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": cli_main.settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
 
             alert_sink = StringIO()
             with redirect_stdout(alert_sink):
@@ -622,192 +1065,104 @@ class CliFlowTests(unittest.TestCase):
             followup_sink = StringIO()
             with redirect_stdout(followup_sink):
                 self.assertEqual(cli_main.run_process_control_plane_alert_followups(force=True), 0)
-            followups = json.loads(followup_sink.getvalue())
-            self.assertGreaterEqual(followups["emitted_count"], 1)
 
-            ack_sink = StringIO()
-            with redirect_stdout(ack_sink):
+    def test_runtime_validation_review_cli_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli_main.settings = resolve_workspace_settings(tmpdir)
+            cli_main.settings.environment_name = "prod"
+            cli_main.job_repository = cli_main.JobRepository(cli_main.settings)
+            cli_main.analytics_service = AnalyticsService(
+                job_repository=cli_main.job_repository,
+                default_environment_name=cli_main.settings.environment_name,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(),
+            )
+            cli_main.control_plane_alert_service = ControlPlaneAlertService(
+                job_repository=cli_main.job_repository,
+                analytics_service=cli_main.analytics_service,
+                default_environment_name=cli_main.settings.environment_name,
+                window_days=7,
+            )
+            cli_main.job_service = cli_main.JobService(
+                job_repository=cli_main.job_repository,
+                audit_service=cli_main.audit_service,
+                trace_collection_service=cli_main.trace_collection_service,
+                worker_mode="standalone",
+                control_plane_alert_service=cli_main.control_plane_alert_service,
+                control_plane_alerts_enabled=True,
+            )
+            cli_main.runtime_validation_review_service = ControlPlaneRuntimeValidationReviewService(
+                settings=cli_main.settings,
+                job_service=cli_main.job_service,
+                job_repository=cli_main.job_repository,
+            )
+            cli_main.job_service.runtime_validation_review_service = cli_main.runtime_validation_review_service
+            cli_main.control_plane_alert_service.runtime_validation_review_service = (
+                cli_main.runtime_validation_review_service
+            )
+
+            cli_main.job_repository.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-cli-review-due-soon",
+                    recorded_at=(datetime.now(UTC) - timedelta(hours=20)).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": cli_main.settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+
+            process_sink = StringIO()
+            with redirect_stdout(process_sink):
                 self.assertEqual(
-                    cli_main.run_acknowledge_control_plane_alert(
-                        alert_id=alert_id,
-                        acknowledged_by="operator-cli",
-                        acknowledgement_note="Investigating",
+                    cli_main.run_process_control_plane_runtime_validation_reviews(
+                        changed_by="system",
+                        reason="review sweep",
+                        force=False,
                     ),
                     0,
                 )
-            acknowledged = json.loads(ack_sink.getvalue())
-            self.assertEqual(acknowledged["acknowledged_by"], "operator-cli")
+            opened = json.loads(process_sink.getvalue())
+            self.assertEqual(len(opened), 1)
+            review_id = opened[0]["review_id"]
 
-            silence_sink = StringIO()
-            with redirect_stdout(silence_sink):
+            assign_sink = StringIO()
+            with redirect_stdout(assign_sink):
                 self.assertEqual(
-                    cli_main.run_create_control_plane_alert_silence(
-                        created_by="operator-cli",
-                        reason="maintenance",
-                        duration_minutes=15,
-                        match_alert_key=None,
-                        match_finding_code="queue_without_active_workers",
-                    ),
-                    0,
-                )
-            silence = json.loads(silence_sink.getvalue())
-            self.assertEqual(silence["created_by"], "operator-cli")
-
-            silences_sink = StringIO()
-            with redirect_stdout(silences_sink):
-                self.assertEqual(cli_main.run_list_control_plane_alert_silences(active_only=True), 0)
-            silences = json.loads(silences_sink.getvalue())
-            self.assertGreaterEqual(len(silences), 1)
-
-            cancel_sink = StringIO()
-            with redirect_stdout(cancel_sink):
-                self.assertEqual(
-                    cli_main.run_cancel_control_plane_alert_silence(
-                        silence_id=silence["silence_id"],
-                        cancelled_by="operator-cli",
-                    ),
-                    0,
-                )
-            cancelled = json.loads(cancel_sink.getvalue())
-            self.assertEqual(cancelled["cancelled_by"], "operator-cli")
-
-            schedule_sink = StringIO()
-            today = datetime.now(UTC).date().isoformat()
-            with redirect_stdout(schedule_sink):
-                self.assertEqual(
-                    cli_main.run_create_control_plane_oncall_schedule(
-                        created_by="operator-cli",
-                        environment_name="prod",
-                        created_by_team=None,
-                        created_by_role=None,
-                        change_reason=None,
-                        approved_by=None,
-                        approved_by_team=None,
-                        approved_by_role=None,
-                        approval_note=None,
-                        team_name="platform-cli",
-                        timezone_name="UTC",
-                        weekdays=[0, 1, 2, 3, 4, 5, 6],
-                        start_time="00:00",
-                        end_time="23:59",
-                        priority=200,
-                        rotation_name="holiday",
-                        effective_start_date=today,
-                        effective_end_date=today,
-                        webhook_url=None,
-                        escalation_webhook_url=None,
-                    ),
-                    0,
-                )
-            schedule = json.loads(schedule_sink.getvalue())
-            self.assertEqual(schedule["team_name"], "platform-cli")
-            self.assertEqual(schedule["environment_name"], "prod")
-            self.assertEqual(schedule["priority"], 200)
-
-            schedules_sink = StringIO()
-            with redirect_stdout(schedules_sink):
-                self.assertEqual(cli_main.run_list_control_plane_oncall_schedules(active_only=True), 0)
-            schedules = json.loads(schedules_sink.getvalue())
-            self.assertGreaterEqual(len(schedules), 1)
-
-            preview_sink = StringIO()
-            with redirect_stdout(preview_sink):
-                self.assertEqual(
-                    cli_main.run_resolve_control_plane_oncall_route(
-                        at=f"{today}T12:00:00+00:00",
-                    ),
-                    0,
-                )
-            preview = json.loads(preview_sink.getvalue())
-            self.assertEqual(preview["resolved_route"]["team_name"], "platform-cli")
-            self.assertGreaterEqual(preview["active_candidate_count"], 1)
-
-            change_request_sink = StringIO()
-            with redirect_stdout(change_request_sink):
-                self.assertEqual(
-                    cli_main.run_submit_control_plane_oncall_change_request(
-                        created_by="operator-cli-2",
-                        environment_name="prod",
-                        created_by_team=None,
-                        created_by_role="engineer",
-                        change_reason="Need overlapping holiday backup coverage.",
-                        team_name="platform-cli-review",
-                        timezone_name="UTC",
-                        weekdays=[0, 1, 2, 3, 4, 5, 6],
-                        start_time="00:00",
-                        end_time="23:59",
-                        priority=200,
-                        rotation_name="holiday-review",
-                        effective_start_date=today,
-                        effective_end_date=today,
-                        webhook_url=None,
-                        escalation_webhook_url=None,
-                    ),
-                    0,
-                )
-            change_request = json.loads(change_request_sink.getvalue())
-            self.assertEqual(change_request["environment_name"], "prod")
-            self.assertEqual(change_request["status"], "pending_review")
-            self.assertTrue(change_request["review_required"])
-
-            change_requests_sink = StringIO()
-            with redirect_stdout(change_requests_sink):
-                self.assertEqual(
-                    cli_main.run_list_control_plane_oncall_change_requests(status="pending_review"),
-                    0,
-                )
-            listed_requests = json.loads(change_requests_sink.getvalue())
-            self.assertGreaterEqual(len(listed_requests), 1)
-
-            assigned_request_sink = StringIO()
-            with redirect_stdout(assigned_request_sink):
-                self.assertEqual(
-                    cli_main.run_assign_control_plane_oncall_change_request(
-                        request_id=change_request["request_id"],
-                        assigned_to="reviewer-cli",
+                    cli_main.run_assign_control_plane_runtime_validation_review(
+                        review_id=review_id,
+                        assigned_to="reviewer-prod",
                         assigned_to_team="platform",
-                        assigned_by="lead-cli",
-                        assignment_note="Own the holiday review.",
+                        assigned_by="system",
+                        assignment_note="Own the refresh",
                     ),
                     0,
                 )
-            assigned_request = json.loads(assigned_request_sink.getvalue())
-            self.assertEqual(assigned_request["assigned_to"], "reviewer-cli")
+            assigned = json.loads(assign_sink.getvalue())
+            self.assertEqual(assigned["assigned_to"], "reviewer-prod")
+            cli_main.settings.control_plane_alert_reminder_interval_seconds = 0.0
+            cli_main.settings.control_plane_alert_escalation_interval_seconds = 3600.0
 
-            reviewed_request_sink = StringIO()
-            with redirect_stdout(reviewed_request_sink):
-                self.assertEqual(
-                    cli_main.run_review_control_plane_oncall_change_request(
-                        request_id=change_request["request_id"],
-                        decision="approve",
-                        reviewed_by="director-cli",
-                        reviewed_by_team=None,
-                        reviewed_by_role="director",
-                        review_note="Approved in CLI workflow.",
-                    ),
-                    0,
-                )
-            reviewed_request = json.loads(reviewed_request_sink.getvalue())
-            self.assertEqual(reviewed_request["status"], "applied")
-            self.assertIsNotNone(reviewed_request["applied_schedule_id"])
-
-            cancel_schedule_sink = StringIO()
-            with redirect_stdout(cancel_schedule_sink):
-                self.assertEqual(
-                    cli_main.run_cancel_control_plane_oncall_schedule(
-                        schedule_id=schedule["schedule_id"],
-                        cancelled_by="operator-cli",
-                    ),
-                    0,
-                )
-            cancelled_schedule = json.loads(cancel_schedule_sink.getvalue())
-            self.assertEqual(cancelled_schedule["cancelled_by"], "operator-cli")
-
-            list_sink = StringIO()
-            with redirect_stdout(list_sink):
-                self.assertEqual(cli_main.run_list_control_plane_alerts(limit=10), 0)
-            listed = json.loads(list_sink.getvalue())
-            self.assertEqual(len(listed), 2)
+            alert_sink = StringIO()
+            with redirect_stdout(alert_sink):
+                self.assertEqual(cli_main.run_emit_control_plane_alerts(force=False), 0)
+            alert_payload = json.loads(alert_sink.getvalue())
+            self.assertGreaterEqual(alert_payload["emitted_count"], 1)
+            runtime_review_alerts = [
+                record
+                for record in alert_payload["alerts"]
+                if record["payload"].get("alert_family") == "runtime_validation_review"
+            ]
+            self.assertEqual(len(runtime_review_alerts), 1)
+            self.assertEqual(runtime_review_alerts[0]["status"], "degraded")
 
 
 if __name__ == "__main__":

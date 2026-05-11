@@ -6,10 +6,15 @@ import unittest
 
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
+from lsa.services.control_plane_runtime_validation_review_service import (
+    RuntimeValidationReviewAlertState,
+    RuntimeValidationReviewRequest,
+)
 from lsa.settings import resolve_workspace_settings
 from lsa.storage.files import JobRepository
 from lsa.storage.models import (
     ControlPlaneAlertRecord,
+    ControlPlaneMaintenanceEventRecord,
     ControlPlaneOnCallChangeRequestRecord,
     JobLeaseEventRecord,
     JobRecord,
@@ -18,6 +23,195 @@ from lsa.storage.models import (
 
 
 class ControlPlaneAlertServiceTests(unittest.TestCase):
+    def test_emit_alerts_emits_runtime_validation_review_chain_and_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            analytics_service = AnalyticsService(
+                job_repository=repo,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(),
+            )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current-review-alert",
+                    recorded_at=datetime.now(UTC).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+
+            class FakeRuntimeValidationReviewService:
+                def __init__(self, state):
+                    self.state = state
+
+                def build_alert_state(self, *, force: bool = False):
+                    return self.state
+
+            review = RuntimeValidationReviewRequest(
+                review_id="review-prod-1",
+                opened_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+                opened_by="system",
+                environment_name=settings.environment_name,
+                status="pending_review",
+                evidence_key="prod:evidence-1:due_soon",
+                trigger_status="passed",
+                trigger_cadence_status="due_soon",
+                summary="Runtime proof is approaching its warning threshold and should be refreshed.",
+            )
+            review_state = RuntimeValidationReviewAlertState(
+                review=review,
+                policy_source="defaults",
+                reminder_interval_seconds=60.0,
+                escalation_interval_seconds=120.0,
+                age_seconds=300.0,
+                status="critical",
+                severity="critical",
+                finding_codes=["runtime_validation_review_unassigned_overdue"],
+                summary="Runtime-proof review has been unassigned for 5 minutes and now requires escalation.",
+            )
+            review_service = FakeRuntimeValidationReviewService(review_state)
+            service = ControlPlaneAlertService(
+                job_repository=repo,
+                analytics_service=analytics_service,
+                window_days=7,
+                sink_path=str(Path(tmpdir) / "runtime-review-alerts.jsonl"),
+                runtime_validation_review_service=review_service,
+            )
+
+            emitted = service.emit_alerts(force=False)
+
+            self.assertEqual(len(emitted), 1)
+            self.assertEqual(emitted[0].payload["alert_family"], "runtime_validation_review")
+            self.assertEqual(emitted[0].status, "critical")
+            self.assertEqual(
+                emitted[0].finding_codes,
+                ["runtime_validation_review_unassigned_overdue"],
+            )
+
+            follow_ups = service.process_follow_ups(force=True)
+
+            self.assertEqual(len(follow_ups), 1)
+            self.assertEqual(follow_ups[0].payload["alert_family"], "runtime_validation_review")
+            self.assertEqual(follow_ups[0].payload["source_alert_id"], emitted[0].alert_id)
+
+            service.acknowledge_alert(
+                alert_id=emitted[0].alert_id,
+                acknowledged_by="operator-a",
+                acknowledgement_note="Owner found.",
+            )
+            self.assertEqual(service.process_follow_ups(force=True), [])
+
+            review_service.state = None
+            recovery = service.emit_alerts(force=True)
+
+            runtime_review_recovery = [
+                record
+                for record in recovery
+                if record.payload.get("alert_family") == "runtime_validation_review"
+            ]
+            self.assertEqual(len(runtime_review_recovery), 1)
+            self.assertEqual(runtime_review_recovery[0].status, "healthy")
+            self.assertEqual(runtime_review_recovery[0].payload["lifecycle_event"], "recovery")
+
+    def test_emit_alerts_emits_runtime_validation_chain_and_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            analytics_service = AnalyticsService(
+                job_repository=repo,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(
+                    runtime_rehearsal_due_soon_age_hours=1.0,
+                    runtime_rehearsal_warning_age_hours=2.0,
+                    runtime_rehearsal_critical_age_hours=6.0,
+                ),
+            )
+            service = ControlPlaneAlertService(
+                job_repository=repo,
+                analytics_service=analytics_service,
+                window_days=7,
+                sink_path=str(Path(tmpdir) / "runtime-validation.jsonl"),
+            )
+
+            stale_rehearsal_at = (datetime.now(UTC) - timedelta(minutes=90)).isoformat()
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-aging",
+                    recorded_at=stale_rehearsal_at,
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+
+            emitted = service.emit_alerts(force=True)
+
+            self.assertEqual(len(emitted), 2)
+            runtime_alert = next(
+                alert for alert in emitted if alert.alert_key.startswith("control-plane-runtime-validation:")
+            )
+            aggregate_alert = next(
+                alert for alert in emitted if not alert.alert_key.startswith("control-plane-runtime-validation:")
+            )
+            self.assertEqual(runtime_alert.status, "degraded")
+            self.assertEqual(runtime_alert.finding_codes, ["runtime_rehearsal_due_soon"])
+            self.assertEqual(runtime_alert.payload["alert_family"], "runtime_validation")
+            self.assertEqual(aggregate_alert.status, "degraded")
+            self.assertIn("runtime_rehearsal_due_soon", aggregate_alert.finding_codes)
+
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-fresh",
+                    recorded_at=datetime.now(UTC).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-b",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
+
+            recovered = service.emit_alerts(force=True)
+
+            self.assertEqual(len(recovered), 2)
+            runtime_recovery = next(
+                alert for alert in recovered if alert.alert_key.startswith("control-plane-runtime-validation:")
+            )
+            aggregate_recovery = next(
+                alert for alert in recovered if not alert.alert_key.startswith("control-plane-runtime-validation:")
+            )
+            self.assertEqual(runtime_recovery.status, "healthy")
+            self.assertEqual(runtime_recovery.payload["lifecycle_event"], "recovery")
+            self.assertEqual(aggregate_recovery.status, "healthy")
+            self.assertEqual(aggregate_recovery.payload["lifecycle_event"], "recovery")
+
     def test_emit_alerts_dedups_and_emits_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = resolve_workspace_settings(tmpdir)
@@ -47,6 +241,24 @@ class ControlPlaneAlertServiceTests(unittest.TestCase):
             )
 
             now = datetime.now(UTC).isoformat()
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current",
+                    recorded_at=now,
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
             repo.save_worker(
                 WorkerRecord(
                     worker_id="worker-stale",
@@ -187,6 +399,145 @@ class ControlPlaneAlertServiceTests(unittest.TestCase):
             no_escalation = service.process_follow_ups(force=True)
             self.assertEqual(no_escalation, [])
 
+    def test_follow_ups_emit_runtime_validation_reminder_alongside_aggregate_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            repo = JobRepository(settings)
+            analytics_service = AnalyticsService(
+                job_repository=repo,
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(),
+            )
+            service = ControlPlaneAlertService(
+                job_repository=repo,
+                analytics_service=analytics_service,
+                window_days=7,
+                dedup_window_seconds=10,
+                reminder_interval_seconds=60,
+                escalation_interval_seconds=120,
+                sink_path=str(Path(tmpdir) / "runtime-followups.jsonl"),
+            )
+            now = datetime.now(UTC)
+            runtime_incident = ControlPlaneAlertRecord(
+                alert_id="runtime-incident-root",
+                created_at=(now - timedelta(seconds=91)).isoformat(),
+                alert_key="control-plane-runtime-validation:degraded:runtime_rehearsal_due_soon",
+                status="degraded",
+                severity="warning",
+                summary="Control-plane runtime proof is approaching its warning threshold.",
+                finding_codes=["runtime_rehearsal_due_soon"],
+                delivery_state="delivered",
+                payload={
+                    "report": {},
+                    "runtime_validation": {},
+                    "alert_family": "runtime_validation",
+                    "lifecycle_event": "incident",
+                    "source_alert_id": None,
+                },
+                error=None,
+            )
+            aggregate_incident = ControlPlaneAlertRecord(
+                alert_id="aggregate-incident-root",
+                created_at=(now - timedelta(seconds=90)).isoformat(),
+                alert_key="control-plane:degraded:oncall_pending_reviews_stale",
+                status="degraded",
+                severity="warning",
+                summary="Pending on-call change reviews are older than the configured SLA.",
+                finding_codes=["oncall_pending_reviews_stale"],
+                delivery_state="delivered",
+                payload={"report": {}, "lifecycle_event": "incident", "source_alert_id": None},
+                error=None,
+            )
+            repo.append_control_plane_alert(runtime_incident)
+            repo.append_control_plane_alert(aggregate_incident)
+
+            reminders = service.process_follow_ups(force=False)
+
+            self.assertEqual(len(reminders), 2)
+            source_alert_ids = {alert.payload["source_alert_id"] for alert in reminders}
+            self.assertEqual(source_alert_ids, {"runtime-incident-root", "aggregate-incident-root"})
+            self.assertTrue(
+                any(alert.alert_key.startswith("control-plane-runtime-validation:") for alert in reminders)
+            )
+
+    def test_runtime_validation_follow_ups_use_environment_policy_intervals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = resolve_workspace_settings(tmpdir)
+            settings.environment_name = "prod"
+            settings.runtime_validation_policy_path.parent.mkdir(parents=True, exist_ok=True)
+            settings.runtime_validation_policy_path.write_text(
+                json.dumps(
+                    {
+                        "environments": {
+                            "prod": {
+                                "reminder_interval_seconds": 30.0,
+                                "escalation_interval_seconds": 60.0,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = JobRepository(settings)
+            analytics_service = AnalyticsService(
+                job_repository=repo,
+                default_environment_name="prod",
+                heartbeat_timeout_seconds=5,
+                default_thresholds=ControlPlaneAlertThresholds(),
+                runtime_validation_policy_path=str(settings.runtime_validation_policy_path),
+                runtime_validation_reminder_interval_seconds=900.0,
+                runtime_validation_escalation_interval_seconds=1800.0,
+            )
+            service = ControlPlaneAlertService(
+                job_repository=repo,
+                analytics_service=analytics_service,
+                default_environment_name="prod",
+                window_days=7,
+                reminder_interval_seconds=900.0,
+                escalation_interval_seconds=1800.0,
+                runtime_validation_policy_path=str(settings.runtime_validation_policy_path),
+                sink_path=str(Path(tmpdir) / "runtime-policy-followups.jsonl"),
+            )
+            now = datetime.now(UTC)
+            runtime_incident = ControlPlaneAlertRecord(
+                alert_id="runtime-policy-root",
+                created_at=(now - timedelta(seconds=40)).isoformat(),
+                alert_key="control-plane-runtime-validation:degraded:runtime_rehearsal_due_soon",
+                status="degraded",
+                severity="warning",
+                summary="Control-plane runtime proof is approaching its warning threshold.",
+                finding_codes=["runtime_rehearsal_due_soon"],
+                delivery_state="delivered",
+                payload={
+                    "report": {},
+                    "runtime_validation": {"environment_name": "prod"},
+                    "alert_family": "runtime_validation",
+                    "lifecycle_event": "incident",
+                    "source_alert_id": None,
+                },
+                error=None,
+            )
+            aggregate_incident = ControlPlaneAlertRecord(
+                alert_id="aggregate-policy-root",
+                created_at=(now - timedelta(seconds=40)).isoformat(),
+                alert_key="control-plane:degraded:oncall_pending_reviews_stale",
+                status="degraded",
+                severity="warning",
+                summary="Pending on-call change reviews are older than the configured SLA.",
+                finding_codes=["oncall_pending_reviews_stale"],
+                delivery_state="delivered",
+                payload={"report": {}, "lifecycle_event": "incident", "source_alert_id": None},
+                error=None,
+            )
+            repo.append_control_plane_alert(runtime_incident)
+            repo.append_control_plane_alert(aggregate_incident)
+
+            reminders = service.process_follow_ups(force=False)
+
+            self.assertEqual(len(reminders), 1)
+            self.assertEqual(reminders[0].payload["source_alert_id"], "runtime-policy-root")
+            self.assertTrue(reminders[0].alert_key.startswith("control-plane-runtime-validation:"))
+
     def test_emit_alert_uses_active_oncall_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = resolve_workspace_settings(tmpdir)
@@ -229,6 +580,24 @@ class ControlPlaneAlertServiceTests(unittest.TestCase):
                     created_at=now_utc.isoformat(),
                     job_type="audit-trace",
                     status="queued",
+                )
+            )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-routed",
+                    recorded_at=now_utc.isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
                 )
             )
             emitted = service.emit_alerts(force=True)
@@ -331,6 +700,24 @@ class ControlPlaneAlertServiceTests(unittest.TestCase):
                 priority=100,
                 rotation_name="primary-b",
             )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current",
+                    recorded_at=datetime.now(UTC).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": settings.environment_name,
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
+                )
+            )
 
             emitted = service.emit_alerts(force=True)
 
@@ -376,6 +763,24 @@ class ControlPlaneAlertServiceTests(unittest.TestCase):
                     end_time="23:59",
                     priority=100,
                     rotation_name="primary-a",
+                )
+            )
+            repo.append_control_plane_maintenance_event(
+                ControlPlaneMaintenanceEventRecord(
+                    event_id="runtime-rehearsal-current",
+                    recorded_at=datetime.now(UTC).isoformat(),
+                    event_type="control_plane_runtime_rehearsal_executed",
+                    changed_by="operator-a",
+                    details={
+                        "environment_name": "prod",
+                        "status": "passed",
+                        "expected_backend": "sqlite",
+                        "expected_repository_layout": "shared",
+                        "database_backend": "sqlite",
+                        "repository_layout": "shared",
+                        "mixed_backends": False,
+                        "checks": {"smoke_job_round_trip_ok": True},
+                    },
                 )
             )
 

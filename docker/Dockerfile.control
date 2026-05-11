@@ -4,6 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+ARG LSA_PIP_INSTALL_EXTRAS=""
+
 WORKDIR /app
 
 RUN useradd --create-home --shell /usr/sbin/nologin lsa
@@ -12,7 +14,12 @@ COPY pyproject.toml README.md /app/
 COPY lsa /app/lsa
 COPY ebpf /app/ebpf
 
-RUN pip install --upgrade pip && pip install -e .
+RUN pip install --upgrade pip && \
+    if [ -n "$LSA_PIP_INSTALL_EXTRAS" ]; then \
+      pip install -e ".[${LSA_PIP_INSTALL_EXTRAS}]"; \
+    else \
+      pip install -e .; \
+    fi
 RUN mkdir -p /app/data && chown -R lsa:lsa /app
 
 USER lsa

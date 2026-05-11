@@ -1,14 +1,37 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lsa_prod}
+      POSTGRES_USER: ${POSTGRES_USER:-lsa}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-production}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lsa} -d ${POSTGRES_DB:-lsa_prod}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - lsa_postgres_data:/var/lib/postgresql/data
+
   api:
     build:
       context: ..
       dockerfile: docker/Dockerfile.control
+      args:
+        LSA_PIP_INSTALL_EXTRAS: ${LSA_PIP_INSTALL_EXTRAS:-}
     command: ["uvicorn", "lsa.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       LSA_API_KEY: ${LSA_API_KEY:-change-me-in-production}
       LSA_ENVIRONMENT_NAME: ${LSA_ENVIRONMENT_NAME:-prod}
       LSA_RUN_EMBEDDED_WORKER: "0"
       LSA_DATABASE_URL: ${LSA_DATABASE_URL:-sqlite:////app/data/control_plane.db}
+      LSA_ENABLE_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS: ${LSA_ENABLE_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS:-0}
+      LSA_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS_DATABASE_URL: ${LSA_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS_DATABASE_URL:-}
+      LSA_ENABLE_POSTGRES_RUNTIME_JOBS: ${LSA_ENABLE_POSTGRES_RUNTIME_JOBS:-0}
+      LSA_POSTGRES_RUNTIME_JOBS_DATABASE_URL: ${LSA_POSTGRES_RUNTIME_JOBS_DATABASE_URL:-}
       LSA_SQLITE_BUSY_TIMEOUT_MS: ${LSA_SQLITE_BUSY_TIMEOUT_MS:-5000}
       LSA_CONTROL_PLANE_ALERTS_ENABLED: ${LSA_CONTROL_PLANE_ALERTS_ENABLED:-1}
     volumes:
@@ -25,12 +48,18 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.control
+      args:
+        LSA_PIP_INSTALL_EXTRAS: ${LSA_PIP_INSTALL_EXTRAS:-}
     command: ["lsa", "worker", "--poll-interval", "0.25"]
     environment:
       LSA_API_KEY: ${LSA_API_KEY:-change-me-in-production}
       LSA_ENVIRONMENT_NAME: ${LSA_ENVIRONMENT_NAME:-prod}
       LSA_RUN_EMBEDDED_WORKER: "0"
       LSA_DATABASE_URL: ${LSA_DATABASE_URL:-sqlite:////app/data/control_plane.db}
+      LSA_ENABLE_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS: ${LSA_ENABLE_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS:-0}
+      LSA_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS_DATABASE_URL: ${LSA_POSTGRES_RUNTIME_SNAPSHOTS_AUDITS_DATABASE_URL:-}
+      LSA_ENABLE_POSTGRES_RUNTIME_JOBS: ${LSA_ENABLE_POSTGRES_RUNTIME_JOBS:-0}
+      LSA_POSTGRES_RUNTIME_JOBS_DATABASE_URL: ${LSA_POSTGRES_RUNTIME_JOBS_DATABASE_URL:-}
       LSA_SQLITE_BUSY_TIMEOUT_MS: ${LSA_SQLITE_BUSY_TIMEOUT_MS:-5000}
       LSA_CONTROL_PLANE_ALERTS_ENABLED: ${LSA_CONTROL_PLANE_ALERTS_ENABLED:-1}
     volumes:
@@ -41,3 +70,4 @@ services:
 
 volumes:
   lsa_data:
+  lsa_postgres_data:

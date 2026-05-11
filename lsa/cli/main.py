@@ -16,19 +16,36 @@ from lsa.services.audit_service import AuditService
 from lsa.services.analytics_service import AnalyticsService, ControlPlaneAlertThresholds
 from lsa.services.control_plane_alert_service import ControlPlaneAlertService
 from lsa.services.control_plane_backup_service import ControlPlaneBackupService
+from lsa.services.control_plane_cutover_promotion_service import ControlPlaneCutoverPromotionService
+from lsa.services.control_plane_cutover_service import ControlPlaneCutoverService
+from lsa.services.control_plane_cutover_readiness_service import ControlPlaneCutoverReadinessService
+from lsa.services.control_plane_maintenance_service import ControlPlaneMaintenanceService
+from lsa.services.control_plane_runtime_rehearsal_service import ControlPlaneRuntimeRehearsalService
+from lsa.services.control_plane_runtime_smoke_service import ControlPlaneRuntimeSmokeService
+from lsa.services.control_plane_runtime_validation_service import ControlPlaneRuntimeValidationService
+from lsa.services.control_plane_runtime_validation_review_service import (
+    ControlPlaneRuntimeValidationReviewService,
+)
 from lsa.services.ingest_service import IngestService
 from lsa.services.job_service import JobService
 from lsa.services.metrics_service import ControlPlaneMetricsService
+from lsa.services.postgres_bootstrap_service import PostgresBootstrapService
+from lsa.services.postgres_cutover_rehearsal_service import PostgresCutoverRehearsalService
+from lsa.services.postgres_runtime_shadow_service import PostgresRuntimeShadowService
+from lsa.services.postgres_target_service import PostgresTargetService
+from lsa.services.runtime_validation_policy import RuntimeValidationPolicy, load_runtime_validation_policy_bundle
 from lsa.services.trace_collection_service import TraceCollectionRequest, TraceCollectionService
 from lsa.settings import resolve_workspace_settings
-from lsa.storage.files import AuditRepository, JobRepository, SnapshotRepository
+from lsa.storage.database import inspect_database_runtime_support
+from lsa.storage.files import AuditRepository, JobRepository, SnapshotRepository, build_control_plane_runtime_bundle
 
 
 settings = resolve_workspace_settings()
 graph = IntentGraph()
-snapshot_repository = SnapshotRepository(settings, graph=graph)
-audit_repository = AuditRepository(settings)
-job_repository = JobRepository(settings)
+runtime_bundle = build_control_plane_runtime_bundle(settings, graph=graph)
+snapshot_repository = runtime_bundle.snapshot_repository
+audit_repository = runtime_bundle.audit_repository
+job_repository = runtime_bundle.job_repository
 ingest_service = IngestService(graph=graph, snapshot_repository=snapshot_repository)
 audit_service = AuditService(
     graph=graph,
@@ -58,7 +75,13 @@ analytics_service = AnalyticsService(
         oncall_pending_review_warning_threshold=settings.analytics_oncall_pending_review_warning_threshold,
         oncall_pending_review_critical_threshold=settings.analytics_oncall_pending_review_critical_threshold,
         oncall_pending_review_sla_hours=settings.analytics_oncall_pending_review_sla_hours,
+        runtime_rehearsal_due_soon_age_hours=settings.analytics_runtime_rehearsal_due_soon_age_hours,
+        runtime_rehearsal_warning_age_hours=settings.analytics_runtime_rehearsal_warning_age_hours,
+        runtime_rehearsal_critical_age_hours=settings.analytics_runtime_rehearsal_critical_age_hours,
     ),
+    runtime_validation_policy_path=str(settings.runtime_validation_policy_path),
+    runtime_validation_reminder_interval_seconds=settings.control_plane_alert_reminder_interval_seconds,
+    runtime_validation_escalation_interval_seconds=settings.control_plane_alert_escalation_interval_seconds,
 )
 control_plane_alert_service = ControlPlaneAlertService(
     job_repository=job_repository,
@@ -69,6 +92,7 @@ control_plane_alert_service = ControlPlaneAlertService(
     reminder_interval_seconds=settings.control_plane_alert_reminder_interval_seconds,
     escalation_interval_seconds=settings.control_plane_alert_escalation_interval_seconds,
     policy_path=str(settings.oncall_policy_path),
+    runtime_validation_policy_path=str(settings.runtime_validation_policy_path),
     required_approver_roles=settings.oncall_approval_required_roles,
     allow_self_approval=settings.oncall_allow_self_approval,
     sink_path=str(settings.control_plane_alert_sink_path),
@@ -94,6 +118,13 @@ job_service = JobService(
     control_plane_alert_interval_seconds=settings.control_plane_alert_interval_seconds,
     control_plane_alerts_enabled=settings.control_plane_alerts_enabled,
 )
+runtime_validation_review_service = ControlPlaneRuntimeValidationReviewService(
+    settings=settings,
+    job_service=job_service,
+    job_repository=job_repository,
+)
+job_service.runtime_validation_review_service = runtime_validation_review_service
+control_plane_alert_service.runtime_validation_review_service = runtime_validation_review_service
 metrics_service = ControlPlaneMetricsService(
     job_repository=job_repository,
     job_service=job_service,
@@ -101,6 +132,102 @@ metrics_service = ControlPlaneMetricsService(
     environment_name=settings.environment_name,
     worker_mode="standalone",
 )
+control_plane_maintenance_service = ControlPlaneMaintenanceService(
+    settings=settings,
+    job_repository=job_repository,
+    job_service=job_service,
+    backup_service=control_plane_backup_service,
+    worker_mode="standalone",
+)
+control_plane_cutover_service = ControlPlaneCutoverService(
+    settings=settings,
+    maintenance_service=control_plane_maintenance_service,
+)
+postgres_bootstrap_service = PostgresBootstrapService()
+postgres_target_service = PostgresTargetService(bootstrap_service=postgres_bootstrap_service)
+def _postgres_cutover_rehearsal_service() -> PostgresCutoverRehearsalService:
+    return PostgresCutoverRehearsalService(
+        job_service=job_service,
+        bootstrap_service=postgres_bootstrap_service,
+        target_service=postgres_target_service,
+    )
+
+
+def _control_plane_cutover_readiness_service() -> ControlPlaneCutoverReadinessService:
+    return ControlPlaneCutoverReadinessService(
+        settings=settings,
+        job_repository=job_repository,
+        bootstrap_service=postgres_bootstrap_service,
+    )
+
+
+def _control_plane_cutover_promotion_service() -> ControlPlaneCutoverPromotionService:
+    return ControlPlaneCutoverPromotionService(
+        settings=settings,
+        job_service=job_service,
+        readiness_service=_control_plane_cutover_readiness_service(),
+    )
+
+
+def _postgres_runtime_shadow_service() -> PostgresRuntimeShadowService:
+    return PostgresRuntimeShadowService(
+        settings=settings,
+        source_job_repository=job_repository,
+    )
+
+
+def _control_plane_runtime_smoke_service() -> ControlPlaneRuntimeSmokeService:
+    snapshot_backend = str(snapshot_repository.database.config.backend)
+    audit_backend = str(audit_repository.database.config.backend)
+    job_backend = str(job_repository.database.config.backend)
+    backends = {snapshot_backend, audit_backend, job_backend}
+    return ControlPlaneRuntimeSmokeService(
+        settings=settings,
+        snapshot_repository=snapshot_repository,
+        audit_repository=audit_repository,
+        job_repository=job_repository,
+        job_service=job_service,
+        repository_layout="mixed" if len(backends) > 1 else "shared",
+        mixed_backends=len(backends) > 1,
+        now_factory=lambda: datetime.now().astimezone().isoformat(),
+    )
+
+
+def _control_plane_runtime_rehearsal_service() -> ControlPlaneRuntimeRehearsalService:
+    return ControlPlaneRuntimeRehearsalService(
+        settings=settings,
+        job_repository=job_repository,
+        job_service=job_service,
+        runtime_smoke_service=_control_plane_runtime_smoke_service(),
+        now_factory=lambda: datetime.now().astimezone().isoformat(),
+    )
+
+
+def _control_plane_runtime_validation_service() -> ControlPlaneRuntimeValidationService:
+    runtime_policy_bundle = load_runtime_validation_policy_bundle(settings.runtime_validation_policy_path)
+    runtime_policy = runtime_policy_bundle.resolve(
+        environment_name=settings.environment_name,
+        fallback=RuntimeValidationPolicy(
+            due_soon_age_hours=settings.analytics_runtime_rehearsal_due_soon_age_hours,
+            warning_age_hours=settings.analytics_runtime_rehearsal_warning_age_hours,
+            critical_age_hours=settings.analytics_runtime_rehearsal_critical_age_hours,
+            reminder_interval_seconds=settings.control_plane_alert_reminder_interval_seconds,
+            escalation_interval_seconds=settings.control_plane_alert_escalation_interval_seconds,
+        ),
+    )
+    return ControlPlaneRuntimeValidationService(
+        job_repository=job_repository,
+        environment_name=settings.environment_name,
+        due_soon_age_hours=runtime_policy.due_soon_age_hours
+        or settings.analytics_runtime_rehearsal_due_soon_age_hours,
+        warning_age_hours=runtime_policy.warning_age_hours
+        or settings.analytics_runtime_rehearsal_warning_age_hours,
+        critical_age_hours=runtime_policy.critical_age_hours
+        or settings.analytics_runtime_rehearsal_critical_age_hours,
+        policy_source=runtime_policy_bundle.source_for(environment_name=settings.environment_name),
+        reminder_interval_seconds=runtime_policy.reminder_interval_seconds,
+        escalation_interval_seconds=runtime_policy.escalation_interval_seconds,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -197,6 +324,149 @@ def build_parser() -> argparse.ArgumentParser:
         "control-plane-maintenance-mode",
         help="Show the current control-plane maintenance mode state.",
     )
+    subparsers.add_parser(
+        "control-plane-preflight",
+        help="Show a guarded preflight report for control-plane maintenance work.",
+    )
+    control_plane_runtime_smoke = subparsers.add_parser(
+        "run-control-plane-runtime-smoke",
+        help="Exercise snapshot, audit, and job persistence against the live control-plane runtime backend.",
+    )
+    control_plane_runtime_smoke.add_argument("--by", required=True)
+    control_plane_runtime_smoke.add_argument("--reason", default=None)
+    control_plane_runtime_smoke.add_argument("--keep-artifacts", action="store_true")
+    control_plane_runtime_rehearsal = subparsers.add_parser(
+        "run-control-plane-runtime-rehearsal",
+        help="Verify that the live control-plane runtime matches the expected backend/layout and passes a smoke check.",
+    )
+    control_plane_runtime_rehearsal.add_argument("--by", required=True)
+    control_plane_runtime_rehearsal.add_argument("--expected-backend", default="postgres")
+    control_plane_runtime_rehearsal.add_argument("--expected-layout", default="shared")
+    control_plane_runtime_rehearsal.add_argument("--reason", default=None)
+    control_plane_runtime_rehearsal.add_argument("--keep-artifacts", action="store_true")
+    subparsers.add_parser(
+        "control-plane-runtime-validation",
+        help="Show the latest runtime rehearsal evidence and whether it is missing, stale, failed, or healthy.",
+    )
+    list_runtime_validation_reviews = subparsers.add_parser(
+        "list-control-plane-runtime-validation-reviews",
+        help="List runtime-validation review requests derived from maintenance history.",
+    )
+    list_runtime_validation_reviews.add_argument("--status", default=None)
+    process_runtime_validation_reviews = subparsers.add_parser(
+        "process-control-plane-runtime-validation-reviews",
+        help="Open or auto-resolve runtime-validation review requests for the active environment.",
+    )
+    process_runtime_validation_reviews.add_argument("--by", default="system")
+    process_runtime_validation_reviews.add_argument("--reason", default=None)
+    process_runtime_validation_reviews.add_argument("--force", action="store_true")
+    assign_runtime_validation_review = subparsers.add_parser(
+        "assign-control-plane-runtime-validation-review",
+        help="Assign an active runtime-validation review request to an owner.",
+    )
+    assign_runtime_validation_review.add_argument("review_id")
+    assign_runtime_validation_review.add_argument("--assigned-to", required=True)
+    assign_runtime_validation_review.add_argument("--assigned-team", default=None)
+    assign_runtime_validation_review.add_argument("--by", required=True)
+    assign_runtime_validation_review.add_argument("--note", default=None)
+    resolve_runtime_validation_review = subparsers.add_parser(
+        "resolve-control-plane-runtime-validation-review",
+        help="Resolve an active runtime-validation review request.",
+    )
+    resolve_runtime_validation_review.add_argument("review_id")
+    resolve_runtime_validation_review.add_argument("--by", required=True)
+    resolve_runtime_validation_review.add_argument("--reason", default="manual_resolution")
+    resolve_runtime_validation_review.add_argument("--note", default=None)
+    subparsers.add_parser(
+        "control-plane-runtime-backend",
+        help="Show runtime backend activation support for the current control-plane database.",
+    )
+    inspect_control_plane_runtime_backend = subparsers.add_parser(
+        "inspect-control-plane-runtime-backend",
+        help="Inspect runtime backend activation support for an arbitrary database URL.",
+    )
+    inspect_control_plane_runtime_backend.add_argument("--database-url", required=True)
+    sync_postgres_runtime_shadow = subparsers.add_parser(
+        "sync-postgres-runtime-shadow",
+        help="Shadow-sync maintenance metadata and maintenance events into a Postgres runtime target.",
+    )
+    sync_postgres_runtime_shadow.add_argument("--target-database-url", required=True)
+    sync_postgres_runtime_shadow.add_argument("--by", required=True)
+    sync_postgres_runtime_shadow.add_argument("--reason", default=None)
+    control_plane_cutover_preflight = subparsers.add_parser(
+        "control-plane-cutover-preflight",
+        help="Validate a target database URL and show the guarded cutover preflight.",
+    )
+    control_plane_cutover_preflight.add_argument("--target-database-url", required=True)
+    inspect_postgres_bootstrap_package = subparsers.add_parser(
+        "inspect-postgres-bootstrap-package",
+        help="Inspect and verify a generated Postgres bootstrap package.",
+    )
+    inspect_postgres_bootstrap_package.add_argument("--package-dir", required=True)
+    inspect_postgres_target = subparsers.add_parser(
+        "inspect-postgres-target",
+        help="Inspect a live Postgres target database against the shared control-plane schema contract.",
+    )
+    inspect_postgres_target.add_argument("--target-database-url", required=True)
+    inspect_postgres_target.add_argument("--psql-executable", default="psql")
+    plan_postgres_bootstrap_execution = subparsers.add_parser(
+        "plan-postgres-bootstrap-execution",
+        help="Build the execution plan for applying a Postgres bootstrap package.",
+    )
+    plan_postgres_bootstrap_execution.add_argument("--package-dir", required=True)
+    plan_postgres_bootstrap_execution.add_argument("--target-database-url", required=True)
+    plan_postgres_bootstrap_execution.add_argument("--artifact-target-root", default=None)
+    plan_postgres_bootstrap_execution.add_argument("--psql-executable", default="psql")
+    execute_postgres_bootstrap_package = subparsers.add_parser(
+        "execute-postgres-bootstrap-package",
+        help="Apply a Postgres bootstrap package or run it in dry-run mode.",
+    )
+    execute_postgres_bootstrap_package.add_argument("--package-dir", required=True)
+    execute_postgres_bootstrap_package.add_argument("--target-database-url", required=True)
+    execute_postgres_bootstrap_package.add_argument("--artifact-target-root", default=None)
+    execute_postgres_bootstrap_package.add_argument("--psql-executable", default="psql")
+    execute_postgres_bootstrap_package.add_argument("--dry-run", action="store_true")
+    verify_postgres_bootstrap_package = subparsers.add_parser(
+        "verify-postgres-bootstrap-package",
+        help="Verify a Postgres bootstrap package against a live Postgres target database.",
+    )
+    verify_postgres_bootstrap_package.add_argument("--package-dir", required=True)
+    verify_postgres_bootstrap_package.add_argument("--target-database-url", required=True)
+    verify_postgres_bootstrap_package.add_argument("--psql-executable", default="psql")
+    run_postgres_cutover_rehearsal = subparsers.add_parser(
+        "run-postgres-cutover-rehearsal",
+        help="Run an audited dry-run or apply-and-verify rehearsal for a Postgres cutover package.",
+    )
+    run_postgres_cutover_rehearsal.add_argument("--package-dir", required=True)
+    run_postgres_cutover_rehearsal.add_argument("--target-database-url", required=True)
+    run_postgres_cutover_rehearsal.add_argument("--by", required=True)
+    run_postgres_cutover_rehearsal.add_argument("--reason", default=None)
+    run_postgres_cutover_rehearsal.add_argument("--psql-executable", default="psql")
+    run_postgres_cutover_rehearsal.add_argument("--artifact-target-root", default=None)
+    run_postgres_cutover_rehearsal.add_argument("--apply-to-target", action="store_true")
+    evaluate_control_plane_cutover_readiness = subparsers.add_parser(
+        "evaluate-control-plane-cutover-readiness",
+        help="Evaluate whether a cutover bundle and its rehearsals are ready for promotion.",
+    )
+    evaluate_control_plane_cutover_readiness.add_argument("--package-dir", required=True)
+    evaluate_control_plane_cutover_readiness.add_argument("--target-database-url", required=True)
+    evaluate_control_plane_cutover_readiness.add_argument("--rehearsal-max-age-hours", type=float, default=24.0)
+    evaluate_control_plane_cutover_readiness.add_argument("--require-apply-rehearsal", action="store_true")
+    evaluate_control_plane_cutover_readiness.add_argument("--skip-runtime-validation", action="store_true")
+    decide_control_plane_cutover = subparsers.add_parser(
+        "decide-control-plane-cutover",
+        help="Record an audited approval, rejection, block, or override decision for a cutover package.",
+    )
+    decide_control_plane_cutover.add_argument("--package-dir", required=True)
+    decide_control_plane_cutover.add_argument("--target-database-url", required=True)
+    decide_control_plane_cutover.add_argument("--by", required=True)
+    decide_control_plane_cutover.add_argument("--decision", choices=["approve", "reject"], default="approve")
+    decide_control_plane_cutover.add_argument("--reason", default=None)
+    decide_control_plane_cutover.add_argument("--note", default=None)
+    decide_control_plane_cutover.add_argument("--rehearsal-max-age-hours", type=float, default=24.0)
+    decide_control_plane_cutover.add_argument("--require-apply-rehearsal", action="store_true")
+    decide_control_plane_cutover.add_argument("--skip-runtime-validation", action="store_true")
+    decide_control_plane_cutover.add_argument("--allow-override", action="store_true")
     list_control_plane_maintenance_events = subparsers.add_parser(
         "list-control-plane-maintenance-events",
         help="List persisted control-plane maintenance events.",
@@ -214,6 +484,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     disable_control_plane_maintenance_mode.add_argument("--by", required=True)
     disable_control_plane_maintenance_mode.add_argument("--reason", default=None)
+    run_control_plane_maintenance_workflow = subparsers.add_parser(
+        "run-control-plane-maintenance-workflow",
+        help="Run the guarded control-plane maintenance workflow.",
+    )
+    run_control_plane_maintenance_workflow.add_argument("--out", required=True)
+    run_control_plane_maintenance_workflow.add_argument("--by", required=True)
+    run_control_plane_maintenance_workflow.add_argument("--reason", default=None)
+    run_control_plane_maintenance_workflow.add_argument("--allow-running-jobs", action="store_true")
+    run_control_plane_maintenance_workflow.add_argument("--keep-maintenance-enabled", action="store_true")
+    prepare_control_plane_cutover_bundle = subparsers.add_parser(
+        "prepare-control-plane-cutover-bundle",
+        help="Run the maintenance workflow and write a cutover bundle for a target database.",
+    )
+    prepare_control_plane_cutover_bundle.add_argument("--out", required=True)
+    prepare_control_plane_cutover_bundle.add_argument("--target-database-url", required=True)
+    prepare_control_plane_cutover_bundle.add_argument("--by", required=True)
+    prepare_control_plane_cutover_bundle.add_argument("--reason", default=None)
+    prepare_control_plane_cutover_bundle.add_argument("--allow-running-jobs", action="store_true")
+    prepare_control_plane_cutover_bundle.add_argument("--keep-maintenance-enabled", action="store_true")
     emit_control_plane_alerts = subparsers.add_parser(
         "emit-control-plane-alerts",
         help="Force emission of current control-plane alerts through configured targets.",
@@ -343,6 +632,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "control-plane-schema",
         help="Show the current control-plane schema version and applied migrations.",
+    )
+    subparsers.add_parser(
+        "control-plane-schema-contract",
+        help="Show the shared control-plane schema contract for runtime and cutover tooling.",
     )
     subparsers.add_parser(
         "migrate-control-plane-schema",
@@ -574,6 +867,11 @@ def run_control_plane_schema() -> int:
     return 0
 
 
+def run_control_plane_schema_contract() -> int:
+    print(json.dumps(job_repository.schema_contract(), indent=2))
+    return 0
+
+
 def run_migrate_control_plane_schema() -> int:
     print(json.dumps(job_repository.migrate_schema(), indent=2))
     return 0
@@ -607,6 +905,321 @@ def run_control_plane_maintenance_mode() -> int:
     return 0
 
 
+def run_control_plane_preflight() -> int:
+    print(json.dumps(control_plane_maintenance_service.build_preflight().to_dict(), indent=2))
+    return 0
+
+
+def run_control_plane_runtime_smoke(*, changed_by: str, reason: str | None, cleanup: bool) -> int:
+    print(
+        json.dumps(
+            _control_plane_runtime_smoke_service().run(
+                changed_by=changed_by,
+                reason=reason,
+                cleanup=cleanup,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_control_plane_runtime_rehearsal(
+    *,
+    changed_by: str,
+    expected_backend: str,
+    expected_repository_layout: str,
+    reason: str | None,
+    cleanup: bool,
+) -> int:
+    print(
+        json.dumps(
+            _control_plane_runtime_rehearsal_service().run(
+                changed_by=changed_by,
+                expected_backend=expected_backend,
+                expected_repository_layout=expected_repository_layout,
+                reason=reason,
+                cleanup=cleanup,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_control_plane_runtime_validation() -> int:
+    print(json.dumps(_control_plane_runtime_validation_service().build_summary().to_dict(), indent=2))
+    return 0
+
+
+def run_list_control_plane_runtime_validation_reviews(*, status: str | None) -> int:
+    print(json.dumps([record.to_dict() for record in job_service.list_runtime_validation_reviews(status=status)], indent=2))
+    return 0
+
+
+def run_process_control_plane_runtime_validation_reviews(
+    *,
+    changed_by: str,
+    reason: str | None,
+    force: bool,
+) -> int:
+    records = job_service.process_runtime_validation_reviews(
+        changed_by=changed_by,
+        reason=reason,
+        force=force,
+    )
+    print(json.dumps([record.to_dict() for record in records], indent=2))
+    return 0
+
+
+def run_assign_control_plane_runtime_validation_review(
+    *,
+    review_id: str,
+    assigned_to: str,
+    assigned_to_team: str | None,
+    assigned_by: str,
+    assignment_note: str | None,
+) -> int:
+    record = job_service.assign_runtime_validation_review(
+        review_id=review_id,
+        assigned_to=assigned_to,
+        assigned_to_team=assigned_to_team,
+        assigned_by=assigned_by,
+        assignment_note=assignment_note,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_resolve_control_plane_runtime_validation_review(
+    *,
+    review_id: str,
+    resolved_by: str,
+    resolution_reason: str,
+    resolution_note: str | None,
+) -> int:
+    record = job_service.resolve_runtime_validation_review(
+        review_id=review_id,
+        resolved_by=resolved_by,
+        resolution_note=resolution_note,
+        resolution_reason=resolution_reason,
+    )
+    print(json.dumps(record.to_dict(), indent=2))
+    return 0
+
+
+def run_control_plane_runtime_backend() -> int:
+    print(json.dumps(job_repository.database_status(), indent=2))
+    return 0
+
+
+def run_inspect_control_plane_runtime_backend(*, database_url: str) -> int:
+    print(
+        json.dumps(
+            inspect_database_runtime_support(
+                root_dir=settings.root_dir,
+                default_path=settings.database_path,
+                raw_url=database_url,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_sync_postgres_runtime_shadow(
+    *,
+    target_database_url: str,
+    changed_by: str,
+    reason: str | None,
+) -> int:
+    print(
+        json.dumps(
+            _postgres_runtime_shadow_service().sync_control_plane_slice(
+                target_database_url=target_database_url,
+                changed_by=changed_by,
+                reason=reason,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_control_plane_cutover_preflight(*, target_database_url: str) -> int:
+    print(
+        json.dumps(
+            control_plane_cutover_service.build_preflight(target_database_url=target_database_url).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_inspect_postgres_bootstrap_package(*, package_dir: str) -> int:
+    print(json.dumps(postgres_bootstrap_service.inspect_package(package_dir=package_dir).to_dict(), indent=2))
+    return 0
+
+
+def run_inspect_postgres_target(*, target_database_url: str, psql_executable: str) -> int:
+    print(
+        json.dumps(
+            postgres_target_service.inspect_target(
+                target_database_url=target_database_url,
+                psql_executable=psql_executable,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_plan_postgres_bootstrap_execution(
+    *,
+    package_dir: str,
+    target_database_url: str,
+    artifact_target_root: str | None,
+    psql_executable: str,
+) -> int:
+    print(
+        json.dumps(
+            postgres_bootstrap_service.build_execution_plan(
+                package_dir=package_dir,
+                target_database_url=target_database_url,
+                artifact_target_root=artifact_target_root,
+                psql_executable=psql_executable,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_execute_postgres_bootstrap_package(
+    *,
+    package_dir: str,
+    target_database_url: str,
+    artifact_target_root: str | None,
+    psql_executable: str,
+    dry_run: bool,
+) -> int:
+    print(
+        json.dumps(
+            postgres_bootstrap_service.execute_package(
+                package_dir=package_dir,
+                target_database_url=target_database_url,
+                artifact_target_root=artifact_target_root,
+                psql_executable=psql_executable,
+                dry_run=dry_run,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_verify_postgres_bootstrap_package(
+    *,
+    package_dir: str,
+    target_database_url: str,
+    psql_executable: str,
+) -> int:
+    print(
+        json.dumps(
+            postgres_target_service.verify_bootstrap_package_against_target(
+                package_dir=package_dir,
+                target_database_url=target_database_url,
+                psql_executable=psql_executable,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_postgres_cutover_rehearsal(
+    *,
+    package_dir: str,
+    target_database_url: str,
+    changed_by: str,
+    reason: str | None,
+    psql_executable: str,
+    artifact_target_root: str | None,
+    apply_to_target: bool,
+) -> int:
+    print(
+        json.dumps(
+            _postgres_cutover_rehearsal_service().execute_rehearsal(
+                package_dir=package_dir,
+                target_database_url=target_database_url,
+                changed_by=changed_by,
+                reason=reason,
+                psql_executable=psql_executable,
+                artifact_target_root=artifact_target_root,
+                apply_to_target=apply_to_target,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_evaluate_control_plane_cutover_readiness(
+    *,
+    package_dir: str,
+    target_database_url: str,
+    rehearsal_max_age_hours: float,
+    require_apply_rehearsal: bool,
+    require_runtime_validation: bool | None = None,
+) -> int:
+    print(
+        json.dumps(
+            _control_plane_cutover_readiness_service().evaluate(
+                package_dir=package_dir,
+                target_database_url=target_database_url,
+                rehearsal_max_age_hours=rehearsal_max_age_hours,
+                require_apply_rehearsal=require_apply_rehearsal,
+                require_runtime_validation=require_runtime_validation,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_decide_control_plane_cutover(
+    *,
+    package_dir: str,
+    target_database_url: str,
+    changed_by: str,
+    requested_decision: str,
+    reason: str | None,
+    decision_note: str | None,
+    rehearsal_max_age_hours: float,
+    require_apply_rehearsal: bool,
+    require_runtime_validation: bool | None = None,
+    allow_override: bool,
+) -> int:
+    print(
+        json.dumps(
+            _control_plane_cutover_promotion_service().decide(
+                package_dir=package_dir,
+                target_database_url=target_database_url,
+                changed_by=changed_by,
+                requested_decision=requested_decision,
+                reason=reason,
+                decision_note=decision_note,
+                rehearsal_max_age_hours=rehearsal_max_age_hours,
+                require_apply_rehearsal=require_apply_rehearsal,
+                require_runtime_validation=require_runtime_validation,
+                allow_override=allow_override,
+            ).to_dict(),
+            indent=2,
+        )
+    )
+    return 0
+
+
 def run_list_control_plane_maintenance_events(*, limit: int) -> int:
     print(json.dumps([record.to_dict() for record in job_service.list_control_plane_maintenance_events(limit=limit)], indent=2))
     return 0
@@ -619,6 +1232,46 @@ def run_enable_control_plane_maintenance_mode(*, changed_by: str, reason: str | 
 
 def run_disable_control_plane_maintenance_mode(*, changed_by: str, reason: str | None) -> int:
     print(json.dumps(job_service.disable_maintenance_mode(changed_by=changed_by, reason=reason), indent=2))
+    return 0
+
+
+def run_control_plane_maintenance_workflow(
+    *,
+    output_path: str,
+    changed_by: str,
+    reason: str | None,
+    allow_running_jobs: bool,
+    keep_maintenance_enabled: bool,
+) -> int:
+    summary = control_plane_maintenance_service.execute_workflow(
+        output_path=output_path,
+        changed_by=changed_by,
+        reason=reason,
+        allow_running_jobs=allow_running_jobs,
+        disable_maintenance_on_success=not keep_maintenance_enabled,
+    )
+    print(json.dumps(summary.to_dict(), indent=2))
+    return 0
+
+
+def run_prepare_control_plane_cutover_bundle(
+    *,
+    output_path: str,
+    target_database_url: str,
+    changed_by: str,
+    reason: str | None,
+    allow_running_jobs: bool,
+    keep_maintenance_enabled: bool,
+) -> int:
+    summary = control_plane_cutover_service.prepare_cutover_bundle(
+        output_path=output_path,
+        target_database_url=target_database_url,
+        changed_by=changed_by,
+        reason=reason,
+        allow_running_jobs=allow_running_jobs,
+        disable_maintenance_on_success=not keep_maintenance_enabled,
+    )
+    print(json.dumps(summary.to_dict(), indent=2))
     return 0
 
 
@@ -1010,12 +1663,141 @@ def main() -> int:
         return run_control_plane_metrics(days=args.days)
     if args.command == "control-plane-maintenance-mode":
         return run_control_plane_maintenance_mode()
+    if args.command == "control-plane-preflight":
+        return run_control_plane_preflight()
+    if args.command == "run-control-plane-runtime-smoke":
+        return run_control_plane_runtime_smoke(
+            changed_by=args.by,
+            reason=args.reason,
+            cleanup=not args.keep_artifacts,
+        )
+    if args.command == "run-control-plane-runtime-rehearsal":
+        return run_control_plane_runtime_rehearsal(
+            changed_by=args.by,
+            expected_backend=args.expected_backend,
+            expected_repository_layout=args.expected_layout,
+            reason=args.reason,
+            cleanup=not args.keep_artifacts,
+        )
+    if args.command == "control-plane-runtime-validation":
+        return run_control_plane_runtime_validation()
+    if args.command == "list-control-plane-runtime-validation-reviews":
+        return run_list_control_plane_runtime_validation_reviews(status=args.status)
+    if args.command == "process-control-plane-runtime-validation-reviews":
+        return run_process_control_plane_runtime_validation_reviews(
+            changed_by=args.by,
+            reason=args.reason,
+            force=args.force,
+        )
+    if args.command == "assign-control-plane-runtime-validation-review":
+        return run_assign_control_plane_runtime_validation_review(
+            review_id=args.review_id,
+            assigned_to=args.assigned_to,
+            assigned_to_team=args.assigned_team,
+            assigned_by=args.by,
+            assignment_note=args.note,
+        )
+    if args.command == "resolve-control-plane-runtime-validation-review":
+        return run_resolve_control_plane_runtime_validation_review(
+            review_id=args.review_id,
+            resolved_by=args.by,
+            resolution_reason=args.reason,
+            resolution_note=args.note,
+        )
+    if args.command == "control-plane-runtime-backend":
+        return run_control_plane_runtime_backend()
+    if args.command == "inspect-control-plane-runtime-backend":
+        return run_inspect_control_plane_runtime_backend(database_url=args.database_url)
+    if args.command == "sync-postgres-runtime-shadow":
+        return run_sync_postgres_runtime_shadow(
+            target_database_url=args.target_database_url,
+            changed_by=args.by,
+            reason=args.reason,
+        )
+    if args.command == "control-plane-cutover-preflight":
+        return run_control_plane_cutover_preflight(target_database_url=args.target_database_url)
+    if args.command == "inspect-postgres-bootstrap-package":
+        return run_inspect_postgres_bootstrap_package(package_dir=args.package_dir)
+    if args.command == "inspect-postgres-target":
+        return run_inspect_postgres_target(
+            target_database_url=args.target_database_url,
+            psql_executable=args.psql_executable,
+        )
+    if args.command == "plan-postgres-bootstrap-execution":
+        return run_plan_postgres_bootstrap_execution(
+            package_dir=args.package_dir,
+            target_database_url=args.target_database_url,
+            artifact_target_root=args.artifact_target_root,
+            psql_executable=args.psql_executable,
+        )
+    if args.command == "execute-postgres-bootstrap-package":
+        return run_execute_postgres_bootstrap_package(
+            package_dir=args.package_dir,
+            target_database_url=args.target_database_url,
+            artifact_target_root=args.artifact_target_root,
+            psql_executable=args.psql_executable,
+            dry_run=args.dry_run,
+        )
+    if args.command == "verify-postgres-bootstrap-package":
+        return run_verify_postgres_bootstrap_package(
+            package_dir=args.package_dir,
+            target_database_url=args.target_database_url,
+            psql_executable=args.psql_executable,
+        )
+    if args.command == "run-postgres-cutover-rehearsal":
+        return run_postgres_cutover_rehearsal(
+            package_dir=args.package_dir,
+            target_database_url=args.target_database_url,
+            changed_by=args.by,
+            reason=args.reason,
+            psql_executable=args.psql_executable,
+            artifact_target_root=args.artifact_target_root,
+            apply_to_target=args.apply_to_target,
+        )
+    if args.command == "evaluate-control-plane-cutover-readiness":
+        return run_evaluate_control_plane_cutover_readiness(
+            package_dir=args.package_dir,
+            target_database_url=args.target_database_url,
+            rehearsal_max_age_hours=args.rehearsal_max_age_hours,
+            require_apply_rehearsal=args.require_apply_rehearsal,
+            require_runtime_validation=None if not args.skip_runtime_validation else False,
+        )
+    if args.command == "decide-control-plane-cutover":
+        return run_decide_control_plane_cutover(
+            package_dir=args.package_dir,
+            target_database_url=args.target_database_url,
+            changed_by=args.by,
+            requested_decision=args.decision,
+            reason=args.reason,
+            decision_note=args.note,
+            rehearsal_max_age_hours=args.rehearsal_max_age_hours,
+            require_apply_rehearsal=args.require_apply_rehearsal,
+            require_runtime_validation=None if not args.skip_runtime_validation else False,
+            allow_override=args.allow_override,
+        )
     if args.command == "list-control-plane-maintenance-events":
         return run_list_control_plane_maintenance_events(limit=args.limit)
     if args.command == "enable-control-plane-maintenance-mode":
         return run_enable_control_plane_maintenance_mode(changed_by=args.by, reason=args.reason)
     if args.command == "disable-control-plane-maintenance-mode":
         return run_disable_control_plane_maintenance_mode(changed_by=args.by, reason=args.reason)
+    if args.command == "run-control-plane-maintenance-workflow":
+        return run_control_plane_maintenance_workflow(
+            output_path=args.out,
+            changed_by=args.by,
+            reason=args.reason,
+            allow_running_jobs=args.allow_running_jobs,
+            keep_maintenance_enabled=args.keep_maintenance_enabled,
+        )
+    if args.command == "prepare-control-plane-cutover-bundle":
+        return run_prepare_control_plane_cutover_bundle(
+            output_path=args.out,
+            target_database_url=args.target_database_url,
+            changed_by=args.by,
+            reason=args.reason,
+            allow_running_jobs=args.allow_running_jobs,
+            keep_maintenance_enabled=args.keep_maintenance_enabled,
+        )
     if args.command == "emit-control-plane-alerts":
         return run_emit_control_plane_alerts(force=args.force)
     if args.command == "process-control-plane-alert-followups":
@@ -1115,6 +1897,8 @@ def main() -> int:
         )
     if args.command == "control-plane-schema":
         return run_control_plane_schema()
+    if args.command == "control-plane-schema-contract":
+        return run_control_plane_schema_contract()
     if args.command == "migrate-control-plane-schema":
         return run_migrate_control_plane_schema()
     if args.command == "export-control-plane-backup":
